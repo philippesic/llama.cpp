@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
@@ -150,22 +151,20 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
     GGML_ASSERT((m - 1)/4 + 1 <= INT_MAX);
 
-    const char * mma_env = getenv("GGML_CUDA_W1A1_MMA");
-    if (mma_env != nullptr && strcmp(mma_env, "0") != 0 && strcmp(mma_env, "1") != 0) {
+    static const bool use_mma = []() {
+        const char * mma_env = std::getenv("GGML_CUDA_W1A1_MMA");
+        if (mma_env == nullptr || strcmp(mma_env, "0") == 0) return false;
+        if (strcmp(mma_env, "1") == 0) return true;
         GGML_ABORT("GGML_CUDA_W1A1_MMA must be 0 or 1");
-    }
-    const bool use_mma = mma_env != nullptr && strcmp(mma_env, "1") == 0;
+    }();
     if (use_mma) {
 #if defined(GGML_CUDA_W1A1_HAS_BINARY_MMA)
         if (k > INT_MAX || (m - 1)/8 + 1 > INT_MAX) {
             GGML_ABORT("W1A1 binary MMA dimensions exceed supported range");
         }
-        int device = -1;
-        cudaDeviceProp prop;
-        CUDA_CHECK(cudaGetDevice(&device));
-        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-        const int cc = prop.major*100 + prop.minor*10;
-        if (cc < GGML_CUDA_CC_TURING || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING ||
+                ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
             GGML_ABORT("W1A1 binary MMA requires an NVIDIA GPU and compiled architecture >= sm_75");
         }
         static std::atomic<bool> logged_mma{false};
