@@ -1595,6 +1595,72 @@ static void ggml_compute_forward_w8a8_mul_mat(
     }
 }
 
+static int32_t ggml_w4a4_sign_extend(uint8_t nibble) {
+    GGML_ASSERT(nibble != 8);
+    return nibble < 8 ? (int32_t) nibble : (int32_t) nibble - 16;
+}
+
+static void ggml_compute_forward_w4a4_mul_mat(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weights = dst->src[0];
+    const struct ggml_tensor * scales  = dst->src[1];
+    const struct ggml_tensor * acts    = dst->src[2];
+    const int64_t k = acts->ne[0];
+    const int64_t packed_k = (k + 1)/2;
+    const int64_t m = weights->ne[1];
+    const int64_t n = acts->ne[1];
+    GGML_ASSERT(k > 0 && k <= INT32_MAX/49 && weights->type == GGML_TYPE_I8 && scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(acts->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] == packed_k && scales->ne[0] == m);
+    GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
+    GGML_ASSERT(acts->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
+
+    uint8_t * const quantized = (uint8_t *) params->wdata + params->ith * packed_k;
+    const int64_t row_begin = m * params->ith / params->nth;
+    const int64_t row_end   = m * (params->ith + 1) / params->nth;
+    if (row_begin == row_end) return;
+    const uint8_t * const weight_data = (const uint8_t *) weights->data;
+    const float * const scale_data = (const float *) scales->data;
+    float * const output = (float *) dst->data;
+
+    for (int64_t token = 0; token < n; ++token) {
+        const float * act = (const float *) ((const char *) acts->data + token * acts->nb[1]);
+        float absmax = 0.0f;
+        for (int64_t i = 0; i < k; ++i) {
+            GGML_ASSERT(isfinite(act[i]));
+            absmax = fmaxf(absmax, fabsf(act[i]));
+        }
+        const float act_scale = absmax / 7.0f;
+        memset(quantized, 0, (size_t) packed_k);
+        if (act_scale != 0.0f) {
+            for (int64_t i = 0; i < k; ++i) {
+                const float scaled = act[i] / act_scale;
+                const float lower = floorf(scaled);
+                const float fraction = scaled - lower;
+                float rounded = lower;
+                if (fraction > 0.5f || (fraction == 0.5f && ((int32_t) lower & 1))) rounded += 1.0f;
+                const int32_t code = (int32_t) fmaxf(-7.0f, fminf(7.0f, rounded));
+                quantized[i/2] |= (uint8_t) (code & 0x0f) << (4 * (i & 1));
+            }
+        }
+        for (int64_t row = row_begin; row < row_end; ++row) {
+            const uint8_t * weight = weight_data + row * packed_k;
+            GGML_ASSERT(isfinite(scale_data[row]) && scale_data[row] >= 0.0f);
+            int32_t dot = 0;
+            for (int64_t i = 0; i < k; ++i) {
+                const uint8_t packed_weight = weight[i/2];
+                const uint8_t packed_act = quantized[i/2];
+                const uint8_t weight_code = (packed_weight >> (4 * (i & 1))) & 0x0f;
+                const uint8_t act_code = (packed_act >> (4 * (i & 1))) & 0x0f;
+                dot += ggml_w4a4_sign_extend(weight_code) * ggml_w4a4_sign_extend(act_code);
+            }
+            if (k & 1) GGML_ASSERT((weight[packed_k - 1] & 0xf0) == 0);
+            output[token * m + row] = ((float) dot * scale_data[row]) * act_scale;
+        }
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -2005,6 +2071,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_W8A8_MUL_MAT:
             {
                 ggml_compute_forward_w8a8_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_W4A4_MUL_MAT:
+            {
+                ggml_compute_forward_w4a4_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2500,6 +2570,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_W1A1_MUL_MAT:
         case GGML_OP_W8A8_MUL_MAT:
+        case GGML_OP_W4A4_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
             {
@@ -3044,6 +3115,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_W8A8_MUL_MAT:
                     {
                         cur = node->src[0]->ne[0] * sizeof(int8_t) * n_tasks;
+                    } break;
+                case GGML_OP_W4A4_MUL_MAT:
+                    {
+                        cur = node->src[0]->ne[0] * sizeof(uint8_t) * n_tasks;
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {

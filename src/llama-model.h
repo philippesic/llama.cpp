@@ -359,6 +359,20 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_w8a8_scale = nullptr;
     struct ggml_tensor * ffn_up_w8a8_codes = nullptr;
     struct ggml_tensor * ffn_up_w8a8_scale = nullptr;
+    struct ggml_tensor * wq_w4a4_packed = nullptr;
+    struct ggml_tensor * wq_w4a4_scale = nullptr;
+    struct ggml_tensor * wk_w4a4_packed = nullptr;
+    struct ggml_tensor * wk_w4a4_scale = nullptr;
+    struct ggml_tensor * wv_w4a4_packed = nullptr;
+    struct ggml_tensor * wv_w4a4_scale = nullptr;
+    struct ggml_tensor * wo_w4a4_packed = nullptr;
+    struct ggml_tensor * wo_w4a4_scale = nullptr;
+    struct ggml_tensor * ffn_gate_w4a4_packed = nullptr;
+    struct ggml_tensor * ffn_gate_w4a4_scale = nullptr;
+    struct ggml_tensor * ffn_down_w4a4_packed = nullptr;
+    struct ggml_tensor * ffn_down_w4a4_scale = nullptr;
+    struct ggml_tensor * ffn_up_w4a4_packed = nullptr;
+    struct ggml_tensor * ffn_up_w4a4_scale = nullptr;
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
@@ -672,6 +686,10 @@ struct llama_model {
     struct ggml_tensor * output_w8a8_scale = nullptr;
     struct ggml_tensor * fc_w8a8_codes = nullptr;
     struct ggml_tensor * fc_w8a8_scale = nullptr;
+    struct ggml_tensor * output_w4a4_packed = nullptr;
+    struct ggml_tensor * output_w4a4_scale = nullptr;
+    struct ggml_tensor * fc_w4a4_packed = nullptr;
+    struct ggml_tensor * fc_w4a4_scale = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 

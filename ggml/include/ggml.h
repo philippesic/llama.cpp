@@ -603,6 +603,7 @@ extern "C" {
 
         GGML_OP_W1A1_MUL_MAT,
         GGML_OP_W8A8_MUL_MAT,
+        GGML_OP_W4A4_MUL_MAT,
 
         GGML_OP_COUNT,
     };
@@ -1500,6 +1501,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_w8a8_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * weights,
+            struct ggml_tensor  * weight_scales,
+            struct ggml_tensor  * activations);
+
+    // Packed signed I4 operands: I8 storage [ceil(K/2), M] with even K in
+    // the low nibble and odd K in the high nibble. Codes are in [-7, 7].
+    GGML_API struct ggml_tensor * ggml_w4a4_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed_weights,
             struct ggml_tensor  * weight_scales,
             struct ggml_tensor  * activations);
 

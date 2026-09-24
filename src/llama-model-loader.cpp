@@ -972,6 +972,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], 512);
                 op_tensor = ggml_w8a8_mul_mat(ctx, w, scales, b);
             } break;
+        case GGML_OP_W4A4_MUL_MAT:
+            {
+                ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[1]);
+                ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0] * 2, 512);
+                op_tensor = ggml_w4a4_mul_mat(ctx, w, scales, b);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 // Used for either MoE expert routing or embedded adapter routing
@@ -1212,6 +1218,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else if (tn.suffix != nullptr && strcmp(tn.suffix, "w8a8_codes") == 0) {
             op = GGML_OP_W8A8_MUL_MAT;
         } else if (tn.suffix != nullptr && strcmp(tn.suffix, "w8a8_scale") == 0) {
+            op = GGML_OP_MUL;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "w4a4_packed") == 0) {
+            op = GGML_OP_W4A4_MUL_MAT;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "w4a4_scale") == 0) {
             op = GGML_OP_MUL;
         } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;

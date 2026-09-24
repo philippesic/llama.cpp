@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "W1A1_MUL_MAT",
     "W8A8_MUL_MAT",
+    "W4A4_MUL_MAT",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,9 +1219,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "w1a1(X,s,Y)",
     "w8a8(X,s,Y)",
+    "w4a4(X,s,Y)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3408,6 +3410,29 @@ struct ggml_tensor * ggml_w8a8_mul_mat(
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weights->ne[1], activations->ne[1]);
     result->op     = GGML_OP_W8A8_MUL_MAT;
     result->src[0] = weights;
+    result->src[1] = weight_scales;
+    result->src[2] = activations;
+    return result;
+}
+
+struct ggml_tensor * ggml_w4a4_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed_weights,
+        struct ggml_tensor  * weight_scales,
+        struct ggml_tensor  * activations) {
+    GGML_ASSERT(packed_weights->type == GGML_TYPE_I8);
+    GGML_ASSERT(weight_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(activations->type == GGML_TYPE_F32);
+    GGML_ASSERT(activations->ne[0] > 0 && packed_weights->ne[0] == (activations->ne[0] + 1)/2);
+    GGML_ASSERT(packed_weights->ne[1] > 0 && packed_weights->ne[2] == 1 && packed_weights->ne[3] == 1);
+    GGML_ASSERT(weight_scales->ne[0] == packed_weights->ne[1]);
+    GGML_ASSERT(weight_scales->ne[1] == 1 && weight_scales->ne[2] == 1 && weight_scales->ne[3] == 1);
+    GGML_ASSERT(activations->ne[1] > 0 && activations->ne[2] == 1 && activations->ne[3] == 1);
+    GGML_ASSERT(activations->nb[0] == ggml_type_size(GGML_TYPE_F32));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, packed_weights->ne[1], activations->ne[1]);
+    result->op     = GGML_OP_W4A4_MUL_MAT;
+    result->src[0] = packed_weights;
     result->src[1] = weight_scales;
     result->src[2] = activations;
     return result;
@@ -7285,6 +7310,9 @@ static void ggml_compute_backward(
         }
         case GGML_OP_W8A8_MUL_MAT: {
             GGML_ABORT("backward pass for W8A8_MUL_MAT is unsupported");
+        }
+        case GGML_OP_W4A4_MUL_MAT: {
+            GGML_ABORT("backward pass for W4A4_MUL_MAT is unsupported");
         }
         case GGML_OP_COUNT:
         default: {
