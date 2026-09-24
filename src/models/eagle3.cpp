@@ -103,6 +103,86 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         LLAMA_LOG_INFO("%s: EAGLE3 W1A1 active groups: %s (%zu tensors)\n", __func__, coverage.c_str(), declared.size());
     }
 
+    uint32_t w8a8_version = 0;
+    const bool has_w8a8 = ml->get_key("eagle3.w8a8.version", w8a8_version, false);
+    const std::set<std::string> w8a8_expected = {
+        "fc.weight", "output.weight",
+        "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.0.attn_output.weight",
+        "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight", "blk.0.ffn_up.weight",
+    };
+    if (has_w8a8) {
+        uint32_t legacy_w1a1_version = 0;
+        if (has_full_w1a1 || ml->get_key("eagle3.w1a1_head.version", legacy_w1a1_version, false)) {
+            throw std::runtime_error("EAGLE3 W8A8 cannot be combined with W1A1 metadata");
+        }
+        std::vector<std::string> groups, names;
+        std::string weight_dtype, activation_dtype, weight_scale, activation_scale;
+        std::string rounding, zero_scale, accumulator, output_rule;
+        ml->get_arr("eagle3.w8a8.groups", groups);
+        ml->get_arr("eagle3.w8a8.tensors", names);
+        ml->get_key("eagle3.w8a8.weight_dtype", weight_dtype);
+        ml->get_key("eagle3.w8a8.activation_dtype", activation_dtype);
+        ml->get_key("eagle3.w8a8.weight_scale", weight_scale);
+        ml->get_key("eagle3.w8a8.activation_scale", activation_scale);
+        ml->get_key("eagle3.w8a8.rounding", rounding);
+        ml->get_key("eagle3.w8a8.zero_scale", zero_scale);
+        ml->get_key("eagle3.w8a8.accumulator", accumulator);
+        ml->get_key("eagle3.w8a8.output", output_rule);
+        const std::set<std::string> declared(names.begin(), names.end());
+        const std::set<std::string> declared_groups(groups.begin(), groups.end());
+        if (w8a8_version != 1 || groups.size() != 4 || declared_groups != std::set<std::string>{"fusion", "attention", "ffn", "head"} ||
+                names.size() != 9 || declared != w8a8_expected || weight_dtype != "i8_signed" || activation_dtype != "i8_signed" ||
+                weight_scale != "f32_absmax_per_row" || activation_scale != "f32_absmax_per_token" ||
+                rounding != "nearest_even" || zero_scale != "zero_codes" || accumulator != "i32" ||
+                output_rule != "f32_dot_weight_activation_then_bias") {
+            throw std::runtime_error("EAGLE3 W8A8 metadata has unsupported or incomplete all-linear coverage");
+        }
+        LLAMA_LOG_INFO("%s: EAGLE3 W8A8 active for all nine draft linears\n", __func__);
+    }
+
+    for (const auto & name : w8a8_expected) {
+        const std::string base = name.substr(0, name.size() - std::string(".weight").size());
+        const bool codes_present = ml->get_tensor_meta((base + ".w8a8_codes").c_str()) != nullptr;
+        const bool scale_present = ml->get_tensor_meta((base + ".w8a8_scale").c_str()) != nullptr;
+        if (codes_present != has_w8a8 || scale_present != has_w8a8) {
+            throw std::runtime_error("EAGLE3 W8A8 metadata and all nine code/scale tensor pairs must agree");
+        }
+    }
+
+    auto load_w8a8_linear = [&](llm_tensor tensor, int bid, const std::string & base_name,
+            int64_t logical_k, int64_t rows, ggml_tensor *& dense,
+            ggml_tensor *& codes, ggml_tensor *& scales) {
+        const std::string base = base_name.substr(0, base_name.size() - std::string(".weight").size());
+        const std::string codes_name = base + ".w8a8_codes";
+        const std::string scale_name = base + ".w8a8_scale";
+        const auto * codes_meta = ml->get_tensor_meta(codes_name.c_str());
+        const auto * scale_meta = ml->get_tensor_meta(scale_name.c_str());
+        if (!codes_meta || !scale_meta || ml->get_tensor_meta(base_name.c_str()) != nullptr ||
+                ml->get_tensor_meta((base + ".w1a1_packed").c_str()) != nullptr ||
+                ml->get_tensor_meta((base + ".w1a1_scale").c_str()) != nullptr ||
+                codes_meta->type != GGML_TYPE_I8 || scale_meta->type != GGML_TYPE_F32 ||
+                codes_meta->ne[0] != logical_k || codes_meta->ne[1] != rows ||
+                codes_meta->ne[2] != 1 || codes_meta->ne[3] != 1 ||
+                scale_meta->ne[0] != rows || scale_meta->ne[1] != 1 ||
+                scale_meta->ne[2] != 1 || scale_meta->ne[3] != 1) {
+            throw std::runtime_error("EAGLE3 W8A8 requires I8 codes and F32 row scales with no dense/W1A1 shadow");
+        }
+        std::string suffix = base_name;
+        std::replace(suffix.begin(), suffix.end(), '.', '_');
+        const std::string audit = "eagle3.w8a8.tensor." + suffix;
+        uint32_t audited_k = 0;
+        std::string audited_codes, audited_scale;
+        ml->get_key((audit + ".logical_k").c_str(), audited_k);
+        ml->get_key((audit + ".codes").c_str(), audited_codes);
+        ml->get_key((audit + ".scale").c_str(), audited_scale);
+        if (audited_k != logical_k || audited_codes != codes_name || audited_scale != scale_name) {
+            throw std::runtime_error("EAGLE3 W8A8 tensor audit metadata disagrees with its shape or name");
+        }
+        codes = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w8a8_codes", bid, -1), {logical_k, rows}, 0);
+        scales = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w8a8_scale", bid, -1), {rows}, 0);
+        dense = nullptr;
+    };
+
     auto load_w1a1_linear = [&](llm_tensor tensor, int bid, const std::string & base_name,
             int64_t logical_k, int64_t rows, ggml_tensor *& dense,
             ggml_tensor *& packed, ggml_tensor *& scales, int flags) {
@@ -149,6 +229,9 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     if (has_full_w1a1) {
         load_w1a1_linear(LLM_TENSOR_FC, -1, tn(LLM_TENSOR_FC, "weight").str(), n_embd_inp, n_embd,
                 fc, fc_w1a1_packed, fc_w1a1_scale, 0);
+    } else if (has_w8a8) {
+        load_w8a8_linear(LLM_TENSOR_FC, -1, tn(LLM_TENSOR_FC, "weight").str(), n_embd_inp, n_embd,
+                fc, fc_w8a8_codes, fc_w8a8_scale);
     } else {
         fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
     }
@@ -166,6 +249,9 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     if (has_full_w1a1) {
         load_w1a1_linear(LLM_TENSOR_OUTPUT, -1, tn(LLM_TENSOR_OUTPUT, "weight").str(), n_embd, n_draft_vocab,
                 output, output_w1a1_packed, output_w1a1_scale, TENSOR_NOT_REQUIRED);
+    } else if (has_w8a8) {
+        load_w8a8_linear(LLM_TENSOR_OUTPUT, -1, tn(LLM_TENSOR_OUTPUT, "weight").str(), n_embd, n_draft_vocab,
+                output, output_w8a8_codes, output_w8a8_scale);
     } else if (has_w1a1) {
         uint32_t logical_k = 0;
         std::string packed_name, scale_name, bit_order, sign_rule, scale_rule, arithmetic;
@@ -227,6 +313,15 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
                     layer.wv, layer.wv_w1a1_packed, layer.wv_w1a1_scale, 0);
             load_w1a1_linear(LLM_TENSOR_ATTN_OUT, i, tn(LLM_TENSOR_ATTN_OUT, "weight", i).str(), n_embd_head_k * n_head, n_embd,
                     layer.wo, layer.wo_w1a1_packed, layer.wo_w1a1_scale, 0);
+        } else if (has_w8a8) {
+            load_w8a8_linear(LLM_TENSOR_ATTN_Q, i, tn(LLM_TENSOR_ATTN_Q, "weight", i).str(), n_embd_attn_input, n_embd_head_k * n_head,
+                    layer.wq, layer.wq_w8a8_codes, layer.wq_w8a8_scale);
+            load_w8a8_linear(LLM_TENSOR_ATTN_K, i, tn(LLM_TENSOR_ATTN_K, "weight", i).str(), n_embd_attn_input, n_embd_k_gqa,
+                    layer.wk, layer.wk_w8a8_codes, layer.wk_w8a8_scale);
+            load_w8a8_linear(LLM_TENSOR_ATTN_V, i, tn(LLM_TENSOR_ATTN_V, "weight", i).str(), n_embd_attn_input, n_embd_v_gqa,
+                    layer.wv, layer.wv_w8a8_codes, layer.wv_w8a8_scale);
+            load_w8a8_linear(LLM_TENSOR_ATTN_OUT, i, tn(LLM_TENSOR_ATTN_OUT, "weight", i).str(), n_embd_head_k * n_head, n_embd,
+                    layer.wo, layer.wo_w8a8_codes, layer.wo_w8a8_scale);
         } else {
             layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd_attn_input, n_embd_head_k * n_head}, 0);
             layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd_attn_input, n_embd_k_gqa}, 0);
@@ -242,6 +337,13 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
                     layer.ffn_down, layer.ffn_down_w1a1_packed, layer.ffn_down_w1a1_scale, 0);
             load_w1a1_linear(LLM_TENSOR_FFN_UP, i, tn(LLM_TENSOR_FFN_UP, "weight", i).str(), n_embd, n_ff,
                     layer.ffn_up, layer.ffn_up_w1a1_packed, layer.ffn_up_w1a1_scale, 0);
+        } else if (has_w8a8) {
+            load_w8a8_linear(LLM_TENSOR_FFN_GATE, i, tn(LLM_TENSOR_FFN_GATE, "weight", i).str(), n_embd, n_ff,
+                    layer.ffn_gate, layer.ffn_gate_w8a8_codes, layer.ffn_gate_w8a8_scale);
+            load_w8a8_linear(LLM_TENSOR_FFN_DOWN, i, tn(LLM_TENSOR_FFN_DOWN, "weight", i).str(), n_ff, n_embd,
+                    layer.ffn_down, layer.ffn_down_w8a8_codes, layer.ffn_down_w8a8_scale);
+            load_w8a8_linear(LLM_TENSOR_FFN_UP, i, tn(LLM_TENSOR_FFN_UP, "weight", i).str(), n_embd, n_ff,
+                    layer.ffn_up, layer.ffn_up_w8a8_codes, layer.ffn_up_w8a8_scale);
         } else {
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
@@ -277,7 +379,13 @@ ggml_tensor * llama_model_eagle3::graph<true>::build_inp_embd_enc() const {
 template <>
 llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = nullptr;
-    auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
+    auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales,
+            ggml_tensor * codes8, ggml_tensor * scales8, ggml_tensor * input, int64_t logical_k) {
+        if (codes8) {
+            if (!loras->empty()) throw std::runtime_error("EAGLE3 W8A8 projections do not support draft LoRA adapters");
+            if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+            return ggml_w8a8_mul_mat(ctx0, codes8, scales8, input);
+        }
         if (!packed) return build_lora_mm(dense, input);
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
@@ -294,6 +402,7 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
 
     // Feature fusion layer
     cur = eagle_linear(model.fc, model.fc_w1a1_packed, model.fc_w1a1_scale,
+            model.fc_w8a8_codes, model.fc_w8a8_scale,
             cur, hparams.n_embd_inp_enc());
     cb(cur, "fc_out", -1);
 
@@ -317,7 +426,13 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
-    auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
+    auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales,
+            ggml_tensor * codes8, ggml_tensor * scales8, ggml_tensor * input, int64_t logical_k) {
+        if (codes8) {
+            if (!loras->empty()) throw std::runtime_error("EAGLE3 W8A8 projections do not support draft LoRA adapters");
+            if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+            return ggml_w8a8_mul_mat(ctx0, codes8, scales8, input);
+        }
         if (!packed) return build_lora_mm(dense, input);
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
@@ -388,15 +503,18 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
         // Self-attention with concatenated input
         ggml_tensor * Qcur = eagle_linear(model.layers[il].wq,
-                model.layers[il].wq_w1a1_packed, model.layers[il].wq_w1a1_scale, cur, 2 * n_embd);
+                model.layers[il].wq_w1a1_packed, model.layers[il].wq_w1a1_scale,
+                model.layers[il].wq_w8a8_codes, model.layers[il].wq_w8a8_scale, cur, 2 * n_embd);
         cb(Qcur, "Qcur", il);
 
         ggml_tensor * Kcur = eagle_linear(model.layers[il].wk,
-                model.layers[il].wk_w1a1_packed, model.layers[il].wk_w1a1_scale, cur, 2 * n_embd);
+                model.layers[il].wk_w1a1_packed, model.layers[il].wk_w1a1_scale,
+                model.layers[il].wk_w8a8_codes, model.layers[il].wk_w8a8_scale, cur, 2 * n_embd);
         cb(Kcur, "Kcur", il);
 
         ggml_tensor * Vcur = eagle_linear(model.layers[il].wv,
-                model.layers[il].wv_w1a1_packed, model.layers[il].wv_w1a1_scale, cur, 2 * n_embd);
+                model.layers[il].wv_w1a1_packed, model.layers[il].wv_w1a1_scale,
+                model.layers[il].wv_w8a8_codes, model.layers[il].wv_w8a8_scale, cur, 2 * n_embd);
         cb(Vcur, "Vcur", il);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -422,11 +540,12 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur_rope", il);
 
         cur = build_attn(inp_attn,
-                model.layers[il].wo_w1a1_packed ? nullptr : model.layers[il].wo, NULL, nullptr,
+                (model.layers[il].wo_w1a1_packed || model.layers[il].wo_w8a8_codes) ? nullptr : model.layers[il].wo, NULL, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-        if (model.layers[il].wo_w1a1_packed) {
+        if (model.layers[il].wo_w1a1_packed || model.layers[il].wo_w8a8_codes) {
             cur = eagle_linear(nullptr, model.layers[il].wo_w1a1_packed,
-                    model.layers[il].wo_w1a1_scale, cur, n_embd_head * n_head);
+                    model.layers[il].wo_w1a1_scale,
+                    model.layers[il].wo_w8a8_codes, model.layers[il].wo_w8a8_scale, cur, n_embd_head * n_head);
         }
 
         // Add residual and update it
@@ -440,15 +559,16 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "post_attn_norm", il);
 
         const auto & layer = model.layers[il];
-        if (layer.ffn_up_w1a1_packed || layer.ffn_gate_w1a1_packed || layer.ffn_down_w1a1_packed) {
+        if (layer.ffn_up_w1a1_packed || layer.ffn_gate_w1a1_packed || layer.ffn_down_w1a1_packed ||
+                layer.ffn_up_w8a8_codes || layer.ffn_gate_w8a8_codes || layer.ffn_down_w8a8_codes) {
             ggml_tensor * up = eagle_linear(layer.ffn_up, layer.ffn_up_w1a1_packed,
-                    layer.ffn_up_w1a1_scale, cur, n_embd);
+                    layer.ffn_up_w1a1_scale, layer.ffn_up_w8a8_codes, layer.ffn_up_w8a8_scale, cur, n_embd);
             ggml_tensor * gate = eagle_linear(layer.ffn_gate, layer.ffn_gate_w1a1_packed,
-                    layer.ffn_gate_w1a1_scale, cur, n_embd);
+                    layer.ffn_gate_w1a1_scale, layer.ffn_gate_w8a8_codes, layer.ffn_gate_w8a8_scale, cur, n_embd);
             gate = ggml_silu(ctx0, gate);
             cur = ggml_mul(ctx0, up, gate);
             cur = eagle_linear(layer.ffn_down, layer.ffn_down_w1a1_packed,
-                    layer.ffn_down_w1a1_scale, cur, hparams.n_ff(il));
+                    layer.ffn_down_w1a1_scale, layer.ffn_down_w8a8_codes, layer.ffn_down_w8a8_scale, cur, hparams.n_ff(il));
         } else {
             cur = build_ffn(cur,
                     layer.ffn_up,   NULL, NULL,
@@ -479,14 +599,18 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     // lm_head - projects to draft vocabulary
     // if the draft has no own output projection, inherit the target model's lm_head
-    if (model.output_w1a1_packed != nullptr) {
+    if (model.output_w1a1_packed != nullptr || model.output_w8a8_codes != nullptr) {
         if (!loras->empty()) {
-            throw std::runtime_error("EAGLE3 packed head does not support draft LoRA adapters");
+            throw std::runtime_error("EAGLE3 low-bit head does not support draft LoRA adapters");
         }
         if (cur->type != GGML_TYPE_F32) {
             cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
         }
-        cur = ggml_w1a1_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd);
+        if (model.output_w8a8_codes) {
+            cur = ggml_w8a8_mul_mat(ctx0, model.output_w8a8_codes, model.output_w8a8_scale, cur);
+        } else {
+            cur = ggml_w1a1_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd);
+        }
     } else {
         auto * output = model.output;
         if (output == nullptr) {

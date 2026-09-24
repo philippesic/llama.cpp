@@ -5149,6 +5149,90 @@ struct test_w1a1_mul_mat : public test_case {
     }
 };
 
+struct test_w8a8_mul_mat : public test_case {
+    static constexpr int64_t k = 8;
+    static constexpr int64_t m = 4;
+    static constexpr int64_t n_tokens = 3;
+    std::vector<float> expected;
+
+    std::string vars() override { return "K=8,M=4,N=3,strided=true"; }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, m);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + 1, n_tokens);
+        ggml_set_name(w, "w8a8_weights");
+        ggml_set_name(s, "w8a8_scales");
+        ggml_set_name(base, "w8a8_activations_base");
+        ggml_tensor * a = ggml_view_2d(ctx, base, k, n_tokens, base->nb[1], 0);
+        ggml_set_name(a, "w8a8_activations");
+        return ggml_w8a8_mul_mat(ctx, w, s, a);
+    }
+
+    static int8_t quantize_nearest_even(float value, float scale) {
+        const double x = (double) value / (double) scale;
+        const double lower = floor(x);
+        const double fraction = x - lower;
+        double rounded = lower;
+        if (fraction > 0.5 || (fraction == 0.5 && fmod(fabs(lower), 2.0) == 1.0)) rounded += 1.0;
+        if (rounded < -127.0) rounded = -127.0;
+        if (rounded > 127.0) rounded = 127.0;
+        return (int8_t) rounded;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_get_tensor(ctx, "w8a8_weights");
+        ggml_tensor * s = ggml_get_tensor(ctx, "w8a8_scales");
+        ggml_tensor * base = ggml_get_tensor(ctx, "w8a8_activations_base");
+        const int8_t weights[m * k] = {
+            1, -2, 3, -4, 5, -6, 7, -8,
+            -8, 7, -6, 5, -4, 3, -2, 1,
+            127, -127, 64, -64, 32, -32, 16, -16,
+            -1, -1, 1, 1, -3, 3, -5, 5,
+        };
+        const float scales[m] = { 0.5f, 1.25f, -0.75f, 0.125f };
+        const float acts[n_tokens][k] = {
+            { 127.0f, 0.5f, 1.5f, 2.5f, -0.5f, -1.5f, 3.0f, -127.0f },
+            { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+            { -9.0f, 1.25f, 2.25f, -3.75f, 0.0f, 64.0f, 100.0f, -0.25f },
+        };
+        std::vector<float> padded((k + 1) * n_tokens, 1234.0f);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            std::copy_n(acts[token], k, padded.data() + token * (k + 1));
+        }
+
+        expected.resize(m * n_tokens);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            float absmax = 0.0f;
+            for (int64_t i = 0; i < k; ++i) absmax = std::max(absmax, std::abs(acts[token][i]));
+            const float act_scale = absmax / 127.0f;
+            for (int64_t row = 0; row < m; ++row) {
+                int32_t dot = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    const int8_t q = act_scale == 0.0f ? 0 : quantize_nearest_even(acts[token][i], act_scale);
+                    dot += (int32_t) weights[row * k + i] * (int32_t) q;
+                }
+                expected[token * m + row] = ((float) dot * scales[row]) * act_scale;
+            }
+        }
+        ggml_backend_tensor_set(w, weights, 0, sizeof(weights));
+        ggml_backend_tensor_set(s, scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(base, padded.data(), 0, padded.size() * sizeof(float));
+    }
+
+    double err(const float * lhs, const float * rhs, size_t count) override {
+        if (count != expected.size()) return test_case::err(lhs, rhs, count);
+        double worst = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            const double denom = 1.0 + std::abs(double(expected[i]));
+            worst = std::max(worst, std::abs(double(lhs[i]) - expected[i]) / denom);
+            worst = std::max(worst, std::abs(double(rhs[i]) - expected[i]) / denom);
+        }
+        return worst;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -10017,6 +10101,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_w1a1_mul_mat(k));
     }
     test_cases.emplace_back(new test_w1a1_mul_mat(33, true));
+    test_cases.emplace_back(new test_w8a8_mul_mat());
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

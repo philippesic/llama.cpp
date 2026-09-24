@@ -1100,9 +1100,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "W1A1_MUL_MAT",
+    "W8A8_MUL_MAT",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,9 +1217,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "w1a1(X,s,Y)",
+    "w8a8(X,s,Y)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3385,6 +3387,29 @@ struct ggml_tensor * ggml_w1a1_mul_mat(
     result->src[1] = weight_scales;
     result->src[2] = activations;
     ggml_set_op_params(result, &logical_k, sizeof(logical_k));
+    return result;
+}
+
+struct ggml_tensor * ggml_w8a8_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * weight_scales,
+        struct ggml_tensor  * activations) {
+    GGML_ASSERT(weights->type == GGML_TYPE_I8);
+    GGML_ASSERT(weight_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(activations->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] > 0 && weights->ne[1] > 0 && weights->ne[2] == 1 && weights->ne[3] == 1);
+    GGML_ASSERT(weight_scales->ne[0] == weights->ne[1]);
+    GGML_ASSERT(weight_scales->ne[1] == 1 && weight_scales->ne[2] == 1 && weight_scales->ne[3] == 1);
+    GGML_ASSERT(activations->ne[0] == weights->ne[0] && activations->ne[1] > 0);
+    GGML_ASSERT(activations->ne[2] == 1 && activations->ne[3] == 1);
+    GGML_ASSERT(activations->nb[0] == ggml_type_size(GGML_TYPE_F32));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weights->ne[1], activations->ne[1]);
+    result->op     = GGML_OP_W8A8_MUL_MAT;
+    result->src[0] = weights;
+    result->src[1] = weight_scales;
+    result->src[2] = activations;
     return result;
 }
 
@@ -7257,6 +7282,9 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_W1A1_MUL_MAT: {
             GGML_ABORT("backward pass for W1A1_MUL_MAT is unsupported");
+        }
+        case GGML_OP_W8A8_MUL_MAT: {
+            GGML_ABORT("backward pass for W8A8_MUL_MAT is unsupported");
         }
         case GGML_OP_COUNT:
         default: {

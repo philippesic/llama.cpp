@@ -602,6 +602,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_W1A1_MUL_MAT,
+        GGML_OP_W8A8_MUL_MAT,
 
         GGML_OP_COUNT,
     };
@@ -1495,6 +1496,12 @@ extern "C" {
             struct ggml_tensor  * weight_scales,
             struct ggml_tensor  * activations,
             int64_t               logical_k);
+
+    GGML_API struct ggml_tensor * ggml_w8a8_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * weight_scales,
+            struct ggml_tensor  * activations);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
