@@ -1,5 +1,6 @@
 #include "w1a1.cuh"
 
+#include <atomic>
 #include <climits>
 #include <cstring>
 
@@ -89,6 +90,12 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
     GGML_ASSERT((m - 1)/4 + 1 <= INT_MAX);
+
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        GGML_LOG_INFO("%s: CUDA packed W1A1 XOR/POPCOUNT dispatch (K=%lld, rows=%lld, tokens=%lld)\n",
+                __func__, (long long) k, (long long) m, (long long) n);
+    }
 
     ggml_cuda_pool_alloc<uint32_t> packed(ctx.pool(), (size_t) n*words);
     ggml_cuda_pool_alloc<float> act_scales(ctx.pool(), n);
