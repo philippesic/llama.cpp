@@ -5262,12 +5262,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_W4A4_MUL_MAT:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             return op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    op->src[2]->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
                    op->src[2]->ne[0] > 0 && op->src[0]->ne[0] == (op->src[2]->ne[0] + 1)/2 &&
                    op->src[1]->ne[0] == op->src[0]->ne[1];
+#else
+            return false;
+#endif
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:

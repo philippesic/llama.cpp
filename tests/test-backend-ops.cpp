@@ -5257,7 +5257,8 @@ struct test_w4a4_mul_mat : public test_case {
 
     static int8_t quantize_nearest_even(float value, float scale) {
         if (scale == 0.0f) return 0;
-        const float x = value / scale;
+        // Round the quotient to F32 before ties-to-even, as the format requires.
+        const float x = (float) (value / scale);
         const float lower = floorf(x);
         const float fraction = x - lower;
         float rounded = lower;
@@ -5275,10 +5276,23 @@ struct test_w4a4_mul_mat : public test_case {
             { 0, 1, -2, 3, -4, 5, -6, 7, -7 },
         };
         const float scales[m] = { 0.5f, 1.25f, 0.125f };
+        const float max_value = 11.0f;
+        const float tie_scale = max_value / 7.0f;
+        const float tie_values[] = {
+            tie_scale * 2.5f, tie_scale * -2.5f,
+            tie_scale * 3.5f, tie_scale * -3.5f,
+            tie_scale * 4.5f, tie_scale * -4.5f,
+        };
+        const float tie_codes[] = { 2.5f, -2.5f, 3.5f, -3.5f, 4.5f, -4.5f };
+        for (size_t i = 0; i < sizeof(tie_values) / sizeof(tie_values[0]); ++i) {
+            GGML_ASSERT(tie_values[i] / tie_scale == tie_codes[i]);
+            GGML_ASSERT((double) tie_values[i] / (double) tie_scale != (double) tie_codes[i]);
+        }
         const float acts[n_tokens][k] = {
             { 7.0f, 0.5f, 1.5f, 2.5f, -0.5f, -1.5f, 3.0f, -7.0f, 0.0f },
             { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-            { -9.0f, 1.25f, 2.25f, -3.75f, 0.0f, 6.0f, 7.0f, -0.25f, 2.0f },
+            { max_value, tie_values[0], tie_values[1], tie_values[2], tie_values[3],
+              tie_values[4], tie_values[5], 0.0f, -1.0f },
         };
         std::vector<uint8_t> packed(m * packed_k, 0);
         for (int64_t row = 0; row < m; ++row) {

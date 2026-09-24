@@ -3,6 +3,35 @@
 #include <atomic>
 #include <climits>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// GGML CUDA compiles with -use_fast_math. Keep the versioned quantizer's F32
+// division and output scale order explicit rather than allowing reciprocal
+// approximation, FTZ, or multiply reassociation.
+static __device__ __forceinline__ float w4a4_div_rn(float a, float b) {
+    float result;
+    asm volatile("div.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+    return result;
+}
+
+static __device__ __forceinline__ float w4a4_mul_rn(float a, float b) {
+    float result;
+    asm volatile("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+    return result;
+}
+
+static __device__ __forceinline__ float w4a4_abs(float value) {
+    float result;
+    asm volatile("abs.f32 %0, %1;" : "=f"(result) : "f"(value));
+    return result;
+}
+
+static __device__ __forceinline__ float w4a4_max(float a, float b) {
+    float result;
+    asm volatile("max.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+    return result;
+}
+
 // One block per input token. The first pass computes its F32 absmax; the
 // second packs two signed [-7, 7] codes into each byte. An odd tail gets a
 // zero high nibble. __float2int_rn implements nearest-even rounding.
@@ -16,17 +45,17 @@ static __global__ void w4a4_pack_activations(
         float absmax = 0.0f;
         for (int64_t i = threadIdx.x; i < k; i += blockDim.x) {
             const float value = row[i];
-            if (!isfinite(value)) asm volatile("trap;");
-            absmax = fmaxf(absmax, fabsf(value));
+            if ((__float_as_uint(value) & 0x7f800000u) == 0x7f800000u) asm volatile("trap;");
+            absmax = w4a4_max(absmax, w4a4_abs(value));
         }
         maxima[threadIdx.x] = absmax;
         __syncthreads();
         for (int stride = blockDim.x/2; stride > 0; stride /= 2) {
-            if (threadIdx.x < stride) maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+            if (threadIdx.x < stride) maxima[threadIdx.x] = w4a4_max(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
             __syncthreads();
         }
         if (threadIdx.x == 0) {
-            token_scale = maxima[0] / 7.0f;
+            token_scale = w4a4_div_rn(maxima[0], 7.0f);
             scales[token] = token_scale;
         }
         __syncthreads();
@@ -35,10 +64,10 @@ static __global__ void w4a4_pack_activations(
             uint8_t lo = 0;
             uint8_t hi = 0;
             if (scale != 0.0f) {
-                const int q0 = __float2int_rn(__fdiv_rn(row[2*byte], scale));
+                const int q0 = __float2int_rn(w4a4_div_rn(row[2*byte], scale));
                 lo = (uint8_t) (max(-7, min(7, q0)) & 0x0f);
                 if (2*byte + 1 < k) {
-                    const int q1 = __float2int_rn(__fdiv_rn(row[2*byte + 1], scale));
+                    const int q1 = __float2int_rn(w4a4_div_rn(row[2*byte + 1], scale));
                     hi = (uint8_t) (max(-7, min(7, q1)) & 0x0f);
                 }
             }
@@ -83,8 +112,10 @@ static __global__ void w4a4_vector_dot(
             __syncthreads();
         }
         if (valid_row && lane == 0) {
-            const float weighted = (float) partial[threadIdx.y][0] * weight_scales[row];
-            output[token*m + row] = weighted * activation_scales[token];
+            const float weight_scale = weight_scales[row];
+            if ((__float_as_uint(weight_scale) & 0x7f800000u) == 0x7f800000u) asm volatile("trap;");
+            const float weighted = w4a4_mul_rn((float) partial[threadIdx.y][0], weight_scale);
+            output[token*m + row] = w4a4_mul_rn(weighted, activation_scales[token]);
         }
         __syncthreads();
     }
@@ -125,3 +156,11 @@ void ggml_cuda_w4a4_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             packed.ptr, act_scales.ptr, m, n, k, packed_k, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
 }
+
+#else
+
+void ggml_cuda_w4a4_mul_mat(ggml_backend_cuda_context &, ggml_tensor *) {
+    GGML_ABORT("W4A4 CUDA operator requires an NVIDIA backend");
+}
+
+#endif
