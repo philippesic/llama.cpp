@@ -5150,74 +5150,101 @@ struct test_w1a1_mul_mat : public test_case {
 };
 
 struct test_w8a8_mul_mat : public test_case {
-    static constexpr int64_t k = 8;
-    static constexpr int64_t m = 4;
-    static constexpr int64_t n_tokens = 3;
+    const int64_t k;
+    const int64_t m = 4;
+    const int64_t n_tokens = 3;
+    const bool strided;
     std::vector<float> expected;
 
-    std::string vars() override { return "K=8,M=4,N=3,strided=true"; }
+    test_w8a8_mul_mat(int64_t k, bool strided) : k(k), strided(strided) {}
+
+    std::string vars() override {
+        return "K=" + std::to_string(k) + ",M=" + std::to_string(m) + ",N=" +
+            std::to_string(n_tokens) + ",strided=" + (strided ? "true" : "false");
+    }
     double max_nmse_err() override { return 1e-6; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, m);
         ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
-        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + 1, n_tokens);
+        const int64_t stride_k = k + (strided ? 1 : 0);
+        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, stride_k, n_tokens);
         ggml_set_name(w, "w8a8_weights");
         ggml_set_name(s, "w8a8_scales");
-        ggml_set_name(base, "w8a8_activations_base");
-        ggml_tensor * a = ggml_view_2d(ctx, base, k, n_tokens, base->nb[1], 0);
-        ggml_set_name(a, "w8a8_activations");
+        ggml_set_name(base, strided ? "w8a8_activations_base" : "w8a8_activations");
+        ggml_tensor * a = strided ? ggml_view_2d(ctx, base, k, n_tokens, base->nb[1], 0) : base;
+        if (strided) ggml_set_name(a, "w8a8_activations");
         return ggml_w8a8_mul_mat(ctx, w, s, a);
     }
 
     static int8_t quantize_nearest_even(float value, float scale) {
-        const double x = (double) value / (double) scale;
-        const double lower = floor(x);
-        const double fraction = x - lower;
-        double rounded = lower;
-        if (fraction > 0.5 || (fraction == 0.5 && fmod(fabs(lower), 2.0) == 1.0)) rounded += 1.0;
-        if (rounded < -127.0) rounded = -127.0;
-        if (rounded > 127.0) rounded = 127.0;
+        // Match the operator/export path: division is rounded to F32 before tie handling.
+        const float scaled = value / scale;
+        const float lower = floorf(scaled);
+        const float fraction = scaled - lower;
+        float rounded = lower;
+        if (fraction > 0.5f || (fraction == 0.5f && ((int32_t) lower & 1))) rounded += 1.0f;
+        if (rounded < -127.0f) rounded = -127.0f;
+        if (rounded > 127.0f) rounded = 127.0f;
         return (int8_t) rounded;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * w = ggml_get_tensor(ctx, "w8a8_weights");
         ggml_tensor * s = ggml_get_tensor(ctx, "w8a8_scales");
-        ggml_tensor * base = ggml_get_tensor(ctx, "w8a8_activations_base");
-        const int8_t weights[m * k] = {
-            1, -2, 3, -4, 5, -6, 7, -8,
-            -8, 7, -6, 5, -4, 3, -2, 1,
-            127, -127, 64, -64, 32, -32, 16, -16,
-            -1, -1, 1, 1, -3, 3, -5, 5,
+        ggml_tensor * base = ggml_get_tensor(ctx, strided ? "w8a8_activations_base" : "w8a8_activations");
+        std::vector<int8_t> weights(m * k);
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t i = 0; i < k; ++i) {
+                weights[row * k + i] = (int8_t) (((row * 53 + i * 29) % 255) - 127);
+            }
+        }
+        const std::array<float, 4> scales = { 0.5f, 1.25f, -0.75f, 0.125f };
+        std::vector<float> acts(n_tokens * k, 0.0f);
+        const float max_value = 73.4384002685546875f;
+        const float tie_scale = max_value / 127.0f;
+        // These F32 inputs divide to exact half integers in F32, while their
+        // wider-precision quotients land just to one side of the tie.
+        const float tie_values[] = {
+            max_value, tie_scale * 120.5f, tie_scale * -120.5f,
+            tie_scale * 2.5f, tie_scale * -2.5f,
+            tie_scale * 1.5f, tie_scale * -1.5f,
         };
-        const float scales[m] = { 0.5f, 1.25f, -0.75f, 0.125f };
-        const float acts[n_tokens][k] = {
-            { 127.0f, 0.5f, 1.5f, 2.5f, -0.5f, -1.5f, 3.0f, -127.0f },
-            { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-            { -9.0f, 1.25f, 2.25f, -3.75f, 0.0f, 64.0f, 100.0f, -0.25f },
-        };
-        std::vector<float> padded((k + 1) * n_tokens, 1234.0f);
+        const float tie_codes[] = { 127.0f, 120.5f, -120.5f, 2.5f, -2.5f, 1.5f, -1.5f };
+        for (size_t i = 1; i < sizeof(tie_codes) / sizeof(tie_codes[0]); ++i) {
+            GGML_ASSERT(tie_values[i] / tie_scale == tie_codes[i]);
+            GGML_ASSERT((double) tie_values[i] / (double) tie_scale != (double) tie_codes[i]);
+        }
+        for (int64_t i = 0; i < k && i < (int64_t) (sizeof(tie_values) / sizeof(tie_values[0])); ++i) {
+            acts[i] = tie_values[i];
+        }
+        // Token 1 is deliberately all zero. Token 2 covers a broad, repeatable range.
+        for (int64_t i = 0; i < k; ++i) {
+            acts[2 * k + i] = (float) (((i * 37) % 201) - 100) * 0.73125f;
+        }
+
+        const int64_t stride_k = k + (strided ? 1 : 0);
+        std::vector<float> padded(stride_k * n_tokens, 1234.0f);
         for (int64_t token = 0; token < n_tokens; ++token) {
-            std::copy_n(acts[token], k, padded.data() + token * (k + 1));
+            std::copy_n(acts.data() + token * k, k, padded.data() + token * stride_k);
         }
 
         expected.resize(m * n_tokens);
         for (int64_t token = 0; token < n_tokens; ++token) {
             float absmax = 0.0f;
-            for (int64_t i = 0; i < k; ++i) absmax = std::max(absmax, std::abs(acts[token][i]));
+            for (int64_t i = 0; i < k; ++i) absmax = std::max(absmax, std::abs(acts[token * k + i]));
             const float act_scale = absmax / 127.0f;
             for (int64_t row = 0; row < m; ++row) {
                 int32_t dot = 0;
                 for (int64_t i = 0; i < k; ++i) {
-                    const int8_t q = act_scale == 0.0f ? 0 : quantize_nearest_even(acts[token][i], act_scale);
+                    const int8_t q = act_scale == 0.0f ? 0 : quantize_nearest_even(acts[token * k + i], act_scale);
                     dot += (int32_t) weights[row * k + i] * (int32_t) q;
                 }
                 expected[token * m + row] = ((float) dot * scales[row]) * act_scale;
             }
         }
-        ggml_backend_tensor_set(w, weights, 0, sizeof(weights));
-        ggml_backend_tensor_set(s, scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(int8_t));
+        ggml_backend_tensor_set(s, scales.data(), 0, scales.size() * sizeof(float));
         ggml_backend_tensor_set(base, padded.data(), 0, padded.size() * sizeof(float));
     }
 
@@ -10101,7 +10128,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_w1a1_mul_mat(k));
     }
     test_cases.emplace_back(new test_w1a1_mul_mat(33, true));
-    test_cases.emplace_back(new test_w8a8_mul_mat());
+    test_cases.emplace_back(new test_w8a8_mul_mat(8, false));
+    test_cases.emplace_back(new test_w8a8_mul_mat(33, true));
+    test_cases.emplace_back(new test_w8a8_mul_mat(9728, true));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
