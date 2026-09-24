@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
+from .w4a4 import quantize_w4a4_weights
 from .w8a8 import quantize_w8a8_weights
 
 
@@ -73,6 +74,7 @@ class LlamaModel(TextModel):
     w1a1_eagle_head = False
     w1a1_eagle_groups: tuple[str, ...] = ()
     w8a8_eagle = False
+    w4a4_eagle = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -252,6 +254,29 @@ class LlamaModel(TextModel):
                 self.gguf_writer.add_string(f"{prefix}.tensor.{key_name}.codes", f"{name.removesuffix('.weight')}.w8a8_codes")
                 self.gguf_writer.add_string(f"{prefix}.tensor.{key_name}.scale", f"{name.removesuffix('.weight')}.w8a8_scale")
 
+        if self.w4a4_eagle:
+            prefix = "eagle3.w4a4"
+            self.gguf_writer.add_uint32(f"{prefix}.version", 1)
+            self.gguf_writer.add_array(f"{prefix}.groups", ["fusion", "attention", "ffn", "head"])
+            self.gguf_writer.add_array(f"{prefix}.tensors", sorted(self._w4a4_full_tensors))
+            self.gguf_writer.add_string(f"{prefix}.weight_dtype", "i4_signed_packed_i8")
+            self.gguf_writer.add_string(f"{prefix}.activation_dtype", "i4_signed_packed_i8")
+            self.gguf_writer.add_string(f"{prefix}.code_range", "-7_to_7")
+            self.gguf_writer.add_string(f"{prefix}.nibble_order", "even_low_odd_high")
+            self.gguf_writer.add_string(f"{prefix}.nibble_encoding", "twos_complement")
+            self.gguf_writer.add_string(f"{prefix}.odd_k_padding", "zero_high_nibble")
+            self.gguf_writer.add_string(f"{prefix}.weight_scale", "f32_absmax_per_row_div7")
+            self.gguf_writer.add_string(f"{prefix}.activation_scale", "f32_absmax_per_token_div7")
+            self.gguf_writer.add_string(f"{prefix}.rounding", "nearest_even")
+            self.gguf_writer.add_string(f"{prefix}.zero_scale", "zero_codes")
+            self.gguf_writer.add_string(f"{prefix}.accumulator", "i32")
+            self.gguf_writer.add_string(f"{prefix}.output", "f32_dot_weight_activation_then_bias")
+            for name, (_, logical_k) in self._w4a4_full_tensors.items():
+                key_name = name.replace(".", "_")
+                self.gguf_writer.add_uint32(f"{prefix}.tensor.{key_name}.logical_k", logical_k)
+                self.gguf_writer.add_string(f"{prefix}.tensor.{key_name}.packed", f"{name.removesuffix('.weight')}.w4a4_packed")
+                self.gguf_writer.add_string(f"{prefix}.tensor.{key_name}.scale", f"{name.removesuffix('.weight')}.w4a4_scale")
+
         if not self.is_mistral_format:
             self.gguf_writer.add_vocab_size(hparams["vocab_size"])
 
@@ -413,6 +438,34 @@ class LlamaModel(TextModel):
                 yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(rope_factors, dtype=torch.float32))
 
     def prepare_tensors(self):
+        full_w4a4 = {}
+        if self.w4a4_eagle:
+            if self.w1a1_eagle_head or self.w1a1_eagle_groups or self.w8a8_eagle:
+                raise ValueError("--w4a4-eagle cannot be combined with other EAGLE quantization flags")
+            if not getattr(self, "is_eagle3", False) or self.block_count != 1:
+                raise ValueError("--w4a4-eagle requires a one-layer EAGLE-3 draft checkpoint")
+            if self.is_big_endian:
+                raise ValueError("--w4a4-eagle currently requires little-endian GGUF")
+            candidates = eagle3_w1a1_candidates(self)
+            expected = {target for _, target in candidates.values()}
+            if len(expected) != 9:
+                raise ValueError("EAGLE W4A4 requires exactly nine eligible linears")
+            for source, (_, target) in candidates.items():
+                if source not in self.model_tensors:
+                    continue
+                bid = int(source.split(".")[2]) if source.startswith("model.layers.") else (
+                    int(source.split(".")[1]) if source.startswith("layers.") else None)
+                weight = LazyTorchTensor.to_eager(self.model_tensors.pop(source)()).cpu()
+                mapped = list(self.modify_tensors(weight, source, bid))
+                if len(mapped) != 1 or mapped[0][0] != target:
+                    raise ValueError(f"Unexpected EAGLE W4A4 source mapping for {source}")
+                packed, scales = quantize_w4a4_weights(mapped[0][1])
+                full_w4a4[target] = (packed, scales, int(mapped[0][1].shape[1]))
+            missing = sorted(expected - full_w4a4.keys())
+            if missing:
+                raise ValueError(f"EAGLE W4A4 coverage is missing source weights for: {missing}")
+            self._w4a4_full_tensors = {name: (scales, logical_k) for name, (_, scales, logical_k) in full_w4a4.items()}
+
         full_w8a8 = {}
         if self.w8a8_eagle:
             if self.w1a1_eagle_head or self.w1a1_eagle_groups:
@@ -504,6 +557,11 @@ class LlamaModel(TextModel):
             base = name.removesuffix(".weight")
             self.gguf_writer.add_tensor(f"{base}.w8a8_codes", codes, raw_dtype=gguf.GGMLQuantizationType.I8)
             self.gguf_writer.add_tensor(f"{base}.w8a8_scale", scales, raw_dtype=gguf.GGMLQuantizationType.F32)
+
+        for name, (packed, scales, _) in full_w4a4.items():
+            base = name.removesuffix(".weight")
+            self.gguf_writer.add_tensor(f"{base}.w4a4_packed", packed, raw_dtype=gguf.GGMLQuantizationType.I8)
+            self.gguf_writer.add_tensor(f"{base}.w4a4_scale", scales, raw_dtype=gguf.GGMLQuantizationType.F32)
 
         # eagle3: write d2t as absolute target token ids
         if getattr(self, 'is_eagle3', False) and hasattr(self, '_eagle3_int_tensors'):

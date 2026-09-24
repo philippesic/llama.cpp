@@ -181,6 +181,10 @@ def parse_args() -> argparse.Namespace:
         "--w8a8-eagle", action="store_true",
         help="Export all nine EAGLE-3 draft linears as signed I8 codes and F32 row scales; requires a matching W8A8 runtime.",
     )
+    parser.add_argument(
+        "--w4a4-eagle", action="store_true",
+        help="Export all nine EAGLE-3 draft linears as packed signed I4 codes and F32 row scales; requires a matching W4A4 runtime.",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -322,9 +326,15 @@ def main() -> None:
         if args.w8a8_eagle:
             if not getattr(model_instance, "is_eagle3", False):
                 raise ValueError("--w8a8-eagle requires an EAGLE-3 draft checkpoint")
-            if args.w1a1_eagle_head or args.w1a1_eagle_groups:
-                raise ValueError("--w8a8-eagle cannot be combined with EAGLE W1A1 flags")
+            if args.w1a1_eagle_head or args.w1a1_eagle_groups or args.w4a4_eagle:
+                raise ValueError("--w8a8-eagle cannot be combined with other EAGLE quantization flags")
             model_instance.w8a8_eagle = True
+        if args.w4a4_eagle:
+            if not getattr(model_instance, "is_eagle3", False):
+                raise ValueError("--w4a4-eagle requires an EAGLE-3 draft checkpoint")
+            if args.w1a1_eagle_head or args.w1a1_eagle_groups or args.w8a8_eagle:
+                raise ValueError("--w4a4-eagle cannot be combined with other EAGLE quantization flags")
+            model_instance.w4a4_eagle = True
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
