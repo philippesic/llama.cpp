@@ -60,6 +60,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/w1a1.cuh"
 #include "ggml-cuda/w4a4.cuh"
+#include "ggml-cuda/w8a8.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
@@ -2266,6 +2267,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_W4A4_MUL_MAT:
             ggml_cuda_w4a4_mul_mat(ctx, dst);
+            break;
+        case GGML_OP_W8A8_MUL_MAT:
+            ggml_cuda_w8a8_mul_mat(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
@@ -5269,6 +5273,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[2]->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
                    op->src[2]->ne[0] > 0 && op->src[0]->ne[0] == (op->src[2]->ne[0] + 1)/2 &&
                    op->src[1]->ne[0] == op->src[0]->ne[1];
+#else
+            return false;
+#endif
+        case GGML_OP_W8A8_MUL_MAT:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            return op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   op->src[2]->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
+                   op->src[0]->ne[0] > 0 && op->src[0]->ne[1] > 0 &&
+                   op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[0] == op->src[0]->ne[1] &&
+                   op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[0] == op->src[0]->ne[0] && op->src[2]->ne[1] > 0 &&
+                   op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == op->src[0]->ne[1] && op->ne[1] == op->src[2]->ne[1];
 #else
             return false;
 #endif
