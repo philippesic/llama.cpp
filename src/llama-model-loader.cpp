@@ -347,6 +347,9 @@ namespace GGUFMeta {
         return true;
     }
 
+    template bool llama_model_loader::get_arr<std::string>(
+        const std::string & key, std::vector<std::string> & result, bool required);
+
     template<typename T, size_t N_MAX>
     bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> & result, bool required) {
         const gguf_context * ctx = metadata;
