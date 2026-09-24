@@ -5042,6 +5042,113 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Packed W1A1 contract, checked against a scalar sign comparison rather than
+// against the CPU backend's implementation of the same operation.
+struct test_w1a1_mul_mat : public test_case {
+    const int64_t k;
+    const bool strided;
+    static constexpr int64_t m = 7;
+    static constexpr int64_t n_tokens = 3;
+    std::vector<float> expected;
+
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false) : k(k), strided(strided) {}
+
+    std::string vars() override { return VARS_TO_STR2(k, strided); }
+    double max_nmse_err() override { return 1e-6; }
+
+    static float weight_value(int64_t row, int64_t i) {
+        switch (row) {
+            case 0: return i % 2 ? -0.0f : +0.0f;
+            case 1: return i % 3 ? -1.0f : 2.0f;
+            case 2: return -1.0f;
+            case 3: return 1.0f;
+            case 4: return i % 5 ? 1.0f : -1.0f;
+            case 5: return i % 7 ? -1.0f : +0.0f;
+            default: return i % 11 ? 1.0f : -0.0f;
+        }
+    }
+
+    static float activation_value(int64_t token, int64_t i) {
+        if (token == 0) return i % 5 == 0 ? -0.0f : (i % 3 == 0 ? -2.0f : 1.0f);
+        if (token == 1) return i % 2 ? -0.0f : +0.0f;
+        return i % 7 == 0 ? +0.0f : (i % 2 ? -0.5f : 3.0f);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (k - 1)/32 + 1, m);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (strided ? 1 : 0), n_tokens);
+        if (strided) {
+            ggml_set_name(a, "w1a1_activations_base");
+            a = ggml_view_2d(ctx, a, k, n_tokens, a->nb[1], 0);
+        }
+        ggml_set_name(w, "w1a1_weights");
+        ggml_set_name(s, "w1a1_scales");
+        ggml_set_name(a, "w1a1_activations");
+        return ggml_w1a1_mul_mat(ctx, w, s, a, k);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_get_tensor(ctx, "w1a1_weights");
+        ggml_tensor * s = ggml_get_tensor(ctx, "w1a1_scales");
+        ggml_tensor * a = ggml_get_tensor(ctx, "w1a1_activations");
+        const int64_t words = (k - 1)/32 + 1;
+        std::vector<uint32_t> packed(words * m);
+        std::vector<float> acts(k * n_tokens);
+        const float scales[m] = { 0.5f, 1.25f, -0.75f, 0.0f, 0.3f, 1.0f, -0.125f };
+
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t i = 0; i < k; ++i) {
+                if (weight_value(row, i) >= 0.0f) packed[row * words + i/32] |= UINT32_C(1) << (i % 32);
+            }
+            // Deliberately set unused bits. The kernel must mask them.
+            if (k % 32) packed[row * words + words - 1] |= ~((UINT32_C(1) << (k % 32)) - 1);
+        }
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t i = 0; i < k; ++i) acts[token * k + i] = activation_value(token, i);
+        }
+
+        expected.resize(m * n_tokens);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            double abs_sum = 0.0;
+            for (int64_t i = 0; i < k; ++i) abs_sum += std::abs(acts[token * k + i]);
+            const float act_scale = float(abs_sum / double(k));
+            for (int64_t row = 0; row < m; ++row) {
+                int64_t matches = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    matches += (weight_value(row, i) >= 0.0f) == (acts[token * k + i] >= 0.0f) ? 1 : -1;
+                }
+                const float weighted = float(matches) * scales[row];
+                expected[token * m + row] = weighted * act_scale;
+            }
+        }
+
+        ggml_backend_tensor_set(w, packed.data(), 0, packed.size() * sizeof(uint32_t));
+        ggml_backend_tensor_set(s, scales, 0, sizeof(scales));
+        if (strided) {
+            ggml_tensor * base = ggml_get_tensor(ctx, "w1a1_activations_base");
+            std::vector<float> padded((k + 1) * n_tokens, 1234.0f);
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                std::copy_n(acts.data() + token * k, k, padded.data() + token * (k + 1));
+            }
+            ggml_backend_tensor_set(base, padded.data(), 0, padded.size() * sizeof(float));
+        } else {
+            ggml_backend_tensor_set(a, acts.data(), 0, acts.size() * sizeof(float));
+        }
+    }
+
+    double err(const float * lhs, const float * rhs, size_t count) override {
+        if (count != expected.size()) return test_case::err(lhs, rhs, count);
+        double worst = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            const double denom = 1.0 + std::abs(double(expected[i]));
+            worst = std::max(worst, std::abs(double(lhs[i]) - expected[i]) / denom);
+            worst = std::max(worst, std::abs(double(rhs[i]) - expected[i]) / denom);
+        }
+        return worst;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9904,6 +10011,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    // 2560 is the audited EAGLE drafter head K width.
+    for (int64_t k : {31, 32, 33, 2560}) {
+        test_cases.emplace_back(new test_w1a1_mul_mat(k));
+    }
+    test_cases.emplace_back(new test_w1a1_mul_mat(33, true));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

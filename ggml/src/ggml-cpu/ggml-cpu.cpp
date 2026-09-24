@@ -440,6 +440,22 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_W1A1_MUL_MAT: {
+            const ggml_tensor * scales = op->src[1];
+            const ggml_tensor * acts   = op->src[2];
+            if (!src0 || !scales || !acts || op->type != GGML_TYPE_F32 ||
+                src0->type != GGML_TYPE_I32 || scales->type != GGML_TYPE_F32 || acts->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src0) || !ggml_is_contiguous(scales) || !ggml_is_contiguous(acts)) {
+                return false;
+            }
+            int64_t k;
+            memcpy(&k, op->op_params, sizeof(k));
+            return k > 0 && src0->ne[0] == (k - 1)/32 + 1 &&
+                src0->ne[1] > 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                scales->ne[0] == src0->ne[1] && scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1 &&
+                acts->ne[0] == k && acts->ne[1] > 0 && acts->ne[2] == 1 && acts->ne[3] == 1 &&
+                op->ne[0] == src0->ne[1] && op->ne[1] == acts->ne[1];
+        }
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

@@ -1099,9 +1099,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "W1A1_MUL_MAT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1215,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "w1a1(X,s,Y)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3352,6 +3354,37 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_w1a1_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed_weights,
+        struct ggml_tensor  * weight_scales,
+        struct ggml_tensor  * activations,
+        int64_t               logical_k) {
+    GGML_ASSERT(logical_k > 0);
+    GGML_ASSERT(packed_weights->type == GGML_TYPE_I32);
+    GGML_ASSERT(weight_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(activations->type == GGML_TYPE_F32);
+    GGML_ASSERT(packed_weights->ne[0] == (logical_k - 1)/32 + 1);
+    GGML_ASSERT(packed_weights->ne[1] > 0 && packed_weights->ne[2] == 1 && packed_weights->ne[3] == 1);
+    GGML_ASSERT(weight_scales->ne[0] == packed_weights->ne[1]);
+    GGML_ASSERT(weight_scales->ne[1] == 1 && weight_scales->ne[2] == 1 && weight_scales->ne[3] == 1);
+    GGML_ASSERT(activations->ne[0] == logical_k && activations->ne[1] > 0);
+    GGML_ASSERT(activations->ne[2] == 1 && activations->ne[3] == 1);
+
+    // A dedicated CPU/CUDA kernel only sees canonical contiguous sources.
+    if (!ggml_is_contiguous(packed_weights)) packed_weights = ggml_cont(ctx, packed_weights);
+    if (!ggml_is_contiguous(weight_scales))  weight_scales  = ggml_cont(ctx, weight_scales);
+    if (!ggml_is_contiguous(activations))    activations    = ggml_cont(ctx, activations);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, packed_weights->ne[1], activations->ne[1]);
+    result->op     = GGML_OP_W1A1_MUL_MAT;
+    result->src[0] = packed_weights;
+    result->src[1] = weight_scales;
+    result->src[2] = activations;
+    ggml_set_op_params(result, &logical_k, sizeof(logical_k));
     return result;
 }
 
@@ -7222,6 +7255,9 @@ static void ggml_compute_backward(
         case GGML_OP_NONE: {
             // noop
         } break;
+        case GGML_OP_W1A1_MUL_MAT: {
+            GGML_ABORT("backward pass for W1A1_MUL_MAT is unsupported");
+        }
         case GGML_OP_COUNT:
         default: {
             GGML_ABORT("%s: unsupported ggml op for backward pass: %s\n", __func__, ggml_op_name(tensor->op));

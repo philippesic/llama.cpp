@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_W1A1_MUL_MAT,
+
         GGML_OP_COUNT,
     };
 
@@ -1483,6 +1485,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Packed W1A1 matmul: I32 signs [ceil(K/32), M], F32 row scales [M],
+    // F32 activations [K, N] -> F32 [M, N]. Bit 1 means value >= 0.
+    // Activations use one mean-absolute F32 scale per row. No backward pass.
+    GGML_API struct ggml_tensor * ggml_w1a1_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed_weights,
+            struct ggml_tensor  * weight_scales,
+            struct ggml_tensor  * activations,
+            int64_t               logical_k);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

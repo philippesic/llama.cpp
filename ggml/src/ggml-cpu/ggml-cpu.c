@@ -1467,6 +1467,74 @@ UseGgmlGemm2:;
     }
 }
 
+// Packed signs are little-bit-order I32 words. This is intentionally separate
+// from MUL_MAT/Q1_0: scales are per full row and activations are packed here.
+static int ggml_w1a1_popcount32(uint32_t x) {
+    int count = 0;
+    while (x != 0) {
+        x &= x - 1;
+        ++count;
+    }
+    return count;
+}
+
+static void ggml_compute_forward_w1a1_mul_mat(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weights = dst->src[0];
+    const struct ggml_tensor * scales  = dst->src[1];
+    const struct ggml_tensor * acts    = dst->src[2];
+    int64_t k;
+    memcpy(&k, dst->op_params, sizeof(k));
+    const int64_t words = (k - 1)/32 + 1;
+    const int64_t m = weights->ne[1];
+    const int64_t n = acts->ne[1];
+    GGML_ASSERT(k > 0 && weights->type == GGML_TYPE_I32 && scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(acts->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] == words && scales->ne[0] == m && acts->ne[0] == k);
+    GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
+    GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
+
+    uint32_t * signs = (uint32_t *) params->wdata + params->ith * words;
+    const int64_t row_begin = m * params->ith / params->nth;
+    const int64_t row_end   = m * (params->ith + 1) / params->nth;
+    if (row_begin == row_end) {
+        return;
+    }
+    const uint32_t tail_mask = (k % 32 == 0) ? UINT32_MAX : ((UINT32_C(1) << (k % 32)) - 1);
+    const float * const scale_data = (const float *) scales->data;
+    const float * const act_data   = (const float *) acts->data;
+    const uint32_t * const weight_data = (const uint32_t *) weights->data;
+    float * const output = (float *) dst->data;
+
+    for (int64_t token = 0; token < n; ++token) {
+        const float * act = act_data + token * k;
+        double abs_sum = 0.0;
+        memset(signs, 0, words * sizeof(uint32_t));
+        for (int64_t i = 0; i < k; ++i) {
+            const float value = act[i];
+            GGML_ASSERT(isfinite(value));
+            abs_sum += (double) fabsf(value);
+            if (value >= 0.0f) {
+                signs[i / 32] |= UINT32_C(1) << (i % 32);
+            }
+        }
+        const float act_scale = (float) (abs_sum / (double) k);
+        for (int64_t row = row_begin; row < row_end; ++row) {
+            const uint32_t * packed = weight_data + row * words;
+            int64_t mismatches = 0;
+            for (int64_t word = 0; word < words; ++word) {
+                const uint32_t mask = word == words - 1 ? tail_mask : UINT32_MAX;
+                mismatches += ggml_w1a1_popcount32((packed[word] ^ signs[word]) & mask);
+            }
+            GGML_ASSERT(isfinite(scale_data[row]));
+            const float dot = (float) (k - 2 * mismatches);
+            const float weighted = dot * scale_data[row];
+            output[token * m + row] = weighted * act_scale;
+        }
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1869,6 +1937,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_W1A1_MUL_MAT:
+            {
+                ggml_compute_forward_w1a1_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2362,6 +2434,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_W1A1_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
             {
@@ -2896,6 +2969,12 @@ struct ggml_cplan ggml_graph_plan(
                         if (ggml_cpu_iqp_supports_mul_mat(node)) {
                             cur = GGML_PAD(cur, 64) + n_tasks * ggml_cpu_iqp_scratch_size(node);
                         }
+                    } break;
+                case GGML_OP_W1A1_MUL_MAT:
+                    {
+                        int64_t k;
+                        memcpy(&k, node->op_params, sizeof(k));
+                        cur = ((k - 1)/32 + 1) * sizeof(uint32_t) * n_tasks;
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
