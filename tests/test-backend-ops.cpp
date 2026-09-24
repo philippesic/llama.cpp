@@ -5047,13 +5047,14 @@ struct test_mul_mat : public test_case {
 struct test_w1a1_mul_mat : public test_case {
     const int64_t k;
     const bool strided;
-    static constexpr int64_t m = 7;
-    static constexpr int64_t n_tokens = 3;
+    const int64_t m;
+    const int64_t n_tokens;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false) : k(k), strided(strided) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int64_t m = 7, int64_t n_tokens = 3)
+        : k(k), strided(strided), m(m), n_tokens(n_tokens) {}
 
-    std::string vars() override { return VARS_TO_STR2(k, strided); }
+    std::string vars() override { return VARS_TO_STR4(k, strided, m, n_tokens); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5064,14 +5065,14 @@ struct test_w1a1_mul_mat : public test_case {
             case 3: return 1.0f;
             case 4: return i % 5 ? 1.0f : -1.0f;
             case 5: return i % 7 ? -1.0f : +0.0f;
-            default: return i % 11 ? 1.0f : -0.0f;
+            default: return (i + 3*row) % (7 + row % 5) < 3 ? -1.0f : 1.0f;
         }
     }
 
     static float activation_value(int64_t token, int64_t i) {
         if (token == 0) return i % 5 == 0 ? -0.0f : (i % 3 == 0 ? -2.0f : 1.0f);
         if (token == 1) return i % 2 ? -0.0f : +0.0f;
-        return i % 7 == 0 ? +0.0f : (i % 2 ? -0.5f : 3.0f);
+        return i % (7 + token % 4) == 0 ? +0.0f : (i % (2 + token % 3) ? -0.5f * (token + 1) : 3.0f);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5095,7 +5096,9 @@ struct test_w1a1_mul_mat : public test_case {
         const int64_t words = (k - 1)/32 + 1;
         std::vector<uint32_t> packed(words * m);
         std::vector<float> acts(k * n_tokens);
-        const float scales[m] = { 0.5f, 1.25f, -0.75f, 0.0f, 0.3f, 1.0f, -0.125f };
+        const float scale_pattern[] = { 0.5f, 1.25f, -0.75f, 0.0f, 0.3f, 1.0f, -0.125f };
+        std::vector<float> scales(m);
+        for (int64_t row = 0; row < m; ++row) scales[row] = scale_pattern[row % 7];
 
         for (int64_t row = 0; row < m; ++row) {
             for (int64_t i = 0; i < k; ++i) {
@@ -5124,7 +5127,7 @@ struct test_w1a1_mul_mat : public test_case {
         }
 
         ggml_backend_tensor_set(w, packed.data(), 0, packed.size() * sizeof(uint32_t));
-        ggml_backend_tensor_set(s, scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(s, scales.data(), 0, scales.size() * sizeof(float));
         if (strided) {
             ggml_tensor * base = ggml_get_tensor(ctx, "w1a1_activations_base");
             std::vector<float> padded((k + 1) * n_tokens, 1234.0f);
@@ -10017,6 +10020,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_w1a1_mul_mat(k));
     }
     test_cases.emplace_back(new test_w1a1_mul_mat(33, true));
+    test_cases.emplace_back(new test_w1a1_mul_mat(128, false, 8, 8));
+    test_cases.emplace_back(new test_w1a1_mul_mat(129, false, 9, 10));
+    test_cases.emplace_back(new test_w1a1_mul_mat(2560, false, 320, 1));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
