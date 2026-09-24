@@ -177,6 +177,10 @@ def parse_args() -> argparse.Namespace:
         "--w1a1-eagle-groups", choices=("fusion", "attention", "ffn", "all"),
         help="Pack EAGLE-3 linears in one coverage group (or all nine eligible linears); head-only remains --w1a1-eagle-head.",
     )
+    parser.add_argument(
+        "--w8a8-eagle", action="store_true",
+        help="Export all nine EAGLE-3 draft linears as signed I8 codes and F32 row scales; requires a matching W8A8 runtime.",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -315,6 +319,12 @@ def main() -> None:
                 ("fusion", "attention", "ffn", "head") if args.w1a1_eagle_groups == "all"
                 else (args.w1a1_eagle_groups,)
             )
+        if args.w8a8_eagle:
+            if not getattr(model_instance, "is_eagle3", False):
+                raise ValueError("--w8a8-eagle requires an EAGLE-3 draft checkpoint")
+            if args.w1a1_eagle_head or args.w1a1_eagle_groups:
+                raise ValueError("--w8a8-eagle cannot be combined with EAGLE W1A1 flags")
+            model_instance.w8a8_eagle = True
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
