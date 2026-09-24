@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -3911,12 +3913,67 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                struct verify_logit_trace {
+                    size_t row;
+                    int64_t position;
+                    int32_t batch_index;
+                    llama_token draft;
+                    llama_token top_id[2] = { -1, -1 };
+                    float top_logit[2] = { -std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity() };
+                    bool has_logits = false;
+                };
+                std::vector<verify_logit_trace> verify_traces;
+                const char * trace_verify_logits = std::getenv("W1A1_TRACE_VERIFY_LOGITS");
+                if (trace_verify_logits && trace_verify_logits[0] == '1' && trace_verify_logits[1] == '\0') {
+                    const int64_t base_position = slot.stats.n_gen;
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
+                    for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                        const int64_t position = base_position + i;
+                        if (position != 33 && position != 123) {
+                            continue;
+                        }
+                        verify_logit_trace trace_row { i, position, slot.spec_i_batch[i], i < n_draft ? slot.spec_draft[i] : -1 };
+                        const float * logits = llama_get_logits_ith(slot.ctx_tgt, trace_row.batch_index);
+                        if (logits) {
+                            trace_row.has_logits = true;
+                            for (llama_token id = 0; id < n_vocab; ++id) {
+                                const float logit = logits[id];
+                                if (logit > trace_row.top_logit[0]) {
+                                    trace_row.top_id[1] = trace_row.top_id[0];
+                                    trace_row.top_logit[1] = trace_row.top_logit[0];
+                                    trace_row.top_id[0] = id;
+                                    trace_row.top_logit[0] = logit;
+                                } else if (logit > trace_row.top_logit[1]) {
+                                    trace_row.top_id[1] = id;
+                                    trace_row.top_logit[1] = logit;
+                                }
+                            }
+                        }
+                        verify_traces.push_back(trace_row);
+                    }
+                }
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                for (const auto & trace_row : verify_traces) {
+                    const bool emitted = trace_row.row < accepted.size();
+                    const llama_token chosen = emitted ? accepted[trace_row.row] : -1;
+                    const char * status = !emitted ? "not-sampled" :
+                        trace_row.row == n_draft ? "bonus" :
+                        chosen == trace_row.draft ? "accepted" : "rejected";
+                    if (trace_row.has_logits) {
+                        SLT_INF(slot, "verify_logits pos=%" PRId64 " row=%zu batch=%d draft=%d chosen=%d status=%s top1=%d:%.9g top2=%d:%.9g margin=%.9g\n",
+                                trace_row.position, trace_row.row, trace_row.batch_index, trace_row.draft, chosen, status,
+                                trace_row.top_id[0], trace_row.top_logit[0], trace_row.top_id[1], trace_row.top_logit[1],
+                                trace_row.top_logit[0] - trace_row.top_logit[1]);
+                    } else {
+                        SLT_INF(slot, "verify_logits pos=%" PRId64 " row=%zu batch=%d draft=%d chosen=%d status=%s logits=null\n",
+                                trace_row.position, trace_row.row, trace_row.batch_index, trace_row.draft, chosen, status);
+                    }
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
