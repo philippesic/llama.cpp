@@ -327,6 +327,23 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
+    // EAGLE-3 full-drafter packed W1A1 projections. These are populated only
+    // by the versioned EAGLE W1A1 GGUF contract.
+    struct ggml_tensor * wq_w1a1_packed = nullptr;
+    struct ggml_tensor * wq_w1a1_scale  = nullptr;
+    struct ggml_tensor * wk_w1a1_packed = nullptr;
+    struct ggml_tensor * wk_w1a1_scale  = nullptr;
+    struct ggml_tensor * wv_w1a1_packed = nullptr;
+    struct ggml_tensor * wv_w1a1_scale  = nullptr;
+    struct ggml_tensor * wo_w1a1_packed = nullptr;
+    struct ggml_tensor * wo_w1a1_scale  = nullptr;
+    struct ggml_tensor * ffn_gate_w1a1_packed = nullptr;
+    struct ggml_tensor * ffn_gate_w1a1_scale  = nullptr;
+    struct ggml_tensor * ffn_down_w1a1_packed = nullptr;
+    struct ggml_tensor * ffn_down_w1a1_scale  = nullptr;
+    struct ggml_tensor * ffn_up_w1a1_packed = nullptr;
+    struct ggml_tensor * ffn_up_w1a1_scale  = nullptr;
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
@@ -633,6 +650,8 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_w1a1_packed = nullptr; // EAGLE-3 drafter-only packed vocabulary head
     struct ggml_tensor * output_w1a1_scale  = nullptr;
+    struct ggml_tensor * fc_w1a1_packed = nullptr; // EAGLE-3 full-drafter feature fusion
+    struct ggml_tensor * fc_w1a1_scale  = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 

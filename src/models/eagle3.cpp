@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include <algorithm>
+#include <set>
+
 void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -54,9 +57,6 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         LLAMA_LOG_INFO("%s: EAGLE3 without d2t - sharing same vocab_size with target (vocab_size = %lld)\n", __func__, (long long)n_draft_vocab);
     }
 
-    // Feature fusion layer: projects 3 target layers to draft hidden size
-    fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
-
     // RMSNorm on the fused target features (input to fc), only when norm_before_fc is set.
     if (hparams.norm_before_fc) {
         output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd_inp}, 0);
@@ -65,6 +65,94 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     // Output layer (uses draft vocab size)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
 
+    uint32_t full_w1a1_version = 0;
+    const bool has_full_w1a1 = ml->get_key("eagle3.w1a1.version", full_w1a1_version, false);
+    std::vector<std::string> w1a1_groups, w1a1_tensors;
+    if (has_full_w1a1) {
+        std::string bit_order, sign_rule, scale_rule, arithmetic;
+        ml->get_arr("eagle3.w1a1.groups", w1a1_groups);
+        ml->get_arr("eagle3.w1a1.tensors", w1a1_tensors);
+        ml->get_key("eagle3.w1a1.bit_order", bit_order);
+        ml->get_key("eagle3.w1a1.sign_rule", sign_rule);
+        ml->get_key("eagle3.w1a1.scale_rule", scale_rule);
+        ml->get_key("eagle3.w1a1.arithmetic", arithmetic);
+        const std::map<std::string, std::vector<std::string>> group_tensors = {
+            {"fusion", {"fc.weight"}},
+            {"attention", {"blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.0.attn_output.weight"}},
+            {"ffn", {"blk.0.ffn_gate.weight", "blk.0.ffn_down.weight", "blk.0.ffn_up.weight"}},
+            {"head", {"output.weight"}},
+        };
+        std::set<std::string> expected;
+        for (const auto & group : w1a1_groups) {
+            const auto it = group_tensors.find(group);
+            if (it == group_tensors.end()) {
+                throw std::runtime_error("EAGLE3 W1A1 metadata contains an unknown group");
+            }
+            expected.insert(it->second.begin(), it->second.end());
+        }
+        const std::set<std::string> declared(w1a1_tensors.begin(), w1a1_tensors.end());
+        const std::set<std::string> declared_groups(w1a1_groups.begin(), w1a1_groups.end());
+        if (full_w1a1_version != 1 || w1a1_groups.empty() || declared_groups.size() != w1a1_groups.size() ||
+                declared.size() != w1a1_tensors.size() ||
+                declared != expected || bit_order != "little" || sign_rule != "nonnegative_is_one" ||
+                scale_rule != "f32_mean_abs" || arithmetic != "f32") {
+            throw std::runtime_error("EAGLE3 W1A1 full-drafter metadata has an unsupported or incomplete audit record");
+        }
+        std::string coverage;
+        for (const auto & group : w1a1_groups) coverage += (coverage.empty() ? "" : ",") + group;
+        LLAMA_LOG_INFO("%s: EAGLE3 W1A1 active groups: %s (%zu tensors)\n", __func__, coverage.c_str(), declared.size());
+    }
+
+    auto load_w1a1_linear = [&](llm_tensor tensor, int bid, const std::string & base_name,
+            int64_t logical_k, int64_t rows, ggml_tensor *& dense,
+            ggml_tensor *& packed, ggml_tensor *& scales, int flags) {
+        const std::string packed_name = base_name.substr(0, base_name.size() - std::string(".weight").size()) + ".w1a1_packed";
+        const std::string scale_name = base_name.substr(0, base_name.size() - std::string(".weight").size()) + ".w1a1_scale";
+        const bool declared = std::find(w1a1_tensors.begin(), w1a1_tensors.end(), base_name) != w1a1_tensors.end();
+        const auto * packed_meta = ml->get_tensor_meta(packed_name.c_str());
+        const auto * scale_meta = ml->get_tensor_meta(scale_name.c_str());
+        if (declared != (packed_meta != nullptr && scale_meta != nullptr) || (packed_meta != nullptr) != (scale_meta != nullptr)) {
+            throw std::runtime_error("EAGLE3 W1A1 declared tensor requires both packed data and scales");
+        }
+        if (!declared) {
+            dense = create_tensor(tn(tensor, "weight", bid), {logical_k, rows}, flags);
+            return;
+        }
+        if (ml->get_tensor_meta(base_name.c_str()) != nullptr || packed_meta->type != GGML_TYPE_I32 || scale_meta->type != GGML_TYPE_F32) {
+            throw std::runtime_error("EAGLE3 W1A1 tensor must omit its dense shadow and use I32 signs/F32 scales");
+        }
+        std::string suffix = base_name;
+        std::replace(suffix.begin(), suffix.end(), '.', '_');
+        uint32_t audited_k = 0;
+        std::string audited_packed, audited_scale;
+        const std::string audit = "eagle3.w1a1.tensor." + suffix;
+        ml->get_key((audit + ".logical_k").c_str(), audited_k);
+        ml->get_key((audit + ".packed").c_str(), audited_packed);
+        ml->get_key((audit + ".scale").c_str(), audited_scale);
+        if (audited_k != logical_k || audited_packed != packed_name || audited_scale != scale_name ||
+                packed_meta->ne[0] != (logical_k + 31) / 32 || packed_meta->ne[1] != rows ||
+                scale_meta->ne[0] != rows) {
+            throw std::runtime_error("EAGLE3 W1A1 tensor shape or audit metadata mismatch");
+        }
+        packed = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_packed", bid, -1), {(logical_k + 31) / 32, rows}, 0);
+        scales = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_scale", bid, -1), {rows}, 0);
+        dense = nullptr;
+        LLAMA_LOG_INFO("%s: EAGLE3 W1A1 loaded %s (K=%lld, rows=%lld)\n", __func__, base_name.c_str(),
+                (long long) logical_k, (long long) rows);
+    };
+
+    if (has_full_w1a1 && ml->get_key("eagle3.w1a1_head.version", full_w1a1_version, false)) {
+        throw std::runtime_error("EAGLE3 full W1A1 and legacy head metadata cannot be combined");
+    }
+
+    // Feature fusion layer: projects 3 target layers to draft hidden size.
+    if (has_full_w1a1) {
+        load_w1a1_linear(LLM_TENSOR_FC, -1, tn(LLM_TENSOR_FC, "weight").str(), n_embd_inp, n_embd,
+                fc, fc_w1a1_packed, fc_w1a1_scale, 0);
+    } else {
+        fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
+    }
+
     // The packed head is opt-in through a versioned GGUF contract. Do not
     // retain a dense shadow copy and never substitute the target head for a
     // malformed packed draft head.
@@ -72,10 +160,13 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     const bool has_w1a1 = ml->get_key("eagle3.w1a1_head.version", w1a1_version, false);
     const bool has_packed = ml->get_tensor_meta(tn(LLM_TENSOR_OUTPUT_W1A1_PACKED).str().c_str()) != nullptr;
     const bool has_scale  = ml->get_tensor_meta(tn(LLM_TENSOR_OUTPUT_W1A1_SCALE ).str().c_str()) != nullptr;
-    if (has_w1a1 != (has_packed && has_scale) || has_packed != has_scale) {
+    if (!has_full_w1a1 && (has_w1a1 != (has_packed && has_scale) || has_packed != has_scale)) {
         throw std::runtime_error("EAGLE3 packed head requires metadata and both companion tensors");
     }
-    if (has_w1a1) {
+    if (has_full_w1a1) {
+        load_w1a1_linear(LLM_TENSOR_OUTPUT, -1, tn(LLM_TENSOR_OUTPUT, "weight").str(), n_embd, n_draft_vocab,
+                output, output_w1a1_packed, output_w1a1_scale, TENSOR_NOT_REQUIRED);
+    } else if (has_w1a1) {
         uint32_t logical_k = 0;
         std::string packed_name, scale_name, bit_order, sign_rule, scale_rule, arithmetic;
         ml->get_key("eagle3.w1a1_head.logical_k", logical_k);
@@ -127,15 +218,35 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         layer.attn_norm_2 = create_tensor(tn(LLM_TENSOR_ATTN_NORM_2, "weight", i), {n_embd}, 0);
 
         // Attention takes input_embeds_normed + fused_target_normed as input
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd_attn_input, n_embd_head_k * n_head}, 0);
-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd_attn_input, n_embd_k_gqa}, 0);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd_attn_input, n_embd_v_gqa}, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        if (has_full_w1a1) {
+            load_w1a1_linear(LLM_TENSOR_ATTN_Q, i, tn(LLM_TENSOR_ATTN_Q, "weight", i).str(), n_embd_attn_input, n_embd_head_k * n_head,
+                    layer.wq, layer.wq_w1a1_packed, layer.wq_w1a1_scale, 0);
+            load_w1a1_linear(LLM_TENSOR_ATTN_K, i, tn(LLM_TENSOR_ATTN_K, "weight", i).str(), n_embd_attn_input, n_embd_k_gqa,
+                    layer.wk, layer.wk_w1a1_packed, layer.wk_w1a1_scale, 0);
+            load_w1a1_linear(LLM_TENSOR_ATTN_V, i, tn(LLM_TENSOR_ATTN_V, "weight", i).str(), n_embd_attn_input, n_embd_v_gqa,
+                    layer.wv, layer.wv_w1a1_packed, layer.wv_w1a1_scale, 0);
+            load_w1a1_linear(LLM_TENSOR_ATTN_OUT, i, tn(LLM_TENSOR_ATTN_OUT, "weight", i).str(), n_embd_head_k * n_head, n_embd,
+                    layer.wo, layer.wo_w1a1_packed, layer.wo_w1a1_scale, 0);
+        } else {
+            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd_attn_input, n_embd_head_k * n_head}, 0);
+            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd_attn_input, n_embd_k_gqa}, 0);
+            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd_attn_input, n_embd_v_gqa}, 0);
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        }
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+        if (has_full_w1a1) {
+            load_w1a1_linear(LLM_TENSOR_FFN_GATE, i, tn(LLM_TENSOR_FFN_GATE, "weight", i).str(), n_embd, n_ff,
+                    layer.ffn_gate, layer.ffn_gate_w1a1_packed, layer.ffn_gate_w1a1_scale, 0);
+            load_w1a1_linear(LLM_TENSOR_FFN_DOWN, i, tn(LLM_TENSOR_FFN_DOWN, "weight", i).str(), n_ff, n_embd,
+                    layer.ffn_down, layer.ffn_down_w1a1_packed, layer.ffn_down_w1a1_scale, 0);
+            load_w1a1_linear(LLM_TENSOR_FFN_UP, i, tn(LLM_TENSOR_FFN_UP, "weight", i).str(), n_embd, n_ff,
+                    layer.ffn_up, layer.ffn_up_w1a1_packed, layer.ffn_up_w1a1_scale, 0);
+        } else {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+        }
 
         // rope_freqs for llama3 rope scaling (optional - only if eagle3 config has rope_scaling)
         layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED);
@@ -166,6 +277,12 @@ ggml_tensor * llama_model_eagle3::graph<true>::build_inp_embd_enc() const {
 template <>
 llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = nullptr;
+    auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
+        if (!packed) return build_lora_mm(dense, input);
+        if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
+        if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+        return ggml_w1a1_mul_mat(ctx0, packed, scales, input, logical_k);
+    };
 
     cur = build_inp_embd_enc();
 
@@ -176,7 +293,8 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     }
 
     // Feature fusion layer
-    cur = build_lora_mm(model.fc, cur);
+    cur = eagle_linear(model.fc, model.fc_w1a1_packed, model.fc_w1a1_scale,
+            cur, hparams.n_embd_inp_enc());
     cb(cur, "fc_out", -1);
 
     // Output: g_embeddings e.g. [4096, n_tokens]
@@ -199,6 +317,12 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
+    auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
+        if (!packed) return build_lora_mm(dense, input);
+        if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
+        if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+        return ggml_w1a1_mul_mat(ctx0, packed, scales, input, logical_k);
+    };
 
     // eagle3 Decoder receives:
     // 1. Token embeddings (e.g.from eagle3's own tok_embd for Llama 3.3 70B, or target model for Llama 3.1 8B)
@@ -263,13 +387,16 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "concat_embd", il);
 
         // Self-attention with concatenated input
-        ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+        ggml_tensor * Qcur = eagle_linear(model.layers[il].wq,
+                model.layers[il].wq_w1a1_packed, model.layers[il].wq_w1a1_scale, cur, 2 * n_embd);
         cb(Qcur, "Qcur", il);
 
-        ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
+        ggml_tensor * Kcur = eagle_linear(model.layers[il].wk,
+                model.layers[il].wk_w1a1_packed, model.layers[il].wk_w1a1_scale, cur, 2 * n_embd);
         cb(Kcur, "Kcur", il);
 
-        ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
+        ggml_tensor * Vcur = eagle_linear(model.layers[il].wv,
+                model.layers[il].wv_w1a1_packed, model.layers[il].wv_w1a1_scale, cur, 2 * n_embd);
         cb(Vcur, "Vcur", il);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -295,8 +422,12 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur_rope", il);
 
         cur = build_attn(inp_attn,
-                model.layers[il].wo, NULL, nullptr,
+                model.layers[il].wo_w1a1_packed ? nullptr : model.layers[il].wo, NULL, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        if (model.layers[il].wo_w1a1_packed) {
+            cur = eagle_linear(nullptr, model.layers[il].wo_w1a1_packed,
+                    model.layers[il].wo_w1a1_scale, cur, n_embd_head * n_head);
+        }
 
         // Add residual and update it
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -308,12 +439,24 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
                 LLM_NORM_RMS, il);
         cb(cur, "post_attn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        const auto & layer = model.layers[il];
+        if (layer.ffn_up_w1a1_packed || layer.ffn_gate_w1a1_packed || layer.ffn_down_w1a1_packed) {
+            ggml_tensor * up = eagle_linear(layer.ffn_up, layer.ffn_up_w1a1_packed,
+                    layer.ffn_up_w1a1_scale, cur, n_embd);
+            ggml_tensor * gate = eagle_linear(layer.ffn_gate, layer.ffn_gate_w1a1_packed,
+                    layer.ffn_gate_w1a1_scale, cur, n_embd);
+            gate = ggml_silu(ctx0, gate);
+            cur = ggml_mul(ctx0, up, gate);
+            cur = eagle_linear(layer.ffn_down, layer.ffn_down_w1a1_packed,
+                    layer.ffn_down_w1a1_scale, cur, hparams.n_ff(il));
+        } else {
+            cur = build_ffn(cur,
+                    layer.ffn_up,   NULL, NULL,
+                    layer.ffn_gate, NULL, NULL,
+                    layer.ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(cur, "ffn_out", il);
 
         // Output norm with residual

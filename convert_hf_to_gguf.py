@@ -173,6 +173,10 @@ def parse_args() -> argparse.Namespace:
         "--w1a1-eagle-head", action="store_true",
         help="Store the EAGLE-3 draft lm_head as packed W1A1 signs and F32 row scales; omit the dense head.",
     )
+    parser.add_argument(
+        "--w1a1-eagle-groups", choices=("fusion", "attention", "ffn", "all"),
+        help="Pack EAGLE-3 linears in one coverage group (or all nine eligible linears); head-only remains --w1a1-eagle-head.",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -304,6 +308,13 @@ def main() -> None:
             if not getattr(model_instance, "is_eagle3", False):
                 raise ValueError("--w1a1-eagle-head requires an EAGLE-3 draft checkpoint")
             model_instance.w1a1_eagle_head = True
+        if args.w1a1_eagle_groups:
+            if not getattr(model_instance, "is_eagle3", False):
+                raise ValueError("--w1a1-eagle-groups requires an EAGLE-3 draft checkpoint")
+            model_instance.w1a1_eagle_groups = (
+                ("fusion", "attention", "ffn", "head") if args.w1a1_eagle_groups == "all"
+                else (args.w1a1_eagle_groups,)
+            )
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")

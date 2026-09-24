@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -13,10 +14,25 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "gguf-py"))
 
 import gguf  # noqa: E402
-from conversion.llama import pack_w1a1_head  # noqa: E402
+from conversion.llama import eagle3_w1a1_candidates, pack_w1a1_head  # noqa: E402
 
 
 class TestPackedEagleHead(unittest.TestCase):
+    def test_full_drafter_groups_cover_nine_eligible_linears(self):
+        candidates = eagle3_w1a1_candidates(SimpleNamespace(block_count=1, hf_arch="LlamaForCausalLM"))
+        grouped = {}
+        for group, name in candidates.values():
+            grouped.setdefault(group, set()).add(name)
+        self.assertEqual(len(candidates), 9)
+        self.assertEqual(len(grouped["fusion"]), 1)
+        self.assertEqual(len(grouped["attention"]), 4)
+        self.assertEqual(len(grouped["ffn"]), 3)
+        self.assertEqual(len(grouped["head"]), 1)
+        self.assertEqual(set(grouped), {"fusion", "attention", "ffn", "head"})
+        base_model_candidates = eagle3_w1a1_candidates(SimpleNamespace(block_count=1, hf_arch="LlamaModel"))
+        self.assertEqual(len(base_model_candidates), 9)
+        self.assertIn("layers.0.self_attn.q_proj.weight", base_model_candidates)
+
     def test_signed_zero_tail_scales_and_gguf_round_trip(self):
         weight = torch.tensor([
             [0.0, -0.0, -2.0, 3.0] + [-1.0] * 29,
