@@ -169,6 +169,10 @@ def parse_args() -> argparse.Namespace:
             "layer count to populate its GGUF."
         ),
     )
+    parser.add_argument(
+        "--w1a1-eagle-head", action="store_true",
+        help="Store the EAGLE-3 draft lm_head as packed W1A1 signs and F32 row scales; omit the dense head.",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -296,6 +300,10 @@ def main() -> None:
                                      fp8_as_q8=args.fp8_as_q8,
                                      fuse_qkv=args.fuse_qkv,
                                      )
+        if args.w1a1_eagle_head:
+            if not getattr(model_instance, "is_eagle3", False):
+                raise ValueError("--w1a1-eagle-head requires an EAGLE-3 draft checkpoint")
+            model_instance.w1a1_eagle_head = True
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")

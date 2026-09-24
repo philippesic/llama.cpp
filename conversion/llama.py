@@ -11,7 +11,31 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
+
+
+def pack_w1a1_head(weight: Tensor, rows_per_chunk: int = 256) -> tuple[np.ndarray, np.ndarray]:
+    """Pack BF16 [output, K] signs as little-bit-order I32 words and F32 row scales."""
+    if weight.ndim != 2 or weight.dtype != torch.bfloat16 or weight.shape[1] == 0:
+        raise ValueError("W1A1 EAGLE head must be a nonempty 2D BF16 tensor")
+    if rows_per_chunk < 1:
+        raise ValueError("rows_per_chunk must be positive")
+
+    n_rows, logical_k = weight.shape
+    n_words = (logical_k + 31) // 32
+    packed = np.empty((n_rows, n_words), dtype=np.int32)
+    scales = np.empty(n_rows, dtype=np.float32)
+    for first in range(0, n_rows, rows_per_chunk):
+        chunk = weight[first:first + rows_per_chunk].float().cpu()
+        if not torch.isfinite(chunk).all():
+            raise ValueError("W1A1 EAGLE head contains nonfinite weights")
+        scales[first:first + len(chunk)] = chunk.abs().mean(dim=1).numpy()
+        signs = (chunk >= 0).numpy()
+        if logical_k % 32:
+            signs = np.pad(signs, ((0, 0), (0, 32 - logical_k % 32)), constant_values=False)
+        bits = np.packbits(signs, axis=1, bitorder="little")
+        packed[first:first + len(chunk)] = bits.view(np.int32).reshape(-1, n_words)
+    return packed, scales
 
 
 @ModelBase.register(
@@ -33,6 +57,7 @@ from .base import ModelBase, TextModel, gguf, logger
 class LlamaModel(TextModel):
     model_arch = gguf.MODEL_ARCH.LLAMA
     undo_permute = True
+    w1a1_eagle_head = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -164,6 +189,18 @@ class LlamaModel(TextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
+
+        if self.w1a1_eagle_head:
+            _, logical_k = self._w1a1_head_shape
+            prefix = "eagle3.w1a1_head"
+            self.gguf_writer.add_uint32(f"{prefix}.version", 1)
+            self.gguf_writer.add_uint32(f"{prefix}.logical_k", logical_k)
+            self.gguf_writer.add_string(f"{prefix}.packed_tensor", "output.w1a1_packed")
+            self.gguf_writer.add_string(f"{prefix}.scale_tensor", "output.w1a1_scale")
+            self.gguf_writer.add_string(f"{prefix}.bit_order", "little")
+            self.gguf_writer.add_string(f"{prefix}.sign_rule", "nonnegative_is_one")
+            self.gguf_writer.add_string(f"{prefix}.scale_rule", "f32_mean_abs")
+            self.gguf_writer.add_string(f"{prefix}.arithmetic", "f32")
 
         if not self.is_mistral_format:
             self.gguf_writer.add_vocab_size(hparams["vocab_size"])
@@ -326,6 +363,20 @@ class LlamaModel(TextModel):
                 yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(rope_factors, dtype=torch.float32))
 
     def prepare_tensors(self):
+        if self.w1a1_eagle_head:
+            if not getattr(self, 'is_eagle3', False):
+                raise ValueError("--w1a1-eagle-head requires an EAGLE-3 draft model")
+            if self.is_big_endian:
+                raise ValueError("--w1a1-eagle-head currently requires little-endian GGUF")
+            if "lm_head.weight" not in self.model_tensors:
+                raise ValueError("--w1a1-eagle-head requires lm_head.weight in the draft checkpoint")
+            weight = LazyTorchTensor.to_eager(self.model_tensors.pop("lm_head.weight")()).cpu()
+            if weight.ndim != 2 or weight.shape[1] != self.hparams["hidden_size"] or weight.shape[0] != self.hparams["draft_vocab_size"]:
+                raise ValueError("EAGLE-3 lm_head.weight shape disagrees with draft configuration")
+            packed, scales = pack_w1a1_head(weight)
+            self._w1a1_head_shape = tuple(weight.shape)
+            del weight
+
         # eagle3: collect d2t original dtype before parent converts tensors to F32
         eagle3_original_dtypes = {}
         if getattr(self, 'is_eagle3', False):
@@ -334,6 +385,10 @@ class LlamaModel(TextModel):
                     eagle3_original_dtypes[name] = data_torch.dtype
 
         super().prepare_tensors()
+
+        if self.w1a1_eagle_head:
+            self.gguf_writer.add_tensor("output.w1a1_packed", packed, raw_dtype=gguf.GGMLQuantizationType.I32)
+            self.gguf_writer.add_tensor("output.w1a1_scale", scales, raw_dtype=gguf.GGMLQuantizationType.F32)
 
         # eagle3: write d2t as absolute target token ids
         if getattr(self, 'is_eagle3', False) and hasattr(self, '_eagle3_int_tensors'):

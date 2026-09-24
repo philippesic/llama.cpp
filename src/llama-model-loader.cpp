@@ -441,6 +441,8 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
+    template bool llama_model_loader::get_key<uint32_t>(const std::string & key, uint32_t & result, bool required);
+    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
 
     template<>
     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
@@ -954,6 +956,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
                 op_tensor = ggml_mul_mat(ctx, w, b);
+            } break;
+        case GGML_OP_W1A1_MUL_MAT:
+            {
+                // Probe the actual packed operation, not an ordinary I32 matmul.
+                // The model validates the logical K separately; a full final word
+                // is sufficient for backend buffer capability selection.
+                ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[1]);
+                ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0] * 32, 512);
+                op_tensor = ggml_w1a1_mul_mat(ctx, w, scales, b, w->ne[0] * 32);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

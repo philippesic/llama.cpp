@@ -64,7 +64,49 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
 
     // Output layer (uses draft vocab size)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_draft_vocab}, TENSOR_NOT_REQUIRED);
+
+    // The packed head is opt-in through a versioned GGUF contract. Do not
+    // retain a dense shadow copy and never substitute the target head for a
+    // malformed packed draft head.
+    uint32_t w1a1_version = 0;
+    const bool has_w1a1 = ml->get_key("eagle3.w1a1_head.version", w1a1_version, false);
+    const bool has_packed = ml->get_tensor_meta(tn(LLM_TENSOR_OUTPUT_W1A1_PACKED).str().c_str()) != nullptr;
+    const bool has_scale  = ml->get_tensor_meta(tn(LLM_TENSOR_OUTPUT_W1A1_SCALE ).str().c_str()) != nullptr;
+    if (has_w1a1 != (has_packed && has_scale) || has_packed != has_scale) {
+        throw std::runtime_error("EAGLE3 packed head requires metadata and both companion tensors");
+    }
+    if (has_w1a1) {
+        uint32_t logical_k = 0;
+        std::string packed_name, scale_name, bit_order, sign_rule, scale_rule, arithmetic;
+        ml->get_key("eagle3.w1a1_head.logical_k", logical_k);
+        ml->get_key("eagle3.w1a1_head.packed_tensor", packed_name);
+        ml->get_key("eagle3.w1a1_head.scale_tensor", scale_name);
+        ml->get_key("eagle3.w1a1_head.bit_order", bit_order);
+        ml->get_key("eagle3.w1a1_head.sign_rule", sign_rule);
+        ml->get_key("eagle3.w1a1_head.scale_rule", scale_rule);
+        ml->get_key("eagle3.w1a1_head.arithmetic", arithmetic);
+        if (w1a1_version != 1 || logical_k != n_embd ||
+                packed_name != tn(LLM_TENSOR_OUTPUT_W1A1_PACKED).str() ||
+                scale_name  != tn(LLM_TENSOR_OUTPUT_W1A1_SCALE ).str() ||
+                bit_order != "little" || sign_rule != "nonnegative_is_one" ||
+                scale_rule != "f32_mean_abs" || arithmetic != "f32" ||
+                ml->get_tensor_meta(tn(LLM_TENSOR_OUTPUT, "weight").str().c_str()) != nullptr) {
+            throw std::runtime_error("EAGLE3 packed head has unsupported metadata or a dense shadow head");
+        }
+
+        const auto * packed_meta = ml->get_tensor_meta(packed_name.c_str());
+        const auto * scale_meta  = ml->get_tensor_meta(scale_name.c_str());
+        if (packed_meta->type != GGML_TYPE_I32 || scale_meta->type != GGML_TYPE_F32) {
+            throw std::runtime_error("EAGLE3 packed head requires I32 signs and F32 scales");
+        }
+        output_w1a1_packed = create_tensor(tn(LLM_TENSOR_OUTPUT_W1A1_PACKED), {(n_embd + 31)/32, n_draft_vocab}, 0);
+        output_w1a1_scale  = create_tensor(tn(LLM_TENSOR_OUTPUT_W1A1_SCALE ), {n_draft_vocab}, 0);
+        output = nullptr;
+        LLAMA_LOG_INFO("%s: EAGLE3 using packed W1A1 draft head (K = %lld, rows = %lld)\n",
+                __func__, (long long) n_embd, (long long) n_draft_vocab);
+    } else {
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_draft_vocab}, TENSOR_NOT_REQUIRED);
+    }
 
     // Token embeddings (optional - Llama 3.3 70B EAGLE3 has its own)
     const struct ggml_tensor * tok_embd_meta = ml->get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
@@ -294,15 +336,25 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     // lm_head - projects to draft vocabulary
     // if the draft has no own output projection, inherit the target model's lm_head
-    auto * output = model.output;
-    if (output == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
+    if (model.output_w1a1_packed != nullptr) {
+        if (!loras->empty()) {
+            throw std::runtime_error("EAGLE3 packed head does not support draft LoRA adapters");
+        }
+        if (cur->type != GGML_TYPE_F32) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
+        cur = ggml_w1a1_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd);
+    } else {
+        auto * output = model.output;
+        if (output == nullptr) {
+            GGML_ASSERT(cparams.ctx_other != nullptr);
+            const auto * model_other = llama_get_model(cparams.ctx_other);
 
-        GGML_ASSERT(model_other->output != nullptr && "EAGLE3 decoder requires an output projection (own or from target model)");
-        output = model_other->output;
+            GGML_ASSERT(model_other->output != nullptr && "EAGLE3 decoder requires an output projection (own or from target model)");
+            output = model_other->output;
+        }
+        cur = build_lora_mm(output, cur);
     }
-    cur = build_lora_mm(output, cur);
 
     if (model.d2t) {
         const int64_t n_draft_vocab = cur->ne[0];
