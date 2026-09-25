@@ -5151,12 +5151,13 @@ struct test_w1a1_mul_mat : public test_case {
 
 struct test_w8a8_mul_mat : public test_case {
     const int64_t k;
-    const int64_t m = 4;
-    const int64_t n_tokens = 3;
+    const int64_t m;
+    const int64_t n_tokens;
     const bool strided;
     std::vector<float> expected;
 
-    test_w8a8_mul_mat(int64_t k, bool strided) : k(k), strided(strided) {}
+    test_w8a8_mul_mat(int64_t k, bool strided, int64_t m = 4, int64_t n_tokens = 3)
+        : k(k), m(m), n_tokens(n_tokens), strided(strided) {}
 
     std::string vars() override {
         return "K=" + std::to_string(k) + ",M=" + std::to_string(m) + ",N=" +
@@ -5199,7 +5200,9 @@ struct test_w8a8_mul_mat : public test_case {
                 weights[row * k + i] = (int8_t) (((row * 53 + i * 29) % 255) - 127);
             }
         }
-        const std::array<float, 4> scales = { 0.5f, 1.25f, -0.75f, 0.125f };
+        const std::array<float, 4> scale_values = { 0.5f, 1.25f, -0.75f, 0.125f };
+        std::vector<float> scales(m);
+        for (int64_t row = 0; row < m; ++row) scales[row] = scale_values[row % scale_values.size()];
         std::vector<float> acts(n_tokens * k, 0.0f);
         const float max_value = 73.4384002685546875f;
         const float tie_scale = max_value / 127.0f;
@@ -5219,8 +5222,10 @@ struct test_w8a8_mul_mat : public test_case {
             acts[i] = tie_values[i];
         }
         // Token 1 is deliberately all zero. Token 2 covers a broad, repeatable range.
-        for (int64_t i = 0; i < k; ++i) {
-            acts[2 * k + i] = (float) (((i * 37) % 201) - 100) * 0.73125f;
+        for (int64_t token = 2; token < n_tokens; ++token) {
+            for (int64_t i = 0; i < k; ++i) {
+                acts[token * k + i] = (float) (((i * 37 + token * 17) % 201) - 100) * 0.73125f;
+            }
         }
 
         const int64_t stride_k = k + (strided ? 1 : 0);
@@ -10282,6 +10287,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_w8a8_mul_mat(8, false));
     test_cases.emplace_back(new test_w8a8_mul_mat(33, true));
     test_cases.emplace_back(new test_w8a8_mul_mat(9728, true));
+    test_cases.emplace_back(new test_w8a8_mul_mat(33, true, 9, 1));
+    test_cases.emplace_back(new test_w8a8_mul_mat(33, true, 9, 9));
     test_cases.emplace_back(new test_w4a4_mul_mat());
     test_cases.emplace_back(new test_w4a4_long_mul_mat());
 
