@@ -5411,6 +5411,78 @@ struct test_w4a4_long_mul_mat : public test_case {
     }
 };
 
+struct test_w4a4_mma_shape : public test_case {
+    static constexpr int64_t k = 33;
+    static constexpr int64_t m = 9;
+    static constexpr int64_t packed_k = (k + 1)/2;
+    const int64_t n_tokens;
+    std::vector<float> expected;
+
+    explicit test_w4a4_mma_shape(int64_t n) : n_tokens(n) { }
+    std::string vars() override { return "K=33,M=9,N=" + std::to_string(n_tokens) + ",strided=true"; }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, packed_k, m);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + 1, n_tokens);
+        ggml_set_name(w, "w4a4_mma_shape_weights");
+        ggml_set_name(s, "w4a4_mma_shape_scales");
+        ggml_set_name(base, "w4a4_mma_shape_activations_base");
+        ggml_tensor * a = ggml_view_2d(ctx, base, k, n_tokens, base->nb[1], 0);
+        ggml_set_name(a, "w4a4_mma_shape_activations");
+        return ggml_w4a4_mul_mat(ctx, w, s, a);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<uint8_t> packed(m * packed_k, 0);
+        std::vector<float> scales(m);
+        std::vector<float> acts((k + 1) * n_tokens, 1234.0f);
+        expected.assign(m * n_tokens, 0.0f);
+        for (int64_t row = 0; row < m; ++row) {
+            scales[row] = 0.125f * (row + 1);
+            for (int64_t i = 0; i < k; ++i) {
+                const int code = (row * 11 + i * 3) % 15 - 7;
+                packed[row * packed_k + i/2] |= (uint8_t) (code & 0x0f) << (4 * (i & 1));
+            }
+        }
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            const bool zero_token = n_tokens > 1 && token == n_tokens - 1;
+            float absmax = 0.0f;
+            for (int64_t i = 0; i < k; ++i) {
+                const float value = zero_token ? 0.0f : 0.25f * ((token * 7 + i * 3) % 15 - 7);
+                acts[token * (k + 1) + i] = value;
+                absmax = std::max(absmax, std::abs(value));
+            }
+            const float act_scale = absmax / 7.0f;
+            for (int64_t row = 0; row < m; ++row) {
+                int32_t dot = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    const int weight_code = (row * 11 + i * 3) % 15 - 7;
+                    const int8_t input_code = test_w4a4_mul_mat::quantize_nearest_even(
+                            acts[token * (k + 1) + i], act_scale);
+                    dot += weight_code * (int32_t) input_code;
+                }
+                expected[token * m + row] = ((float) dot * scales[row]) * act_scale;
+            }
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "w4a4_mma_shape_weights"), packed.data(), 0, packed.size());
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "w4a4_mma_shape_scales"), scales.data(), 0, scales.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "w4a4_mma_shape_activations_base"), acts.data(), 0, acts.size() * sizeof(float));
+    }
+
+    double err(const float * lhs, const float * rhs, size_t count) override {
+        if (count != expected.size()) return test_case::err(lhs, rhs, count);
+        double worst = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            const double denom = 1.0 + std::abs(double(expected[i]));
+            worst = std::max(worst, std::abs(double(lhs[i]) - expected[i]) / denom);
+            worst = std::max(worst, std::abs(double(rhs[i]) - expected[i]) / denom);
+        }
+        return worst;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -10284,6 +10356,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_w8a8_mul_mat(9728, true));
     test_cases.emplace_back(new test_w4a4_mul_mat());
     test_cases.emplace_back(new test_w4a4_long_mul_mat());
+    test_cases.emplace_back(new test_w4a4_mma_shape(1));
+    test_cases.emplace_back(new test_w4a4_mma_shape(9));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

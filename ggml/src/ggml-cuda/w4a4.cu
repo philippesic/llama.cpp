@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -121,6 +123,71 @@ static __global__ void w4a4_vector_dot(
     }
 }
 
+static __device__ __forceinline__ uint32_t w4a4_packed_nibble(
+        const uint8_t * packed, int64_t row, int64_t k_index,
+        int64_t rows, int64_t k, int64_t packed_k) {
+    if (row >= rows || k_index >= k) return 0;
+    const uint8_t byte = packed[row * packed_k + k_index/2];
+    return (byte >> (4 * (k_index & 1))) & 0x0f;
+}
+
+// SM75 signed-I4 Tensor Core candidate. The per-lane A/B and D fragments are
+// exactly those checked by test-w4a4-sm75-mma: group=lane>>2, t=lane&3;
+// A=(row=group, K=8*t+i), B=(token=group, K=8*t+i), D=(row=group,
+// token=2*t+j). All lanes execute each MMA, including masked M/N/K tails.
+// Byte assembly is safe for odd K and unaligned packed row starts.
+static __global__ void w4a4_sm75_mma_dot(
+        const uint8_t * weights, const float * weight_scales,
+        const uint8_t * activations, const float * activation_scales,
+        int64_t m, int64_t n, int64_t k, int64_t packed_k, float * output) {
+    const int lane = threadIdx.x;
+    const int group = lane >> 2;
+    const int thread_in_group = lane & 3;
+    const int64_t row = (int64_t) blockIdx.x * 8 + group;
+    for (int64_t token_base = (int64_t) blockIdx.y * 8; token_base < n; token_base += (int64_t) gridDim.y * 8) {
+        const int64_t token_for_b = token_base + group;
+        int d0 = 0;
+        int d1 = 0;
+        for (int64_t k_base = 0; k_base < k; k_base += 32) {
+            uint32_t a = 0;
+            uint32_t b = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int64_t ki = k_base + thread_in_group * 8 + i;
+                a |= w4a4_packed_nibble(weights, row, ki, m, k, packed_k) << (4 * i);
+                b |= w4a4_packed_nibble(activations, token_for_b, ki, n, k, packed_k) << (4 * i);
+            }
+#if __CUDA_ARCH__ >= 750
+            const int c0 = d0;
+            const int c1 = d1;
+            asm volatile(
+                "mma.sync.aligned.m8n8k32.row.col.satfinite.s32.s4.s4.s32 "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
+                : "=r"(d0), "=r"(d1)
+                : "r"(a), "r"(b), "r"(c0), "r"(c1));
+#else
+            // The host selector never launches this kernel below SM75.
+            asm volatile("trap;");
+            GGML_UNUSED(a);
+            GGML_UNUSED(b);
+#endif
+        }
+        const int64_t token0 = token_base + 2 * thread_in_group;
+        if (row < m && token0 < n) {
+            const float weight_scale = weight_scales[row];
+            if ((__float_as_uint(weight_scale) & 0x7f800000u) == 0x7f800000u) asm volatile("trap;");
+            const float weighted = w4a4_mul_rn((float) d0, weight_scale);
+            output[token0 * m + row] = w4a4_mul_rn(weighted, activation_scales[token0]);
+        }
+        if (row < m && token0 + 1 < n) {
+            const float weight_scale = weight_scales[row];
+            if ((__float_as_uint(weight_scale) & 0x7f800000u) == 0x7f800000u) asm volatile("trap;");
+            const float weighted = w4a4_mul_rn((float) d1, weight_scale);
+            output[(token0 + 1) * m + row] = w4a4_mul_rn(weighted, activation_scales[token0 + 1]);
+        }
+    }
+}
+
 void ggml_cuda_w4a4_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * weights = dst->src[0];
     const ggml_tensor * scales  = dst->src[1];
@@ -137,9 +204,26 @@ void ggml_cuda_w4a4_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(acts->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
     GGML_ASSERT((m + 3)/4 <= INT_MAX);
 
-    static std::atomic<unsigned> logged_shapes{0};
+    static const bool use_mma = [] {
+        const char * value = std::getenv("GGML_CUDA_W4A4_MMA");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (use_mma) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (cc != GGML_CUDA_CC_TURING) {
+            GGML_ABORT("GGML_CUDA_W4A4_MMA=1 requires an SM75 NVIDIA device");
+        }
+    }
+
+    static std::atomic<unsigned> logged_vector_shapes{0};
+    static std::atomic<unsigned> logged_mma_shapes{0};
     const unsigned shape_bit = n == 1 ? 1u : 2u;
-    if ((logged_shapes.fetch_or(shape_bit) & shape_bit) == 0) {
+    if (use_mma) {
+        if ((logged_mma_shapes.fetch_or(shape_bit) & shape_bit) == 0) {
+            GGML_LOG_INFO("%s: CUDA W4A4 SM75 signed-I4 Tensor Core MMA m8n8k32 candidate (K=%lld, rows=%lld, tokens=%lld)\n",
+                    __func__, (long long) k, (long long) m, (long long) n);
+        }
+    } else if ((logged_vector_shapes.fetch_or(shape_bit) & shape_bit) == 0) {
         GGML_LOG_INFO("%s: CUDA W4A4 signed-nibble vector dot, scalar integer MUL/ADD; no INT4 Tensor Core MMA (K=%lld, rows=%lld, tokens=%lld)\n",
                 __func__, (long long) k, (long long) m, (long long) n);
     }
@@ -151,9 +235,16 @@ void ggml_cuda_w4a4_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     w4a4_pack_activations<<<dim3(token_blocks), 256, 0, stream>>>(
             (const float *) acts->data, acts->nb[1], k, packed_k, n, packed.ptr, act_scales.ptr);
     CUDA_CHECK(cudaGetLastError());
-    w4a4_vector_dot<<<dim3((unsigned) ((m + 3)/4), token_blocks), dim3(32, 4), 0, stream>>>(
-            (const uint8_t *) weights->data, (const float *) scales->data,
-            packed.ptr, act_scales.ptr, m, n, k, packed_k, (float *) dst->data);
+    if (use_mma) {
+        const unsigned mma_token_blocks = (unsigned) ((n + 7)/8 < 65535 ? (n + 7)/8 : 65535);
+        w4a4_sm75_mma_dot<<<dim3((unsigned) ((m + 7)/8), mma_token_blocks), 32, 0, stream>>>(
+                (const uint8_t *) weights->data, (const float *) scales->data,
+                packed.ptr, act_scales.ptr, m, n, k, packed_k, (float *) dst->data);
+    } else {
+        w4a4_vector_dot<<<dim3((unsigned) ((m + 3)/4), token_blocks), dim3(32, 4), 0, stream>>>(
+                (const uint8_t *) weights->data, (const float *) scales->data,
+                packed.ptr, act_scales.ptr, m, n, k, packed_k, (float *) dst->data);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
