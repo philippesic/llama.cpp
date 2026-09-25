@@ -1,6 +1,7 @@
 // Standalone, opt-in layout probe. Build on a CUDA host with:
 // nvcc -std=c++17 -arch=sm_75 tests/test-w4a4-sm75-mma.cu -o test-w4a4-sm75-mma
-// The production W4A4 CUDA dispatch does not call this kernel.
+// The opt-in production W4A4 kernel uses this tested fragment mapping.
+// This executable remains a separate exact-I32 instruction probe.
 
 #include <cuda_runtime.h>
 
