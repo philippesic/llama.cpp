@@ -168,8 +168,11 @@ void ggml_cuda_w8a8_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     const char * mma_env = std::getenv("GGML_CUDA_W8A8_MMA");
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool use_mma = mma_env != nullptr && std::strcmp(mma_env, "1") == 0 &&
-            cc == GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING;
+    const bool use_mma = mma_env != nullptr && std::strcmp(mma_env, "1") == 0;
+    if (use_mma && (cc != GGML_CUDA_CC_TURING || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING)) {
+        GGML_ABORT("GGML_CUDA_W8A8_MMA=1 requires an SM75 device and compiled SM75 code (device cc=%d, compiled cc=%d)",
+                cc, ggml_cuda_highest_compiled_arch(cc));
+    }
     static std::atomic<bool> logged_dp4a{false};
     static std::atomic<bool> logged_mma{false};
     if (use_mma ? !logged_mma.exchange(true) : !logged_dp4a.exchange(true)) {
