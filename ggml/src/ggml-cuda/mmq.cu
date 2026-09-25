@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
+#include "qformat-dispatch-trace.cuh"
 #include "mmid.cuh"
 
 #include <cstdint>
@@ -87,6 +88,9 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    ggml_cuda_trace_qformat_dispatch(ggml_cuda_qformat_kernel::mmq, src0, src1, dst,
+                                     GGML_TYPE_Q8_1, true, ids != nullptr, false);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 

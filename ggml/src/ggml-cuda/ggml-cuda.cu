@@ -41,6 +41,7 @@
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/pool1d.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/qformat-dispatch-trace.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -93,6 +94,52 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+void ggml_cuda_trace_qformat_dispatch(
+        ggml_cuda_qformat_kernel kernel,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        ggml_type activation_kernel_type,
+        bool activation_quantized,
+        bool matmul_id,
+        bool fused) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_QFORMAT_DISPATCH_TRACE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled) {
+        return;
+    }
+
+    const unsigned type_index = src0->type == GGML_TYPE_Q4_0 ? 0 : src0->type == GGML_TYPE_Q8_0 ? 1 : 2;
+    if (type_index == 2) {
+        return;
+    }
+
+    // At most 40 lines per process; the first shape is an example of each path, not a shape census.
+    unsigned kernel_index = static_cast<unsigned>(kernel);
+    if (kernel == ggml_cuda_qformat_kernel::cublas) {
+        kernel_index = activation_kernel_type == GGML_TYPE_F32 ? 2 :
+                       activation_kernel_type == GGML_TYPE_F16 ? 3 : 4;
+    }
+    const unsigned key = (((type_index * 5 + kernel_index) * 2 + matmul_id) * 2 + fused);
+    static std::atomic<uint64_t> seen{0};
+    const uint64_t bit = uint64_t(1) << key;
+    if (seen.fetch_or(bit, std::memory_order_relaxed) & bit) {
+        return;
+    }
+
+    const char * family = kernel == ggml_cuda_qformat_kernel::mmvq ? "MMVQ" :
+                          kernel == ggml_cuda_qformat_kernel::mmq  ? "MMQ"  : "cuBLAS";
+    GGML_LOG_INFO("CUDA qformat dispatch: family=%s src0=%s src1=%s dst=%s "
+                  "shape=[K=%" PRId64 ",M=%" PRId64 ",N=%" PRId64 ",batch=%" PRId64 "x%" PRId64 "] "
+                  "activation_kernel=%s activation_quantized=%s matmul_id=%s fused=%s\n",
+                  family, ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
+                  src0->ne[0], src0->ne[1], src1->ne[1], src1->ne[2], src1->ne[3],
+                  ggml_type_name(activation_kernel_type), activation_quantized ? "yes" : "no",
+                  matmul_id ? "yes" : "no", fused ? "yes" : "no");
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1655,6 +1702,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
+
+    ggml_cuda_trace_qformat_dispatch(ggml_cuda_qformat_kernel::cublas, src0, src1, dst,
+                                     compute_type, false, false, false);
 
     switch (compute_type) {
         case GGML_TYPE_F32:
