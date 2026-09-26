@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -107,6 +108,35 @@ enum slot_state {
 };
 
 struct server_slot; // forward declaration
+
+// One verification attempt. A checkpoint restore produces a separate attempt
+// with status "checkpoint_replay" followed by a replay attempt.
+struct server_round_trace {
+    bool active = false;
+    bool replay = false;
+    int task_id = -1;
+    int parent_task_id = -1;
+    int64_t round_index = 0;
+    int64_t start_us = 0;
+    int64_t draft_start_us = 0, draft_end_us = 0;
+    int64_t checkpoint_start_us = 0, checkpoint_end_us = 0;
+    int64_t target_start_us = 0, target_end_us = 0;
+    int64_t process_start_us = 0, process_end_us = 0;
+    int64_t check_start_us = 0, check_end_us = 0;
+    int64_t repair_start_us = 0, repair_end_us = 0;
+    int64_t accept_start_us = 0, accept_end_us = 0;
+    int64_t begin_us = 0;
+    int64_t begin_start_us = 0, begin_end_us = 0;
+    int n_draft_max = 0;
+    bool stopped_low_confidence = false;
+    float stop_probability = -1.0f;
+    bool discarded_below_min = false;
+    size_t n_accepted = 0;
+    llama_tokens proposed;
+    llama_tokens emitted;
+    common_speculative_process_trace process_detail;
+    common_speculative_draft_trace draft_detail;
+};
 
 struct server_batch {
     llama_batch batch;
@@ -257,6 +287,10 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    int64_t spec_trace_round_index = 0;
+    int64_t spec_trace_begin_start_us = 0;
+    int64_t spec_trace_begin_end_us = 0;
+    server_round_trace spec_trace_round;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -370,6 +404,10 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_trace_round_index = 0;
+        spec_trace_begin_start_us = 0;
+        spec_trace_begin_end_us = 0;
+        spec_trace_round = {};
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -895,6 +933,84 @@ private:
 
     common_speculative_ptr spec;
 
+    std::ofstream round_trace_file; // enabled by W1AX_ROUND_TRACE_JSONL
+
+    void emit_round_trace(server_slot & slot, const char * status) {
+        auto & tr = slot.spec_trace_round;
+        if (!tr.active) {
+            return;
+        }
+        tr.active = false;
+        const int64_t end_us = ggml_time_us();
+        const auto duration = [](int64_t beg, int64_t end) -> int64_t {
+            return beg > 0 && end >= beg ? end - beg : 0;
+        };
+        const int64_t total_us = duration(tr.start_us, end_us);
+        const int64_t draft_us = duration(tr.draft_start_us, tr.draft_end_us);
+        const int64_t checkpoint_us = duration(tr.checkpoint_start_us, tr.checkpoint_end_us);
+        const int64_t target_us = duration(tr.target_start_us, tr.target_end_us);
+        const int64_t process_us = duration(tr.process_start_us, tr.process_end_us);
+        const int64_t check_us = duration(tr.check_start_us, tr.check_end_us);
+        const int64_t repair_us = duration(tr.repair_start_us, tr.repair_end_us);
+        const int64_t accept_us = duration(tr.accept_start_us, tr.accept_end_us);
+        const int64_t named_us = draft_us + checkpoint_us + target_us + process_us + check_us + repair_us + accept_us;
+        json record = {
+            {"schema", "w1ax_eagle_round_v1"},
+            {"clock", "ggml_time_us_cpu_wall"},
+            {"task_id", tr.task_id},
+            {"parent_task_id", tr.parent_task_id},
+            {"slot_id", slot.id},
+            {"round_index", tr.round_index},
+            {"status", status},
+            {"replay", tr.replay},
+            {"round_start_us", tr.start_us},
+            {"round_end_us", end_us},
+            {"round_us", total_us},
+            {"begin_us", tr.begin_us},
+            {"n_draft_max", tr.n_draft_max},
+            {"n_draft_configured", params_base.speculative.draft.n_max},
+            {"draft_p_min", params_base.speculative.draft.p_min},
+            {"stopped_low_confidence", tr.stopped_low_confidence},
+            {"stop_probability", tr.stop_probability},
+            {"discarded_below_min", tr.discarded_below_min},
+            {"draft_us", draft_us},
+            {"checkpoint_us", checkpoint_us},
+            {"target_decode_sync_us", target_us},
+            {"process_us", process_us},
+            {"check_us", check_us},
+            {"kv_repair_us", repair_us},
+            {"accept_hook_us", accept_us},
+            {"residual_us", std::max<int64_t>(0, total_us - named_us)},
+            {"process_feature_copy_us", tr.process_detail.feature_copy_us},
+            {"process_encoder_us", tr.process_detail.encoder_us},
+            {"process_batch_build_us", tr.process_detail.batch_build_us},
+            {"process_draft_decode_us", tr.process_detail.draft_decode_us},
+            {"process_batch_tokens", tr.process_detail.n_tokens},
+            {"process_draft_decode_tokens", tr.process_detail.n_draft_decode},
+            {"draft_seed_decode_us", tr.draft_detail.seed_decode_us},
+            {"draft_step_decode_us", tr.draft_detail.step_decode_us},
+            {"draft_sampler_us", tr.draft_detail.sampler_us},
+            {"n_proposed", tr.proposed.size()},
+            {"n_accepted", tr.n_accepted},
+            {"n_emitted", tr.emitted.size()},
+            {"proposed_token_ids", tr.proposed},
+            {"emitted_token_ids", tr.emitted},
+            {"timing_scope", "CPU wall; begin_us is outside round_us; batched decode/process spans are shared; no CUDA events"},
+        };
+        record["spans_us"] = json::object({
+            {"begin", json::array({tr.begin_start_us, tr.begin_end_us})},
+            {"draft", json::array({tr.draft_start_us, tr.draft_end_us})},
+            {"checkpoint", json::array({tr.checkpoint_start_us, tr.checkpoint_end_us})},
+            {"target_decode_sync", json::array({tr.target_start_us, tr.target_end_us})},
+            {"process", json::array({tr.process_start_us, tr.process_end_us})},
+            {"check", json::array({tr.check_start_us, tr.check_end_us})},
+            {"kv_repair", json::array({tr.repair_start_us, tr.repair_end_us})},
+            {"accept_hook", json::array({tr.accept_start_us, tr.accept_end_us})},
+        });
+        round_trace_file << record.dump() << '\n';
+        round_trace_file.flush();
+    }
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -936,6 +1052,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        round_trace_file.close();
         spec.reset();
         spec_init.reset();
 
@@ -1263,6 +1380,19 @@ private:
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
                     return false;
+                }
+            }
+        }
+
+        if (spec) {
+            const char * trace_path = std::getenv("W1AX_ROUND_TRACE_JSONL");
+            if (trace_path != nullptr && trace_path[0] != '\0') {
+                round_trace_file.open(trace_path, std::ios::out | std::ios::app);
+                if (round_trace_file.is_open()) {
+                    common_speculative_set_process_trace(spec.get(), true);
+                    SRV_INF("writing EAGLE round CPU wall trace to %s\n", trace_path);
+                } else {
+                    SRV_WRN("cannot open EAGLE round trace at %s\n", trace_path);
                 }
             }
         }
@@ -2995,6 +3125,22 @@ private:
 
             generating.push_back(&slot);
 
+            if (spec && round_trace_file.is_open()) {
+                auto & tr = slot.spec_trace_round;
+                tr = {};
+                tr.active = true;
+                tr.replay = slot.spec_is_replay;
+                tr.task_id = slot.task->id;
+                tr.parent_task_id = slot.task->id_parent;
+                tr.round_index = slot.spec_trace_round_index++;
+                tr.start_us = ggml_time_us();
+                tr.begin_start_us = slot.spec_trace_begin_start_us;
+                tr.begin_end_us = slot.spec_trace_begin_end_us;
+                tr.begin_us = tr.begin_end_us > tr.begin_start_us ? tr.begin_end_us - tr.begin_start_us : 0;
+                slot.spec_trace_begin_start_us = 0;
+                slot.spec_trace_begin_end_us = 0;
+            }
+
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
@@ -3002,6 +3148,7 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 const int n_draft_max = slot.get_n_draft_max();
+                if (slot.spec_trace_round.active) slot.spec_trace_round.n_draft_max = n_draft_max;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3042,13 +3189,31 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t_draft = round_trace_file.is_open() ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (t_draft) {
+                const int64_t t_end = ggml_time_us();
+                const auto detail = common_speculative_get_draft_trace(spec.get());
+                for (auto * slot : drafting) {
+                    slot->spec_trace_round.draft_start_us = t_draft;
+                    slot->spec_trace_round.draft_end_us = t_end;
+                    slot->spec_trace_round.draft_detail = detail;
+                }
+            }
         }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
+            if (slot.spec_trace_round.active) {
+                slot.spec_trace_round.checkpoint_start_us = ggml_time_us();
+                slot.spec_trace_round.proposed = slot.spec_draft;
+                const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                slot.spec_trace_round.stopped_low_confidence = dp.stopped_low_confidence;
+                slot.spec_trace_round.stop_probability = dp.stop_probability;
+                slot.spec_trace_round.discarded_below_min = dp.discarded_below_min;
+            }
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
@@ -3093,7 +3258,19 @@ private:
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
+            if (slot.spec_trace_round.active) {
+                slot.spec_trace_round.checkpoint_end_us = ggml_time_us();
+            }
         });
+
+        // A replay reuses an existing proposal and does not call draft().
+        if (round_trace_file.is_open()) {
+            for (auto * slot : generating) {
+                if (slot->spec_trace_round.active && slot->spec_trace_round.proposed.empty()) {
+                    slot->spec_trace_round.proposed = slot->spec_draft;
+                }
+            }
+        }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -3675,15 +3852,40 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        const auto trace_slot_in_batch = [&](const server_slot & slot) {
+            if (!slot.spec_trace_round.active) {
+                return false;
+            }
+            for (int i = 0; i < batch_view.n_tokens; ++i) {
+                for (int j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                    if (batch_view.seq_id[i][j] == slot.id) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_target = round_trace_file.is_open() ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (t_target) {
+            const int64_t t_end = ggml_time_us();
+            for (auto & slot : slots) {
+                if (trace_slot_in_batch(slot)) {
+                    auto & tr = slot.spec_trace_round;
+                    if (!tr.target_start_us) tr.target_start_us = t_target;
+                    tr.target_end_us = t_end;
+                }
+            }
+        }
 
         if (ret != 0) {
             {
@@ -3743,9 +3945,22 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_process = round_trace_file.is_open() ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            if (t_process) {
+                const int64_t t_end = ggml_time_us();
+                const auto detail = common_speculative_get_process_trace(spec.get());
+                for (auto & slot : slots) {
+                    if (trace_slot_in_batch(slot)) {
+                        auto & tr = slot.spec_trace_round;
+                        if (!tr.process_start_us) tr.process_start_us = t_process;
+                        tr.process_end_us = t_end;
+                        tr.process_detail = detail;
+                    }
+                }
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3837,7 +4052,12 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
+                    const int64_t t_begin = round_trace_file.is_open() ? ggml_time_us() : 0;
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    if (t_begin) {
+                        slot.spec_trace_begin_start_us = t_begin;
+                        slot.spec_trace_begin_end_us = ggml_time_us();
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -3882,7 +4102,12 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
+            if (slot.spec_trace_round.active) {
+                slot.spec_trace_round.emitted.push_back(id);
+            }
+
             if (!process_token(result, slot)) {
+                emit_round_trace(slot, "no_proposal");
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -3891,6 +4116,7 @@ private:
                 return;
             }
 
+            emit_round_trace(slot, "no_proposal");
             slot.print_timings_tg();
         });
 
@@ -3912,11 +4138,13 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                if (slot.spec_trace_round.active) slot.spec_trace_round.check_start_us = ggml_time_us();
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                if (slot.spec_trace_round.active) slot.spec_trace_round.check_end_us = ggml_time_us();
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3930,6 +4158,10 @@ private:
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
+                        if (slot.spec_trace_round.active) {
+                            slot.spec_trace_round.n_accepted = accepted.size() - 1;
+                            slot.spec_trace_round.repair_start_us = ggml_time_us();
+                        }
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
@@ -3953,6 +4185,11 @@ private:
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
+                        if (slot.spec_trace_round.active) {
+                            slot.spec_trace_round.repair_end_us = ggml_time_us();
+                            emit_round_trace(slot, "checkpoint_replay");
+                        }
+
                         return;
                     }
                 }
@@ -3961,7 +4198,9 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                if (slot.spec_trace_round.active) slot.spec_trace_round.accept_start_us = ggml_time_us();
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                if (slot.spec_trace_round.active) slot.spec_trace_round.accept_end_us = ggml_time_us();
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -3979,6 +4218,9 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            if (slot.spec_trace_round.active) {
+                slot.spec_trace_round.n_accepted = n_accepted;
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
@@ -3995,7 +4237,9 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            if (slot.spec_trace_round.active) slot.spec_trace_round.repair_start_us = ggml_time_us();
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (slot.spec_trace_round.active) slot.spec_trace_round.repair_end_us = ggml_time_us();
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4007,8 +4251,10 @@ private:
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+                if (slot.spec_trace_round.active) slot.spec_trace_round.emitted.push_back(ids[i]);
 
                 if (!process_token(result, slot)) {
+                    emit_round_trace(slot, "complete");
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
@@ -4017,6 +4263,7 @@ private:
                 }
             }
 
+            emit_round_trace(slot, "complete");
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());

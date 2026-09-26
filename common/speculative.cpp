@@ -159,6 +159,10 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
+    bool process_trace_enabled = false;
+    common_speculative_process_trace process_trace;
+    common_speculative_draft_trace draft_trace;
+
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
     virtual ~common_speculative_impl() = default;
@@ -570,6 +574,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        process_trace = {};
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -579,6 +584,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+        const int64_t t_feature_start = process_trace_enabled ? ggml_time_us() : 0;
+        process_trace.n_tokens = n_tokens;
 
         // i_batch_beg[seq] / i_batch_end[seq]: inclusive batch indices of this seq's
         // first/last token in batch_in. Assumes per-seq tokens are contiguous within
@@ -619,6 +626,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
         }
 
+        if (process_trace_enabled) {
+            process_trace.feature_copy_us = ggml_time_us() - t_feature_start;
+        }
+
+        const int64_t t_encoder_start = process_trace_enabled ? ggml_time_us() : 0;
         g_embd_buf.resize((size_t) n_tokens * n_embd_dec);
 
         // llama_encode() requires the full encoder batch to fit in n_ubatch.
@@ -650,7 +662,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                         g_embd_chunk,
                         (size_t) n_chunk * n_embd_dec * sizeof(float));
         }
+        if (process_trace_enabled) {
+            process_trace.encoder_us = ggml_time_us() - t_encoder_start;
+        }
 
+        const int64_t t_batch_start = process_trace_enabled ? ggml_time_us() : 0;
         const float * g_embd = g_embd_buf.data();
 
         const size_t row_bytes = (size_t) n_embd_dec * sizeof(float);
@@ -706,8 +722,17 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             std::memcpy(pending_g_last[seq_id].data(), g_embd + (size_t) end * n_embd_dec, row_bytes);
         }
 
+        if (process_trace_enabled) {
+            process_trace.batch_build_us = ggml_time_us() - t_batch_start;
+            process_trace.n_draft_decode = batch.n_tokens;
+        }
+
         if (batch.n_tokens > 0) {
+            const int64_t t_decode_start = process_trace_enabled ? ggml_time_us() : 0;
             const int32_t rc = llama_decode(ctx_dft, batch);
+            if (process_trace_enabled) {
+                process_trace.draft_decode_us = ggml_time_us() - t_decode_start;
+            }
             if (rc != 0) {
                 SPC_ERR("llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, ubatch_pos[0]=%d)\n",
                         rc, (int) batch.n_tokens, (int) batch_in.pos[0]);
@@ -721,6 +746,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        draft_trace = {};
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -759,7 +785,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             return;
         }
 
+        const int64_t t_seed = process_trace_enabled ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
+        if (process_trace_enabled) draft_trace.seed_decode_us = ggml_time_us() - t_seed;
         if (ret != 0) {
             SPC_ERR("llama_decode returned %d\n", ret);
             return;
@@ -779,7 +807,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int64_t t_sample = process_trace_enabled ? ggml_time_us() : 0;
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                if (process_trace_enabled) {
+                    if (draft_trace.sampler_us.size() <= (size_t) i) draft_trace.sampler_us.resize(i + 1, 0);
+                    draft_trace.sampler_us[i] += ggml_time_us() - t_sample;
+                }
                 // pre-norm hidden state of this position becomes g_embd for the next step
                 const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 ++i_batch;
@@ -797,6 +830,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
                 if (cur_p->data[0].p < params.p_min) {
+                    auto & dp = dparams.at(seq_id);
+                    dp.stopped_low_confidence = true;
+                    dp.stop_probability = cur_p->data[0].p;
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -824,7 +860,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 break;
             }
 
+            const int64_t t_step = process_trace_enabled ? ggml_time_us() : 0;
             ret = llama_decode(ctx_dft, batch);
+            if (process_trace_enabled) draft_trace.step_decode_us.push_back(ggml_time_us() - t_step);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
@@ -840,6 +878,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
 
             if (dp.result->size() < (size_t) params.n_min) {
+                dp.discarded_below_min = true;
                 dp.result->clear();
             }
         }
@@ -2801,6 +2840,41 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         result = result && impl->process(batch);
     }
 
+    return result;
+}
+
+void common_speculative_set_process_trace(common_speculative * spec, bool enabled) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->process_trace_enabled = enabled;
+    }
+}
+
+common_speculative_process_trace common_speculative_get_process_trace(const common_speculative * spec) {
+    common_speculative_process_trace result;
+    if (spec == nullptr) {
+        return result;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) {
+            return impl->process_trace;
+        }
+    }
+    return result;
+}
+
+common_speculative_draft_trace common_speculative_get_draft_trace(const common_speculative * spec) {
+    common_speculative_draft_trace result;
+    if (spec == nullptr) {
+        return result;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) {
+            return impl->draft_trace;
+        }
+    }
     return result;
 }
 

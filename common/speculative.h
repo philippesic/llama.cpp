@@ -69,6 +69,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // EAGLE3 diagnostics for the most recent draft() call.
+    bool  stopped_low_confidence = false;
+    float stop_probability = -1.0f;
+    bool  discarded_below_min = false;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -78,6 +83,28 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+
+// Optional CPU wall timing for the most recent EAGLE3 process() call. Times include
+// any synchronization performed by the called APIs; they are not CUDA event times.
+struct common_speculative_process_trace {
+    int64_t feature_copy_us = 0;
+    int64_t encoder_us      = 0;
+    int64_t batch_build_us  = 0;
+    int64_t draft_decode_us = 0;
+    int32_t n_tokens        = 0;
+    int32_t n_draft_decode  = 0;
+};
+
+void common_speculative_set_process_trace(common_speculative * spec, bool enabled);
+common_speculative_process_trace common_speculative_get_process_trace(const common_speculative * spec);
+
+struct common_speculative_draft_trace {
+    int64_t seed_decode_us = 0;
+    std::vector<int64_t> step_decode_us;
+    std::vector<int64_t> sampler_us;
+};
+
+common_speculative_draft_trace common_speculative_get_draft_trace(const common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
