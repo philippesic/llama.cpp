@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 // Each lane owns a complete little-bit-order sign word. Accumulate absolute
@@ -203,6 +205,8 @@ static __global__ void w1a16_signadd(
 // eight-byte magic, five little-endian integer fields, a fixed 128-byte
 // weight tensor name, then contiguous [N,K] F32 activation values. Capture
 // synchronizes the stream and is intentionally excluded from timing trials.
+// captures.jsonl adds per-process ggml_time_us timestamps for round attribution;
+// its timestamp is taken before the activation download and synchronization.
 static void w1ax_capture_activations(
         cudaStream_t stream, const ggml_tensor * weights, const ggml_tensor * acts,
         int64_t k, int64_t m, int64_t n, int bits) {
@@ -215,6 +219,7 @@ static void w1ax_capture_activations(
         if (!warned.exchange(true)) GGML_LOG_WARN("W1Ax activation capture requires CUDA graph capture disabled\n");
         return;
     }
+    const int64_t timestamp_us = ggml_time_us();
     std::vector<float> host((size_t) k*n);
     CUDA_CHECK(cudaMemcpyAsync(host.data(), acts->data, host.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -236,6 +241,35 @@ static void w1ax_capture_activations(
     GGML_ASSERT(fwrite(name, 1, sizeof(name), file) == sizeof(name));
     GGML_ASSERT(fwrite(host.data(), sizeof(float), host.size(), file) == host.size());
     GGML_ASSERT(fclose(file) == 0);
+    const int64_t capture_end_us = ggml_time_us();
+
+    // Tensor names usually contain only dots and identifiers, but serialize
+    // arbitrary valid names without allowing quotes/control bytes to break JSONL.
+    std::string escaped_name;
+    for (const unsigned char * p = (const unsigned char *) name; *p; ++p) {
+        if (*p == '"' || *p == '\\') escaped_name += '\\';
+        if (*p < 0x20) {
+            char escape[7];
+            snprintf(escape, sizeof(escape), "\\u%04x", (unsigned) *p);
+            escaped_name += escape;
+        } else {
+            escaped_name += (char) *p;
+        }
+    }
+    static std::mutex sidecar_mutex;
+    const std::lock_guard<std::mutex> lock(sidecar_mutex);
+    const int sidecar_len = snprintf(path, sizeof(path), "%s/captures.jsonl", directory);
+    GGML_ASSERT(sidecar_len > 0 && (size_t) sidecar_len < sizeof(path));
+    FILE * sidecar = fopen(path, "a");
+    GGML_ASSERT(sidecar != nullptr);
+    GGML_ASSERT(fprintf(sidecar,
+            "{\"schema_version\":1,\"sequence\":%llu,\"file\":\"op-%012llu.bin\","
+            "\"weight_tensor\":\"%s\",\"k\":%lld,\"m\":%lld,\"n\":%lld,"
+            "\"bits\":%d,\"timestamp_us\":%lld,\"capture_start_us\":%lld,\"capture_end_us\":%lld}\n",
+            id, id, escaped_name.c_str(), (long long) k, (long long) m,
+            (long long) n, bits, (long long) timestamp_us,
+            (long long) timestamp_us, (long long) capture_end_us) > 0);
+    GGML_ASSERT(fclose(sidecar) == 0);
 }
 
 void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
