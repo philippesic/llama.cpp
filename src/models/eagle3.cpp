@@ -1,7 +1,24 @@
 #include "models.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <set>
+
+static int eagle3_w1ax_activation_bits() {
+    const char * value = std::getenv("GGML_W1AX_ACT_BITS");
+    if (!value || !*value || std::string(value) == "1") return 1;
+    if (std::string(value) == "4") return 4;
+    if (std::string(value) == "8") return 8;
+    if (std::string(value) == "16") return 16;
+    throw std::runtime_error("GGML_W1AX_ACT_BITS must be 1, 4, 8, or 16");
+}
+
+static void eagle3_log_w1ax_activation_bits(int bits) {
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t mask = uint32_t(1) << bits;
+    if (!(logged.fetch_or(mask) & mask)) LLAMA_LOG_INFO("EAGLE3 W1Ax activation bits: %d\n", bits);
+}
 
 void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -277,11 +294,13 @@ ggml_tensor * llama_model_eagle3::graph<true>::build_inp_embd_enc() const {
 template <>
 llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = nullptr;
+    const int activation_bits = eagle3_w1ax_activation_bits();
+    if (model.fc_w1a1_packed) eagle3_log_w1ax_activation_bits(activation_bits);
     auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
         if (!packed) return build_lora_mm(dense, input);
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
-        return ggml_w1a1_mul_mat(ctx0, packed, scales, input, logical_k);
+        return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
     };
 
     cur = build_inp_embd_enc();
@@ -310,6 +329,8 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
 // Output: draft logits
 template <>
 llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    const int activation_bits = eagle3_w1ax_activation_bits();
+    if (model.output_w1a1_packed || model.layers[0].wq_w1a1_packed) eagle3_log_w1ax_activation_bits(activation_bits);
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -321,7 +342,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (!packed) return build_lora_mm(dense, input);
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
-        return ggml_w1a1_mul_mat(ctx0, packed, scales, input, logical_k);
+        return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
     };
 
     // eagle3 Decoder receives:
@@ -486,7 +507,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (cur->type != GGML_TYPE_F32) {
             cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
         }
-        cur = ggml_w1a1_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd);
+        cur = ggml_w1ax_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd, activation_bits);
     } else {
         auto * output = model.output;
         if (output == nullptr) {

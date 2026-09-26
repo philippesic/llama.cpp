@@ -5047,13 +5047,15 @@ struct test_mul_mat : public test_case {
 struct test_w1a1_mul_mat : public test_case {
     const int64_t k;
     const bool strided;
+    const int bits;
     static constexpr int64_t m = 7;
-    static constexpr int64_t n_tokens = 3;
+    const int64_t n_tokens;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false) : k(k), strided(strided) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3)
+        : k(k), strided(strided), bits(bits), n_tokens(n_tokens) {}
 
-    std::string vars() override { return VARS_TO_STR2(k, strided); }
+    std::string vars() override { return VARS_TO_STR4(k, strided, bits, n_tokens); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5085,7 +5087,7 @@ struct test_w1a1_mul_mat : public test_case {
         ggml_set_name(w, "w1a1_weights");
         ggml_set_name(s, "w1a1_scales");
         ggml_set_name(a, "w1a1_activations");
-        return ggml_w1a1_mul_mat(ctx, w, s, a, k);
+        return ggml_w1ax_mul_mat(ctx, w, s, a, k, bits);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -5113,13 +5115,29 @@ struct test_w1a1_mul_mat : public test_case {
             double abs_sum = 0.0;
             for (int64_t i = 0; i < k; ++i) abs_sum += std::abs(acts[token * k + i]);
             const float act_scale = float(abs_sum / double(k));
+            float absmax = 0.0f;
+            for (int64_t i = 0; i < k; ++i) absmax = std::max(absmax, std::abs(acts[token * k + i]));
+            const int qmax = bits == 8 ? 127 : 7;
+            const float quant_scale = absmax / float(qmax);
             for (int64_t row = 0; row < m; ++row) {
                 int64_t matches = 0;
+                int32_t int_dot = 0;
+                float half_dot = 0.0f;
                 for (int64_t i = 0; i < k; ++i) {
-                    matches += (weight_value(row, i) >= 0.0f) == (acts[token * k + i] >= 0.0f) ? 1 : -1;
+                    const int sign = weight_value(row, i) >= 0.0f ? 1 : -1;
+                    const float x = acts[token * k + i];
+                    matches += sign * (x >= 0.0f ? 1 : -1);
+                    if (bits == 16) {
+                        const float h = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
+                        half_dot += sign > 0 ? h : -h;
+                    } else if (bits == 4 || bits == 8) {
+                        const float normalized = absmax == 0.0f ? 0.0f : x * (float(qmax) / absmax);
+                        const int q = std::max(-qmax, std::min(qmax, int(std::nearbyint(normalized))));
+                        int_dot += sign * q;
+                    }
                 }
-                const float weighted = float(matches) * scales[row];
-                expected[token * m + row] = weighted * act_scale;
+                const float weighted = (bits == 1 ? float(matches) : bits == 16 ? half_dot : float(int_dot)) * scales[row];
+                expected[token * m + row] = bits == 1 ? weighted * act_scale : bits == 16 ? weighted : weighted * quant_scale;
             }
         }
 
@@ -10013,10 +10031,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // 2560 is the audited EAGLE drafter head K width.
-    for (int64_t k : {31, 32, 33, 2560}) {
-        test_cases.emplace_back(new test_w1a1_mul_mat(k));
+    for (int bits : {1, 4, 8, 16}) {
+        for (int64_t k : {1, 7, 31, 32, 33, 64, 2560}) {
+            test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 1));
+            test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 2));
+            test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 3));
+        }
+        test_cases.emplace_back(new test_w1a1_mul_mat(33, true, bits));
     }
-    test_cases.emplace_back(new test_w1a1_mul_mat(33, true));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

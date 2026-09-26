@@ -1486,6 +1486,7 @@ static void ggml_compute_forward_w1a1_mul_mat(
     const struct ggml_tensor * acts    = dst->src[2];
     int64_t k;
     memcpy(&k, dst->op_params, sizeof(k));
+    const int32_t activation_bits = ggml_get_op_params_i32(dst, 2);
     const int64_t words = (k - 1)/32 + 1;
     const int64_t m = weights->ne[1];
     const int64_t n = acts->ne[1];
@@ -1506,9 +1507,49 @@ static void ggml_compute_forward_w1a1_mul_mat(
     const float * const act_data   = (const float *) acts->data;
     const uint32_t * const weight_data = (const uint32_t *) weights->data;
     float * const output = (float *) dst->data;
+    int8_t * codes = (activation_bits == 4 || activation_bits == 8) ? (int8_t *) malloc((size_t) k) : NULL;
+    float * half_values = activation_bits == 16 ? (float *) malloc((size_t) k * sizeof(float)) : NULL;
+    GGML_ASSERT((activation_bits != 4 && activation_bits != 8) || codes != NULL);
+    GGML_ASSERT(activation_bits != 16 || half_values != NULL);
 
     for (int64_t token = 0; token < n; ++token) {
         const float * act = act_data + token * k;
+        if (activation_bits != 1) {
+            const int qmax = activation_bits == 8 ? 127 : 7;
+            float act_scale = 1.0f;
+            if (activation_bits == 16) {
+                for (int64_t i = 0; i < k; ++i) {
+                    GGML_ASSERT(isfinite(act[i]));
+                    half_values[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(act[i]));
+                }
+            } else {
+                GGML_ASSERT(activation_bits == 4 || activation_bits == 8);
+                float absmax = 0.0f;
+                for (int64_t i = 0; i < k; ++i) {
+                    GGML_ASSERT(isfinite(act[i]));
+                    absmax = fmaxf(absmax, fabsf(act[i]));
+                }
+                act_scale = absmax / (float) qmax;
+                for (int64_t i = 0; i < k; ++i) {
+                    const float normalized = absmax == 0.0f ? 0.0f : act[i] * ((float) qmax / absmax);
+                    codes[i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(normalized)));
+                }
+            }
+            for (int64_t row = row_begin; row < row_end; ++row) {
+                const uint32_t * packed = weight_data + row * words;
+                float sum_fp = 0.0f;
+                int32_t sum_int = 0;
+                for (int64_t i = 0; i < k; ++i) {
+                    const int sign = (packed[i / 32] & (UINT32_C(1) << (i % 32))) ? 1 : -1;
+                    if (activation_bits == 16) sum_fp += sign > 0 ? half_values[i] : -half_values[i];
+                    else sum_int += sign * (int32_t) codes[i];
+                }
+                GGML_ASSERT(isfinite(scale_data[row]));
+                const float weighted = (activation_bits == 16 ? sum_fp : (float) sum_int) * scale_data[row];
+                output[token * m + row] = activation_bits == 16 ? weighted : weighted * act_scale;
+            }
+            continue;
+        }
         double abs_sum = 0.0;
         memset(signs, 0, words * sizeof(uint32_t));
         for (int64_t i = 0; i < k; ++i) {
@@ -1533,6 +1574,8 @@ static void ggml_compute_forward_w1a1_mul_mat(
             output[token * m + row] = weighted * act_scale;
         }
     }
+    free(codes);
+    free(half_values);
 }
 
 // ggml_compute_forward_mul_mat_id

@@ -1496,6 +1496,16 @@ extern "C" {
             struct ggml_tensor  * activations,
             int64_t               logical_k);
 
+    // Same packed one-bit weights, with activations at 1, 4, 8 or 16 bits.
+    // A16 casts each input to FP16; A8/A4 use signed per-token absmax codes.
+    GGML_API struct ggml_tensor * ggml_w1ax_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed_weights,
+            struct ggml_tensor  * weight_scales,
+            struct ggml_tensor  * activations,
+            int64_t               logical_k,
+            int32_t               activation_bits);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(

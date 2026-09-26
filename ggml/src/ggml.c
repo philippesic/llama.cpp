@@ -3363,6 +3363,17 @@ struct ggml_tensor * ggml_w1a1_mul_mat(
         struct ggml_tensor  * weight_scales,
         struct ggml_tensor  * activations,
         int64_t               logical_k) {
+    return ggml_w1ax_mul_mat(ctx, packed_weights, weight_scales, activations, logical_k, 1);
+}
+
+struct ggml_tensor * ggml_w1ax_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed_weights,
+        struct ggml_tensor  * weight_scales,
+        struct ggml_tensor  * activations,
+        int64_t               logical_k,
+        int32_t               activation_bits) {
+    GGML_ASSERT(activation_bits == 1 || activation_bits == 4 || activation_bits == 8 || activation_bits == 16);
     GGML_ASSERT(logical_k > 0);
     GGML_ASSERT(packed_weights->type == GGML_TYPE_I32);
     GGML_ASSERT(weight_scales->type == GGML_TYPE_F32);
@@ -3385,6 +3396,7 @@ struct ggml_tensor * ggml_w1a1_mul_mat(
     result->src[1] = weight_scales;
     result->src[2] = activations;
     ggml_set_op_params(result, &logical_k, sizeof(logical_k));
+    ggml_set_op_params_i32(result, 2, activation_bits);
     return result;
 }
 
