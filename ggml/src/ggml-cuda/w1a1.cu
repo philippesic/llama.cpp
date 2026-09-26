@@ -129,7 +129,7 @@ static __global__ void w1ax_quantize(
 static __global__ void w1ax_integer_dot(
         const uint32_t * weights, const float * weight_scales,
         const int8_t * codes, const uint32_t * planes, const float * act_scales,
-        int64_t m, int64_t k, int64_t words, int bits, bool bitserial, float * output) {
+        int64_t m, int64_t k, int64_t words, int bits, bool bitserial, float * output, int32_t * raw_dots) {
     __shared__ int sums[4][32];
     const int64_t row = (int64_t) blockIdx.x*4 + threadIdx.y;
     const int64_t token = blockIdx.y;
@@ -159,9 +159,27 @@ static __global__ void w1ax_integer_dot(
         __syncthreads();
     }
     if (row < m && lane == 0) {
+        if (raw_dots) raw_dots[token*m + row] = sums[threadIdx.y][0];
         const float weighted = (float) sums[threadIdx.y][0] * weight_scales[row];
         output[token*m + row] = weighted * act_scales[token];
     }
+}
+
+// Independent scalar integer reference. Enable only for correctness runs;
+// the production path never materializes raw dot values.
+static __global__ void w1ax_validate_integer_dots(
+        const uint32_t * weights, const int8_t * codes, const int32_t * raw_dots,
+        int64_t m, int64_t n, int64_t k, int64_t words) {
+    const int64_t index = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (index >= m*n) return;
+    const int64_t token = index / m;
+    const int64_t row = index % m;
+    int32_t reference = 0;
+    for (int64_t i = 0; i < k; ++i) {
+        const int sign = (weights[row*words + i/32] & (1u << (i%32))) ? 1 : -1;
+        reference += sign*(int) codes[token*k + i];
+    }
+    if (reference != raw_dots[index]) asm("trap;");
 }
 
 // Explicit F32->FP16 cast happens at the operator boundary. Add signed FP16
@@ -263,15 +281,25 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         return;
     }
     if (bits == 4 || bits == 8) {
+        static const bool check_integer_dots = getenv("GGML_W1AX_ASSERT_INT_DOT") &&
+            strcmp(getenv("GGML_W1AX_ASSERT_INT_DOT"), "0") != 0;
         ggml_cuda_pool_alloc<int8_t> codes(ctx.pool(), (size_t) n*k);
         ggml_cuda_pool_alloc<uint32_t> planes(ctx.pool(), bits == 4 ? (size_t) n*words*4 : 1);
+        ggml_cuda_pool_alloc<int32_t> raw_dots(ctx.pool(), check_integer_dots ? (size_t) n*m : 1);
         w1ax_quantize<<<dim3(token_blocks), 256, 0, stream>>>(
                 (const float *) acts->data, k, words, bits, codes.ptr, planes.ptr, act_scales.ptr);
         CUDA_CHECK(cudaGetLastError());
         w1ax_integer_dot<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
-                codes.ptr, planes.ptr, act_scales.ptr, m, k, words, bits, bitserial, (float *) dst->data);
+                codes.ptr, planes.ptr, act_scales.ptr, m, k, words, bits, bitserial, (float *) dst->data,
+                check_integer_dots ? raw_dots.ptr : nullptr);
         CUDA_CHECK(cudaGetLastError());
+        if (check_integer_dots) {
+            w1ax_validate_integer_dots<<<dim3((unsigned) ((m*n + 127)/128)), 128, 0, stream>>>(
+                    (const uint32_t *) weights->data, codes.ptr, raw_dots.ptr, m, n, k, words);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
         return;
     }
     GGML_ASSERT(bits == 1);
