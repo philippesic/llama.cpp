@@ -252,12 +252,16 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(weights->type == GGML_TYPE_I32 && scales->type == GGML_TYPE_F32);
     GGML_ASSERT(acts->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->ne[0] == words && scales->ne[0] == m && acts->ne[0] == k);
+    GGML_ASSERT(bits == 1 || bits == 4 || bits == 8 || bits == 16);
     GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
     GGML_ASSERT((m - 1)/4 + 1 <= INT_MAX);
 
     static std::atomic<unsigned> logged{0};
-    const bool bitserial = bits == 4 && !(getenv("GGML_W1AX_A4_KERNEL") && strcmp(getenv("GGML_W1AX_A4_KERNEL"), "conventional") == 0);
+    const char * a4_kernel = getenv("GGML_W1AX_A4_KERNEL");
+    GGML_ASSERT(bits != 4 || !a4_kernel || !*a4_kernel ||
+            strcmp(a4_kernel, "bitserial") == 0 || strcmp(a4_kernel, "conventional") == 0);
+    const bool bitserial = bits == 4 && (!a4_kernel || strcmp(a4_kernel, "conventional") != 0);
     const unsigned flag = bits == 1 ? 1u : bits == 4 ? (bitserial ? 2u : 4u) : bits == 8 ? 8u : 16u;
     if (!(logged.fetch_or(flag) & flag)) {
         const char * marker = bits == 1 ? "CUDA packed W1A1 XOR/POPCOUNT dispatch" :
