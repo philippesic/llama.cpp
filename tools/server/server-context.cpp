@@ -18,13 +18,17 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <sstream>
 #include <utility>
 #include <fstream>
 
@@ -108,6 +112,11 @@ enum slot_state {
 };
 
 struct server_slot; // forward declaration
+
+struct server_verify_trace {
+    size_t row;
+    json record;
+};
 
 // One verification attempt. A checkpoint restore produces a separate attempt
 // with status "checkpoint_replay" followed by a replay attempt.
@@ -291,6 +300,7 @@ struct server_slot {
     int64_t spec_trace_begin_start_us = 0;
     int64_t spec_trace_begin_end_us = 0;
     server_round_trace spec_trace_round;
+    int64_t verify_trace_round_index = 0;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -408,6 +418,7 @@ struct server_slot {
         spec_trace_begin_start_us = 0;
         spec_trace_begin_end_us = 0;
         spec_trace_round = {};
+        verify_trace_round_index = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -934,6 +945,64 @@ private:
     common_speculative_ptr spec;
 
     std::ofstream round_trace_file; // enabled by W1AX_ROUND_TRACE_JSONL
+    std::ofstream verify_trace_file; // enabled by W1AX_VERIFY_TRACE_JSONL
+    std::set<int64_t> verify_trace_positions;
+
+    // Read the untouched model output, before any sampler can transform it.
+    // This scan runs only at explicitly selected zero-based generated positions.
+    server_verify_trace capture_verify_trace(const server_slot & slot, size_t row, int32_t batch_index,
+            int64_t position, int64_t round, llama_token draft, const char * mode) {
+        server_verify_trace tr { row, {
+            {"schema", "w1ax_verify_logits_v1"},
+            {"task_id", slot.task->id}, {"parent_task_id", slot.task->id_parent}, {"slot_id", slot.id},
+            {"round_index", round}, {"generated_position", position}, {"row", row},
+            {"batch_index", batch_index}, {"mode", mode}, {"replay", slot.spec_is_replay},
+            {"draft_token_id", draft}, {"sampled", false}, {"sampled_token_id", nullptr},
+            {"selected_token_id", nullptr}, {"emitted", false}, {"emitted_token_id", nullptr},
+            {"status", "not_sampled"},
+            {"logit_source", "llama_get_logits_ith_before_sampling"},
+            {"emission_scope", "processed generation token; visible text may be suppressed by stopping rules"},
+        } };
+        const float * logits = llama_get_logits_ith(slot.ctx_tgt, batch_index);
+        tr.record["has_logits"] = logits != nullptr;
+        json top = json::array();
+        int64_t n_nan = 0;
+        if (logits) {
+            std::array<std::pair<float, llama_token>, 5> ranked;
+            for (auto & entry : ranked) entry = { -std::numeric_limits<float>::infinity(), LLAMA_TOKEN_NULL };
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
+            for (llama_token id = 0; id < n_vocab; ++id) {
+                const float value = logits[id];
+                if (std::isnan(value)) {
+                    ++n_nan;
+                    continue;
+                }
+                for (size_t k = 0; k < ranked.size(); ++k) {
+                    if (ranked[k].second == LLAMA_TOKEN_NULL || value > ranked[k].first) {
+                        for (size_t j = ranked.size() - 1; j > k; --j) ranked[j] = ranked[j - 1];
+                        ranked[k] = { value, id };
+                        break;
+                    }
+                }
+            }
+            for (const auto & entry : ranked) {
+                if (entry.second == LLAMA_TOKEN_NULL) continue;
+                json item = {{"token_id", entry.second}, {"logit", nullptr}};
+                if (std::isfinite(entry.first)) item["logit"] = entry.first;
+                else item["logit_special"] = entry.first > 0 ? "+inf" : "-inf";
+                top.push_back(std::move(item));
+            }
+        }
+        tr.record["raw_top5"] = std::move(top);
+        tr.record["nan_logit_count"] = n_nan;
+        return tr;
+    }
+
+    void emit_verify_traces(std::vector<server_verify_trace> & traces) {
+        for (const auto & tr : traces) verify_trace_file << tr.record.dump() << '\n';
+        if (!traces.empty()) verify_trace_file.flush();
+        traces.clear();
+    }
 
     void emit_round_trace(server_slot & slot, const char * status) {
         auto & tr = slot.spec_trace_round;
@@ -1053,6 +1122,8 @@ private:
 
     void destroy() {
         round_trace_file.close();
+        verify_trace_file.close();
+        verify_trace_positions.clear();
         spec.reset();
         spec_init.reset();
 
@@ -1393,6 +1464,34 @@ private:
                     SRV_INF("writing EAGLE round CPU wall trace to %s\n", trace_path);
                 } else {
                     SRV_WRN("cannot open EAGLE round trace at %s\n", trace_path);
+                }
+            }
+        }
+
+        if (const char * path = std::getenv("W1AX_VERIFY_TRACE_JSONL")) {
+            if (path[0] != '\0') {
+                const char * positions = std::getenv("W1AX_VERIFY_TRACE_POSITIONS");
+                try {
+                    std::stringstream input(positions ? positions : "109");
+                    std::string part;
+                    while (std::getline(input, part, ',')) {
+                        size_t end = 0;
+                        const int64_t pos = std::stoll(part, &end);
+                        if (pos < 0 || part.find_first_not_of(" \t\r\n", end) != std::string::npos) {
+                            throw std::invalid_argument("expected nonnegative generated positions");
+                        }
+                        verify_trace_positions.insert(pos);
+                    }
+                    if (verify_trace_positions.empty()) throw std::invalid_argument("empty position list");
+                    verify_trace_file.open(path, std::ios::out | std::ios::app);
+                    if (!verify_trace_file.is_open()) {
+                        SRV_WRN("cannot open raw verifier trace at %s\n", path);
+                    } else {
+                        SRV_INF("writing raw verifier logits at selected generated positions to %s\n", path);
+                    }
+                } catch (const std::exception & e) {
+                    verify_trace_positions.clear();
+                    SRV_WRN("invalid W1AX_VERIFY_TRACE_POSITIONS: %s; raw verifier trace disabled\n", e.what());
                 }
             }
         }
@@ -4070,6 +4169,15 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            std::vector<server_verify_trace> verify_traces;
+            if (verify_trace_file.is_open()) {
+                const int64_t round = slot.verify_trace_round_index++;
+                if (verify_trace_positions.count(slot.stats.n_gen)) {
+                    verify_traces.push_back(capture_verify_trace(slot, 0, tok_idx, slot.stats.n_gen, round,
+                            LLAMA_TOKEN_NULL, slot.can_speculate() ? "target_no_proposal" : "target_only"));
+                }
+            }
+
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
@@ -4106,7 +4214,17 @@ private:
                 slot.spec_trace_round.emitted.push_back(id);
             }
 
-            if (!process_token(result, slot)) {
+            const bool keep_generating = process_token(result, slot);
+            for (auto & tr : verify_traces) {
+                tr.record["sampled"] = true;
+                tr.record["sampled_token_id"] = id;
+                tr.record["selected_token_id"] = id;
+                tr.record["emitted"] = true;
+                tr.record["emitted_token_id"] = id;
+                tr.record["status"] = "target";
+            }
+            emit_verify_traces(verify_traces);
+            if (!keep_generating) {
                 emit_round_trace(slot, "no_proposal");
                 // release slot because of stop condition
                 slot.print_timings();
@@ -4132,6 +4250,21 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            std::vector<server_verify_trace> verify_traces;
+            if (verify_trace_file.is_open()) {
+                const int64_t round = slot.verify_trace_round_index++;
+                for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                    const int64_t position = slot.stats.n_gen + i;
+                    if (verify_trace_positions.count(position)) {
+                        auto tr = capture_verify_trace(slot, i, slot.spec_i_batch[i], position, round,
+                                i < n_draft ? slot.spec_draft[i] : LLAMA_TOKEN_NULL, "speculative_verify");
+                        tr.record["base_generated_position"] = slot.stats.n_gen;
+                        tr.record["verifier_prefix_draft_ids"] = llama_tokens(slot.spec_draft.begin(), slot.spec_draft.begin() + i);
+                        verify_traces.push_back(std::move(tr));
+                    }
+                }
+            }
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
@@ -4145,6 +4278,20 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 if (slot.spec_trace_round.active) slot.spec_trace_round.check_end_us = ggml_time_us();
+                for (auto & tr : verify_traces) {
+                    if (tr.row < accepted.size()) {
+                        const llama_token selected = accepted[tr.row];
+                        tr.record["selected_token_id"] = selected;
+                        tr.record["sampled"] = true;
+                        // Synthetic acceptance does not preserve the actual sampler result.
+                        if (synth_probs.empty()) {
+                            tr.record["sampled_token_id"] = selected;
+                        }
+                        tr.record["status"] = !synth_probs.empty() ? "synthetic_selected" :
+                            tr.row == n_draft ? "bonus" :
+                            selected == slot.spec_draft[tr.row] ? "accepted" : "rejected";
+                    }
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4189,6 +4336,9 @@ private:
                             slot.spec_trace_round.repair_end_us = ggml_time_us();
                             emit_round_trace(slot, "checkpoint_replay");
                         }
+
+                        for (auto & tr : verify_traces) tr.record["disposition"] = "checkpoint_replay";
+                        emit_verify_traces(verify_traces);
 
                         return;
                     }
@@ -4253,7 +4403,15 @@ private:
                 slot.stats.n_gen += 1;
                 if (slot.spec_trace_round.active) slot.spec_trace_round.emitted.push_back(ids[i]);
 
-                if (!process_token(result, slot)) {
+                const bool keep_generating = process_token(result, slot);
+                for (auto & tr : verify_traces) {
+                    if (tr.row == i) {
+                        tr.record["emitted"] = true;
+                        tr.record["emitted_token_id"] = ids[i];
+                    }
+                }
+                if (!keep_generating) {
+                    emit_verify_traces(verify_traces);
                     emit_round_trace(slot, "complete");
                     slot.print_timings();
                     send_final_response(slot);
@@ -4263,6 +4421,7 @@ private:
                 }
             }
 
+            emit_verify_traces(verify_traces);
             emit_round_trace(slot, "complete");
             slot.print_timings_tg();
 
