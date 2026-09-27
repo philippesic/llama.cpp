@@ -1425,6 +1425,9 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
+    ggml_cuda_matmul_audit(ctx, src0, src1, "MMVQ", "Q8_1", "I32_dot_F32_scaled_sum", fusion && fusion->gate ? "shared_Q8_1_pack" : "separate_Q8_1_pack", fusion ? fusion->gate : nullptr);
+    if (fusion && fusion->gate) ggml_cuda_matmul_audit(ctx, fusion->gate, src1, "MMVQ", "Q8_1", "I32_dot_F32_scaled_sum", "shared_Q8_1_pack", src0);
+
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();

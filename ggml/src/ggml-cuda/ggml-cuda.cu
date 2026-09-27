@@ -86,6 +86,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <tuple>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -698,6 +700,36 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
+
+void ggml_cuda_matmul_audit(ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * acts, const char * path, const char * activation, const char * accumulation,
+        const char * conversion, const ggml_tensor * fused_gate) {
+    static const bool enabled = getenv("GGML_CUDA_MATMUL_AUDIT") != nullptr;
+    if (!enabled) return;
+    if (weights->type != GGML_TYPE_F16 && weights->type != GGML_TYPE_F32 && weights->type != GGML_TYPE_Q4_0 &&
+            weights->type != GGML_TYPE_Q8_0 && weights->type != GGML_TYPE_I32) return;
+    const char * name = weights->name;
+    if (strncmp(name, "blk.0.", 6) && strcmp(name, "fc.weight") && strcmp(name, "output.weight") &&
+            strcmp(name, "fc.w1a1_packed") && strcmp(name, "output.w1a1_packed")) return;
+    if (strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.") != strlen(name)) return;
+    if (fused_gate && strspn(fused_gate->name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.") != strlen(fused_gate->name)) return;
+    using key_type = std::tuple<uintptr_t, std::string, int, int64_t, int64_t, int64_t,
+            std::string, std::string, std::string, std::string, std::string>;
+    static std::set<key_type> seen;
+    static std::mutex mutex;
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.emplace((uintptr_t) &ctx, name, (int) weights->type, acts->ne[0], weights->ne[1], acts->ne[1],
+            path, activation, accumulation, conversion, fused_gate ? fused_gate->name : "").second) return;
+    fprintf(stderr, "CUDA_MATMUL_AUDIT {\"schema\":1,\"scope\":\"dispatch_inventory_not_execution_counts\","
+            "\"device\":%d,\"context\":\"%p\",\"weight\":\"%s\",\"weight_type\":\"%s\","
+            "\"k\":%lld,\"m\":%lld,\"n\":%lld,\"path\":\"%s\",\"activation_buffer_type\":\"%s\","
+            "\"activation_operand\":\"%s\",\"accumulation\":\"%s\",\"conversion\":\"%s\","
+            "\"fused_with_weight\":\"%s\",\"projection_records_share_launch\":%s}\n",
+            ctx.device, (void *) &ctx, name, ggml_type_name(weights->type), (long long) acts->ne[0],
+            (long long) weights->ne[1], (long long) acts->ne[1], path, ggml_type_name(acts->type),
+            activation, accumulation, conversion, fused_gate ? fused_gate->name : "", fused_gate ? "true" : "false");
+    fflush(stderr);
+}
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (graph_stats_enabled) {
@@ -1547,6 +1579,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
     }
+
+    ggml_cuda_matmul_audit(ctx, src0, src1, "cuBLAS", ggml_type_name(compute_type),
+            cu_compute_type == CUBLAS_COMPUTE_16F ? "F16" : "F32", "operand_conversion_if_needed");
 
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);

@@ -16,6 +16,9 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
 
 
+    ggml_cuda_matmul_audit(ctx, src0, src1, "MMF", ggml_type_name(src0->type), "F32_MMA",
+            src0->type == GGML_TYPE_F16 ? "inside_kernel_F16_round" : "kernel_specialization");
+
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     const size_t ts_src0 = ggml_type_size(src0->type);

@@ -335,6 +335,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(n <= 65535);
     w1ax_capture_activations(stream, weights, acts, k, m, n, bits);
     if (bits == 16 && grouped) {
+        ggml_cuda_matmul_audit(ctx, weights, acts, "custom_A16_group128", "F16", "F32_signadd_and_scales", "inside_kernel_F16_round_no_separate_pack");
         w1a16_group128_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
                 (const float *) acts->data, m, k, words, (float *) dst->data);
@@ -342,6 +343,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         return;
     }
     if (bits == 16) {
+        ggml_cuda_matmul_audit(ctx, weights, acts, "custom_A16_row", "F16", "F32_signadd_and_scales", "inside_kernel_F16_round_no_separate_pack");
         w1a16_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
                 (const float *) acts->data, m, k, words, (float *) dst->data);

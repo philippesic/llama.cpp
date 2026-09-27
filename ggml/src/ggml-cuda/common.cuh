@@ -1582,6 +1582,10 @@ struct ggml_backend_cuda_context {
     }
 };
 
+void ggml_cuda_matmul_audit(ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        const ggml_tensor * acts, const char * path, const char * activation, const char * accumulation,
+        const char * conversion, const ggml_tensor * fused_gate = nullptr);
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;

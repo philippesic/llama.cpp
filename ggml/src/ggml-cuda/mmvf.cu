@@ -653,6 +653,13 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
+    const bool half_accum = src0->type == GGML_TYPE_F16 && prec == GGML_PREC_DEFAULT;
+    const char * accumulation = half_accum ? "F16_partial_F32_reduction" : "F32";
+    const char * activation = half_accum ? "F16" : "F32";
+    const char * conversion = half_accum ? "inside_kernel_F16_round" : "none";
+    ggml_cuda_matmul_audit(ctx, src0, src1, "MMVF", activation, accumulation, conversion, fusion ? fusion->gate : nullptr);
+    if (fusion && fusion->gate) ggml_cuda_matmul_audit(ctx, fusion->gate, src1, "MMVF", activation, accumulation, conversion, src0);
+
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
