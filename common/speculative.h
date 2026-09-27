@@ -111,6 +111,12 @@ struct common_speculative_process_trace {
 void common_speculative_set_process_trace(common_speculative * spec, bool enabled);
 common_speculative_process_trace common_speculative_get_process_trace(const common_speculative * spec);
 
+// For a finer diagnostic partition, EAGLE_DRAFT_STAGE_JSONL appends one
+// eagle_draft_stage_v1 record per invoked EAGLE draft() call. It inserts an
+// explicit synchronization before sampling: sync/retrieve covers pending backend
+// work plus the prenorm getter, while candidate-logit copying remains inside
+// output_sampling. Its CPU wall spans nest inside these/server round spans and
+// must not be added to parent spans or CUDA times. JSON serialization is excluded.
 struct common_speculative_draft_trace {
     int64_t seed_decode_us = 0;
     std::vector<int64_t> step_decode_us;

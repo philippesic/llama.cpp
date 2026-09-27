@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <map>
+#include <sstream>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -50,6 +51,80 @@ static FILE * eagle_state_trace_open() {
     GGML_ASSERT(file != nullptr);
     return file;
 }
+
+// Diagnostic CPU wall partition of a single EAGLE draft() invocation. These
+// spans nest INSIDE the server's draft/round wall spans; never add them to those
+// parent spans or to CUDA event/kernel durations. Serialization is outside total.
+struct eagle_draft_stage_trace {
+    struct span { const char * stage; int depth; int64_t start, end; };
+    struct sequence { llama_seq_id id; llama_pos pos0; llama_token seed; };
+    const char * path;
+    uint64_t call_index;
+    int64_t start = 0, cursor = 0;
+    const char * current = "seed_prepare";
+    const char * status = "complete";
+    int depth = -1;
+    int seed_rows = 0, recurrent_rows = 0, decode_calls = 0, sampling_calls = 0, retrieval_calls = 0;
+    std::vector<span> spans;
+    std::vector<sequence> sequences;
+
+    explicit eagle_draft_stage_trace(uint64_t call_index)
+        : path(std::getenv("EAGLE_DRAFT_STAGE_JSONL")), call_index(call_index) {
+        if (enabled()) start = cursor = ggml_time_us();
+    }
+    bool enabled() const { return path && *path; }
+    void next(const char * stage, int next_depth) {
+        if (!enabled()) return;
+        const int64_t now = ggml_time_us();
+        spans.push_back({current, depth, cursor, now});
+        current = stage; depth = next_depth; cursor = now;
+    }
+    ~eagle_draft_stage_trace() {
+        if (!enabled()) return;
+        const int64_t end = ggml_time_us();
+        spans.push_back({current, depth, cursor, end});
+        std::map<std::string, int64_t> totals;
+        int64_t partition_us = 0;
+        std::ostringstream out;
+        out << "{\"schema\":\"eagle_draft_stage_v1\",\"clock\":\"ggml_time_us_cpu_wall\","
+            << "\"scope\":\"draft_invocation_nested_within_round\",\"explicit_sync_before_sampling\":true,"
+            << "\"serialization_included\":false,\"call_index\":" << call_index
+            << ",\"start_us\":" << start << ",\"end_us\":" << end << ",\"total_us\":" << end-start
+            << ",\"status\":\"" << status << "\",\"seed_rows\":" << seed_rows
+            << ",\"recurrent_rows\":" << recurrent_rows << ",\"decode_calls\":" << decode_calls
+            << ",\"sampling_calls\":" << sampling_calls << ",\"retrieval_calls\":" << retrieval_calls
+            << ",\"sequences\":[";
+        for (size_t i = 0; i < sequences.size(); ++i) {
+            const auto & seq = sequences[i];
+            if (i) out << ',';
+            out << "{\"seq_id\":" << seq.id << ",\"pos0\":" << seq.pos0 << ",\"seed_token_id\":" << seq.seed << '}';
+        }
+        out << "],\"spans\":[";
+        for (size_t i = 0; i < spans.size(); ++i) {
+            const auto & value = spans[i];
+            const int64_t us = value.end - value.start;
+            GGML_ASSERT(us >= 0);
+            if (i) out << ',';
+            out << "{\"stage\":\"" << value.stage << "\",\"depth\":" << value.depth
+                << ",\"start_us\":" << value.start << ",\"end_us\":" << value.end << ",\"duration_us\":" << us << '}';
+            totals[value.stage] += us;
+            partition_us += us;
+        }
+        GGML_ASSERT(partition_us == end-start);
+        out << "],\"stage_totals_us\":{";
+        size_t n = 0;
+        for (const auto & total : totals) {
+            if (n++) out << ',';
+            out << '"' << total.first << "\":" << total.second;
+        }
+        out << "},\"partition_us\":" << partition_us << ",\"unassigned_us\":0}\n";
+        const std::string line = out.str();
+        FILE * file = fopen(path, "a");
+        GGML_ASSERT(file);
+        GGML_ASSERT(fwrite(line.data(), 1, line.size(), file) == line.size());
+        GGML_ASSERT(fclose(file) == 0);
+    }
+};
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -768,6 +843,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        eagle_draft_stage_trace stage(n_call_draft);
         auto & ctx_dft = params.ctx_dft;
 
         draft_trace = {};
@@ -793,6 +869,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 continue;
             }
 
+            if (stage.enabled()) stage.sequences.push_back({seq_id, dp.pos0, dp.id_last});
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
@@ -818,13 +895,18 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
 
         if (batch.n_tokens == 0) {
+            stage.status = "empty";
             return;
         }
 
+        if (stage.enabled()) { stage.seed_rows = batch.n_tokens; ++stage.decode_calls; }
+        stage.next("seed_decode_call", 0);
         const int64_t t_seed = process_trace_enabled ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
         if (process_trace_enabled) draft_trace.seed_decode_us = ggml_time_us() - t_seed;
+        stage.next("step_bookkeeping", 0);
         if (ret != 0) {
+            stage.status = "seed_decode_error";
             SPC_ERR("llama_decode returned %d\n", ret);
             return;
         }
@@ -844,6 +926,17 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 auto & dp = dparams.at(seq_id);
+                const float * prenorm = nullptr;
+                if (stage.enabled()) {
+                    stage.next(i == 0 ? "seed_sync_retrieve" : "recurrent_sync_retrieve", i);
+                    // Separate the pending backend wait from CPU sampling only in
+                    // this diagnostic. The ordinary path still synchronizes inside
+                    // common_sampler_sample and retrieves prenorm afterward.
+                    llama_synchronize(ctx_dft);
+                    prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                    ++stage.retrieval_calls;
+                }
+                stage.next("capture_copy", i);
                 if (dp.capture_head) {
                     const float * state = llama_get_embeddings_ith(ctx_dft, i_batch);
                     const float * logits = llama_get_logits_ith(ctx_dft, i_batch);
@@ -856,14 +949,17 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     row.logits.assign(logits, logits + nv);
                     dp.head_rows.push_back(std::move(row));
                 }
+                stage.next("output_sampling", i);
+                if (stage.enabled()) ++stage.sampling_calls;
                 const int64_t t_sample = process_trace_enabled ? ggml_time_us() : 0;
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 if (process_trace_enabled) {
                     if (draft_trace.sampler_us.size() <= (size_t) i) draft_trace.sampler_us.resize(i + 1, 0);
                     draft_trace.sampler_us[i] += ggml_time_us() - t_sample;
                 }
+                stage.next("step_bookkeeping", i);
                 // pre-norm hidden state of this position becomes g_embd for the next step
-                const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                if (!stage.enabled()) prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -901,18 +997,24 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     continue;
                 }
 
+                stage.next("recurrent_input_pack", i + 1);
                 common_batch_add(batch, id, pending_pos_last[seq_id] + (i + 1), { seq_id }, true);
                 std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec, prenorm, row_bytes);
+                stage.next("step_bookkeeping", i);
             }
 
             if (batch.n_tokens == 0) {
                 break;
             }
 
+            if (stage.enabled()) { stage.recurrent_rows += batch.n_tokens; ++stage.decode_calls; }
+            stage.next("recurrent_decode_call", i + 1);
             const int64_t t_step = process_trace_enabled ? ggml_time_us() : 0;
             ret = llama_decode(ctx_dft, batch);
             if (process_trace_enabled) draft_trace.step_decode_us.push_back(ggml_time_us() - t_step);
+            stage.next("step_bookkeeping", i + 1);
             if (ret != 0) {
+                stage.status = "recurrent_decode_error";
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
@@ -920,6 +1022,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             ++i;
         }
 
+        stage.next("finalize_bookkeeping", i);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
