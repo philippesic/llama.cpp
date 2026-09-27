@@ -91,6 +91,7 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     uint32_t full_w1a1_version = 0;
     const bool has_full_w1a1 = ml->get_key("eagle3.w1a1.version", full_w1a1_version, false);
     std::vector<std::string> w1a1_groups, w1a1_tensors;
+    std::map<std::string, std::string> dense_types;
     uint32_t scale_group_size = 0;
     if (has_full_w1a1) {
         std::string bit_order, sign_rule, scale_rule, arithmetic;
@@ -116,15 +117,31 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         }
         const std::set<std::string> declared(w1a1_tensors.begin(), w1a1_tensors.end());
         const std::set<std::string> declared_groups(w1a1_groups.begin(), w1a1_groups.end());
-        if (full_w1a1_version == 2) {
+        if (full_w1a1_version == 3) {
+            std::vector<std::string> names, types;
+            ml->get_arr("eagle3.w1a1.dense_tensors", names);
+            ml->get_arr("eagle3.w1a1.dense_types", types);
+            if (names.empty() || names.size() != types.size()) {
+                throw std::runtime_error("EAGLE3 mixed precision requires named dense tensor types");
+            }
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (declared.count(names[i]) || !expected.count(names[i]) ||
+                        !dense_types.emplace(names[i], types[i]).second ||
+                        (types[i] != "Q8_0" && types[i] != "Q4_0" && types[i] != "F16")) {
+                    throw std::runtime_error("EAGLE3 mixed precision has an invalid dense exception");
+                }
+                expected.erase(names[i]);
+            }
+        }
+        if (full_w1a1_version == 2 || full_w1a1_version == 3) {
             ml->get_key("eagle3.w1a1.scale_group_size", scale_group_size);
             if ((scale_group_size != 0 && scale_group_size != 128) || eagle3_w1ax_activation_bits() != 16) {
-                throw std::runtime_error("EAGLE3 scale-reference v2 requires row/group128 and explicit A16");
+                throw std::runtime_error("EAGLE3 scale-reference v2/v3 requires row/group128 and explicit A16");
             }
         }
         const bool valid_scale_rule = scale_rule == "f32_mean_abs" ||
-            (full_w1a1_version == 2 && scale_rule == "f32_nonnegative_least_squares");
-        if ((full_w1a1_version != 1 && full_w1a1_version != 2) || w1a1_groups.empty() || declared_groups.size() != w1a1_groups.size() ||
+            ((full_w1a1_version == 2 || full_w1a1_version == 3) && scale_rule == "f32_nonnegative_least_squares");
+        if ((full_w1a1_version != 1 && full_w1a1_version != 2 && full_w1a1_version != 3) || w1a1_groups.empty() || declared_groups.size() != w1a1_groups.size() ||
                 declared.size() != w1a1_tensors.size() ||
                 declared != expected || bit_order != "little" || sign_rule != "nonnegative_is_one" ||
                 !valid_scale_rule || arithmetic != "f32") {
@@ -147,7 +164,22 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
             throw std::runtime_error("EAGLE3 W1A1 declared tensor requires both packed data and scales");
         }
         if (!declared) {
+            const auto type = dense_types.find(base_name);
+            const auto * meta = ml->get_tensor_meta(base_name.c_str());
+            if (type != dense_types.end()) {
+                const ggml_type expected_type = type->second == "Q8_0" ? GGML_TYPE_Q8_0 :
+                    type->second == "Q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
+                if (!meta || meta->type != expected_type || meta->ne[0] != logical_k || meta->ne[1] != rows ||
+                        meta->ne[2] != 1 || meta->ne[3] != 1) {
+                    throw std::runtime_error("EAGLE3 mixed precision dense type or shape does not match audit metadata");
+                }
+            }
             dense = create_tensor(tn(tensor, "weight", bid), {logical_k, rows}, flags);
+            if (dense) {
+                LLAMA_LOG_INFO("%s: EAGLE3 dense loaded %s (type=%s, K=%lld, rows=%lld, bytes=%zu)\n",
+                        __func__, base_name.c_str(), ggml_type_name(dense->type),
+                        (long long) logical_k, (long long) rows, ggml_nbytes(dense));
+            }
             return;
         }
         if (ml->get_tensor_meta(base_name.c_str()) != nullptr || packed_meta->type != GGML_TYPE_I32 || scale_meta->type != GGML_TYPE_F32) {

@@ -1284,6 +1284,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    bool has_w1ax = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1469,6 +1470,12 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    struct {
+        uint64_t calls = 0, launches = 0, captures = 0, recaptures = 0;
+        uint64_t direct_disabled = 0, direct_incompatible = 0, direct_warmup = 0;
+        uint64_t warmup_resets = 0, update_reinstantiations = 0, evictions = 0;
+        uint64_t w1ax_launches = 0, w1ax_captures = 0;
+    } graph_stats;
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
@@ -1479,6 +1486,7 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
+                    ++graph_stats.evictions;
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;

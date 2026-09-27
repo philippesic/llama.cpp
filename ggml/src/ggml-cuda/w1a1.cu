@@ -330,8 +330,6 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                 (long long) k, (long long) m, (long long) n);
     }
 
-    ggml_cuda_pool_alloc<uint32_t> packed(ctx.pool(), (size_t) n*words);
-    ggml_cuda_pool_alloc<float> act_scales(ctx.pool(), n);
     const cudaStream_t stream = ctx.stream();
     const unsigned token_blocks = (unsigned) (n < 65535 ? n : 65535);
     GGML_ASSERT(n <= 65535);
@@ -350,6 +348,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    ggml_cuda_pool_alloc<float> act_scales(ctx.pool(), n);
     if (bits == 4 || bits == 8) {
         static const bool check_integer_dots = getenv("GGML_W1AX_ASSERT_INT_DOT") &&
             strcmp(getenv("GGML_W1AX_ASSERT_INT_DOT"), "0") != 0;
@@ -373,6 +372,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         return;
     }
     GGML_ASSERT(bits == 1);
+    ggml_cuda_pool_alloc<uint32_t> packed(ctx.pool(), (size_t) n*words);
     w1a1_pack_activations<<<dim3(token_blocks), 256, 0, stream>>>(
             (const float *) acts->data, k, words, n, packed.ptr, act_scales.ptr);
     CUDA_CHECK(cudaGetLastError());

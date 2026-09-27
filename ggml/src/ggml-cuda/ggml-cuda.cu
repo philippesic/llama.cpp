@@ -700,6 +700,23 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+#ifdef USE_CUDA_GRAPH
+    if (getenv("GGML_CUDA_GRAPH_STATS")) {
+        const auto & s = graph_stats;
+        GGML_LOG_INFO("CUDA_GRAPH_STATS {\"schema\":1,\"device\":%d,\"context\":\"%p\","
+            "\"calls\":%llu,\"launches\":%llu,\"captures\":%llu,\"recaptures\":%llu,"
+            "\"direct_disabled\":%llu,\"direct_incompatible\":%llu,\"direct_warmup\":%llu,"
+            "\"warmup_resets\":%llu,\"update_reinstantiations\":%llu,\"evictions\":%llu,"
+            "\"w1ax_launches\":%llu,\"w1ax_captures\":%llu}\n",
+            device, (void *) this, (unsigned long long) s.calls, (unsigned long long) s.launches,
+            (unsigned long long) s.captures, (unsigned long long) s.recaptures,
+            (unsigned long long) s.direct_disabled, (unsigned long long) s.direct_incompatible,
+            (unsigned long long) s.direct_warmup, (unsigned long long) s.warmup_resets,
+            (unsigned long long) s.update_reinstantiations, (unsigned long long) s.evictions,
+            (unsigned long long) s.w1ax_launches, (unsigned long long) s.w1ax_captures);
+    }
+#endif
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2611,6 +2628,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     graph->uid = cgraph->uid;
+    graph->has_w1ax = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        graph->has_w1ax |= cgraph->nodes[i]->op == GGML_OP_W1A1_MUL_MAT;
+    }
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -2656,6 +2677,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
 #endif
 
+        ++cuda_ctx->graph_stats.update_reinstantiations;
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
@@ -4433,6 +4455,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    ++cuda_ctx->graph_stats.calls;
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4457,12 +4480,27 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    ++cuda_ctx->graph_stats.warmup_resets;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+            if (!use_cuda_graph) ++cuda_ctx->graph_stats.direct_warmup;
+        } else {
+            ++cuda_ctx->graph_stats.direct_incompatible;
+        }
+    } else {
+        ++cuda_ctx->graph_stats.direct_disabled;
+    }
+    if (use_cuda_graph) {
+        ++cuda_ctx->graph_stats.launches;
+        if (graph->has_w1ax) ++cuda_ctx->graph_stats.w1ax_launches;
+        if (cuda_graph_update_required) {
+            ++cuda_ctx->graph_stats.captures;
+            if (graph->graph) ++cuda_ctx->graph_stats.recaptures;
+            if (graph->has_w1ax) ++cuda_ctx->graph_stats.w1ax_captures;
         }
     }
 #endif // USE_CUDA_GRAPH
