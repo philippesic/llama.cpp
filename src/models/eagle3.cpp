@@ -381,6 +381,10 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     // store in t_h_nextn (same as MTP) so can be read via llama_get_embeddings_nextn(ctx_dft)
     ggml_set_output(cur);
     res->t_h_nextn = cur;
+    // The embedding flag is shared by encoder and decoder graphs. Generic graph
+    // finalization requires t_embd even for this feature-fusion-only encoder.
+    // Alias its existing output; head capture only reads embeddings after decode.
+    if (cparams.embeddings) res->t_embd = cur;
 
     ggml_build_forward_expand(gf, cur);
 }
