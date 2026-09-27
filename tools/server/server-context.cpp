@@ -335,6 +335,7 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
+    size_t n_sent_tokens = 0; // raw IDs already included in requested chat SSE chunks
 
     std::vector<completion_token_output> generated_token_probs;
 
@@ -441,6 +442,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        n_sent_tokens  = 0;
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -2464,6 +2466,15 @@ private:
         } else {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
+            if (slot.task->params.return_tokens && !is_progress &&
+                    slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CHAT) {
+                // A text chunk may complete several UTF-8 tokens. Return every
+                // generated ID since the previous chunk, including hidden IDs.
+                res->tokens.assign(slot.generated_tokens.begin() + slot.n_sent_tokens,
+                                   slot.generated_tokens.end());
+                slot.n_sent_tokens = slot.generated_tokens.size();
+                res->return_tokens = true;
+            }
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -2502,10 +2513,14 @@ private:
             slot.debug_generated_text = slot.generated_text;
         }
 
-        // in stream mode, content and tokens are already in last partial chunk
+        // Stream text is already in partial chunks. Requested chat raw IDs
+        // also have a final cumulative copy, including a possible UTF-8 tail.
         if (slot.task->params.stream) {
             res->content     = "";
-            res->tokens      = llama_tokens{};
+            if (slot.task->params.return_tokens &&
+                    slot.task->params.res_type == TASK_RESPONSE_TYPE_OAI_CHAT) {
+                res->tokens = std::move(slot.generated_tokens);
+            }
         } else {
             res->content     = std::move(slot.generated_text);
             res->tokens      = std::move(slot.generated_tokens);

@@ -395,6 +395,7 @@ struct server_task_result_cmpl_final : server_task_result {
 struct server_task_result_cmpl_partial : server_task_result {
     std::string  content;
     llama_tokens tokens;
+    bool return_tokens = false;
 
     int32_t n_decoded;
     int32_t n_prompt_tokens;

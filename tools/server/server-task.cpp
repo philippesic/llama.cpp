@@ -517,6 +517,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         deltas.back()["timings"] = stats.to_json();
     }
 
+    if (generation_params.return_tokens && !deltas.empty()) {
+        // Explicitly cumulative; partial chunks use the incremental `tokens` field.
+        deltas.back()["generated_token_ids"] = tokens;
+    }
+
     // extra fields for debugging purposes
     if (verbose && !deltas.empty()) {
         deltas.front()["__verbose"] = to_json_non_oaicompat();
@@ -1140,6 +1145,13 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 
     for (const auto & diff : oaicompat_msg_diffs) {
         add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
+    }
+
+    if (return_tokens && !tokens.empty()) {
+        if (deltas.empty()) {
+            add_delta(json::object()); // raw token can have no visible text delta
+        }
+        deltas.back()["tokens"] = tokens;
     }
 
     if (!deltas.empty()) {
