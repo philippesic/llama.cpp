@@ -14,6 +14,12 @@ static int eagle3_w1ax_activation_bits() {
     throw std::runtime_error("GGML_W1AX_ACT_BITS must be 1, 4, 8, or 16");
 }
 
+static bool eagle3_dense_diagnostics() {
+    const char * a16 = std::getenv("GGML_EAGLE_DENSE_A16");
+    const char * capture = std::getenv("GGML_W1AX_CAPTURE_DIR");
+    return (a16 && std::string(a16) == "1") || (capture && *capture);
+}
+
 static void eagle3_log_w1ax_activation_bits(int bits) {
     static std::atomic<uint32_t> logged{0};
     const uint32_t mask = uint32_t(1) << bits;
@@ -85,6 +91,7 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     uint32_t full_w1a1_version = 0;
     const bool has_full_w1a1 = ml->get_key("eagle3.w1a1.version", full_w1a1_version, false);
     std::vector<std::string> w1a1_groups, w1a1_tensors;
+    uint32_t scale_group_size = 0;
     if (has_full_w1a1) {
         std::string bit_order, sign_rule, scale_rule, arithmetic;
         ml->get_arr("eagle3.w1a1.groups", w1a1_groups);
@@ -109,10 +116,18 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         }
         const std::set<std::string> declared(w1a1_tensors.begin(), w1a1_tensors.end());
         const std::set<std::string> declared_groups(w1a1_groups.begin(), w1a1_groups.end());
-        if (full_w1a1_version != 1 || w1a1_groups.empty() || declared_groups.size() != w1a1_groups.size() ||
+        if (full_w1a1_version == 2) {
+            ml->get_key("eagle3.w1a1.scale_group_size", scale_group_size);
+            if ((scale_group_size != 0 && scale_group_size != 128) || eagle3_w1ax_activation_bits() != 16) {
+                throw std::runtime_error("EAGLE3 scale-reference v2 requires row/group128 and explicit A16");
+            }
+        }
+        const bool valid_scale_rule = scale_rule == "f32_mean_abs" ||
+            (full_w1a1_version == 2 && scale_rule == "f32_nonnegative_least_squares");
+        if ((full_w1a1_version != 1 && full_w1a1_version != 2) || w1a1_groups.empty() || declared_groups.size() != w1a1_groups.size() ||
                 declared.size() != w1a1_tensors.size() ||
                 declared != expected || bit_order != "little" || sign_rule != "nonnegative_is_one" ||
-                scale_rule != "f32_mean_abs" || arithmetic != "f32") {
+                !valid_scale_rule || arithmetic != "f32") {
             throw std::runtime_error("EAGLE3 W1A1 full-drafter metadata has an unsupported or incomplete audit record");
         }
         std::string coverage;
@@ -148,11 +163,14 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         ml->get_key((audit + ".scale").c_str(), audited_scale);
         if (audited_k != logical_k || audited_packed != packed_name || audited_scale != scale_name ||
                 packed_meta->ne[0] != (logical_k + 31) / 32 || packed_meta->ne[1] != rows ||
-                scale_meta->ne[0] != rows) {
+                scale_meta->ne[0] != (scale_group_size ? (logical_k + 127)/128 : rows) ||
+                scale_meta->ne[1] != (scale_group_size ? rows : 1) || scale_meta->ne[2] != 1 || scale_meta->ne[3] != 1) {
             throw std::runtime_error("EAGLE3 W1A1 tensor shape or audit metadata mismatch");
         }
         packed = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_packed", bid, -1), {(logical_k + 31) / 32, rows}, 0);
-        scales = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_scale", bid, -1), {rows}, 0);
+        scales = scale_group_size ?
+            create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_scale", bid, -1), {(logical_k + 127)/128, rows}, 0) :
+            create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_scale", bid, -1), {rows}, 0);
         dense = nullptr;
         LLAMA_LOG_INFO("%s: EAGLE3 W1A1 loaded %s (K=%lld, rows=%lld)\n", __func__, base_name.c_str(),
                 (long long) logical_k, (long long) rows);
@@ -297,7 +315,18 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     const int activation_bits = eagle3_w1ax_activation_bits();
     if (model.fc_w1a1_packed) eagle3_log_w1ax_activation_bits(activation_bits);
     auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
-        if (!packed) return build_lora_mm(dense, input);
+        if (!packed) {
+            const char * a16 = std::getenv("GGML_EAGLE_DENSE_A16");
+            const bool cast_a16 = a16 && std::string(a16) == "1";
+            const char * capture = std::getenv("GGML_W1AX_CAPTURE_DIR");
+            if (cast_a16 || (capture && *capture)) {
+                if (cast_a16) input = ggml_cast(ctx0, input, GGML_TYPE_F16);
+                input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+                input = ggml_cont(ctx0, input);
+                ggml_format_name(input, cast_a16 ? "eagle_capture_a16_%s" : "eagle_capture_f32_%s", dense->name);
+            }
+            return build_lora_mm(dense, input);
+        }
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
         return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
@@ -339,7 +368,18 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * cur;
     ggml_tensor * inpL;
     auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
-        if (!packed) return build_lora_mm(dense, input);
+        if (!packed) {
+            const char * a16 = std::getenv("GGML_EAGLE_DENSE_A16");
+            const bool cast_a16 = a16 && std::string(a16) == "1";
+            const char * capture = std::getenv("GGML_W1AX_CAPTURE_DIR");
+            if (cast_a16 || (capture && *capture)) {
+                if (cast_a16) input = ggml_cast(ctx0, input, GGML_TYPE_F16);
+                input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+                input = ggml_cont(ctx0, input);
+                ggml_format_name(input, cast_a16 ? "eagle_capture_a16_%s" : "eagle_capture_f32_%s", dense->name);
+            }
+            return build_lora_mm(dense, input);
+        }
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
         return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
@@ -443,10 +483,10 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur_rope", il);
 
         cur = build_attn(inp_attn,
-                model.layers[il].wo_w1a1_packed ? nullptr : model.layers[il].wo, NULL, nullptr,
+                (model.layers[il].wo_w1a1_packed || eagle3_dense_diagnostics()) ? nullptr : model.layers[il].wo, NULL, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-        if (model.layers[il].wo_w1a1_packed) {
-            cur = eagle_linear(nullptr, model.layers[il].wo_w1a1_packed,
+        if (model.layers[il].wo_w1a1_packed || eagle3_dense_diagnostics()) {
+            cur = eagle_linear(model.layers[il].wo, model.layers[il].wo_w1a1_packed,
                     model.layers[il].wo_w1a1_scale, cur, n_embd_head * n_head);
         }
 
@@ -461,7 +501,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "post_attn_norm", il);
 
         const auto & layer = model.layers[il];
-        if (layer.ffn_up_w1a1_packed || layer.ffn_gate_w1a1_packed || layer.ffn_down_w1a1_packed) {
+        if (layer.ffn_up_w1a1_packed || layer.ffn_gate_w1a1_packed || layer.ffn_down_w1a1_packed || eagle3_dense_diagnostics()) {
             ggml_tensor * up = eagle_linear(layer.ffn_up, layer.ffn_up_w1a1_packed,
                     layer.ffn_up_w1a1_scale, cur, n_embd);
             ggml_tensor * gate = eagle_linear(layer.ffn_gate, layer.ffn_gate_w1a1_packed,
@@ -517,7 +557,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
             GGML_ASSERT(model_other->output != nullptr && "EAGLE3 decoder requires an output projection (own or from target model)");
             output = model_other->output;
         }
-        cur = build_lora_mm(output, cur);
+        cur = eagle_linear(output, nullptr, nullptr, cur, hparams.n_embd);
     }
 
     if (model.d2t) {

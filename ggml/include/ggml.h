@@ -1498,6 +1498,8 @@ extern "C" {
 
     // Same packed one-bit weights, with activations at 1, 4, 8 or 16 bits.
     // A16 casts each input to FP16; A8/A4 use signed per-token absmax codes.
+    // A16 also accepts group-128 F32 scales [ceil(K/128), M]. It sums signed
+    // FP16 inputs in F32 per group, then separately multiplies and sums in F32.
     GGML_API struct ggml_tensor * ggml_w1ax_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * packed_weights,

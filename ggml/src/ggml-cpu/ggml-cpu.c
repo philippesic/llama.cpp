@@ -1492,7 +1492,10 @@ static void ggml_compute_forward_w1a1_mul_mat(
     const int64_t n = acts->ne[1];
     GGML_ASSERT(k > 0 && weights->type == GGML_TYPE_I32 && scales->type == GGML_TYPE_F32);
     GGML_ASSERT(acts->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(weights->ne[0] == words && scales->ne[0] == m && acts->ne[0] == k);
+    const bool grouped = scales->ne[0] != m || scales->ne[1] != 1;
+    const int64_t groups = (k + 127)/128;
+    GGML_ASSERT(weights->ne[0] == words && scales->ne[0] == (grouped ? groups : m) && acts->ne[0] == k);
+    GGML_ASSERT(!grouped || activation_bits == 16);
     GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
 
@@ -1537,6 +1540,22 @@ static void ggml_compute_forward_w1a1_mul_mat(
             }
             for (int64_t row = row_begin; row < row_end; ++row) {
                 const uint32_t * packed = weight_data + row * words;
+                if (grouped) {
+                    float total = 0.0f;
+                    for (int64_t group = 0; group < groups; ++group) {
+                        float dot = 0.0f;
+                        const int64_t end = MIN(k, (group + 1)*128);
+                        for (int64_t i = group*128; i < end; ++i) {
+                            dot += (packed[i/32] & (UINT32_C(1) << (i%32))) ? half_values[i] : -half_values[i];
+                        }
+                        GGML_ASSERT(isfinite(scale_data[row*groups + group]));
+                        // Volatile forces a separately rounded product, matching CUDA __fmul_rn.
+                        volatile float weighted = dot * scale_data[row*groups + group];
+                        total += weighted;
+                    }
+                    output[token*m + row] = total;
+                    continue;
+                }
                 float sum_fp = 0.0f;
                 int32_t sum_int = 0;
                 for (int64_t i = 0; i < k; ++i) {

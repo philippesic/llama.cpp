@@ -16,6 +16,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -29,6 +31,25 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+// Bounded diagnostic for the existing EAGLE deferred boundary transition.
+// Hash float bytes rather than decimal summaries so identical endpoints compare exactly.
+static uint64_t eagle_state_hash(const float * values, size_t count) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const auto * bytes = reinterpret_cast<const unsigned char *>(values);
+    for (size_t i = 0; i < count*sizeof(float); ++i) {
+        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static FILE * eagle_state_trace_open() {
+    const char * path = std::getenv("EAGLE_STATE_TRACE_JSONL");
+    if (!path || !*path) return nullptr;
+    FILE * file = fopen(path, "a");
+    GGML_ASSERT(file != nullptr);
+    return file;
+}
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -773,7 +794,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            FILE * state_trace = eagle_state_trace_open();
+            const llama_pos kv_max_before = state_trace ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) : -1;
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
+            if (FILE * trace = state_trace) {
+                const llama_pos kv_max_after = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+                GGML_ASSERT(kv_max_after < pending_pos_last[seq_id]);
+                fprintf(trace, "{\"schema\":\"eagle_state_v1\",\"event\":\"seed\",\"seq_id\":%d,"
+                        "\"position\":%d,\"token\":%d,\"kv_max_before\":%d,\"kv_max_after\":%d,"
+                        "\"pending_hash\":\"%016" PRIx64 "\"}\n",
+                        seq_id, pending_pos_last[seq_id], dp.id_last, kv_max_before, kv_max_after,
+                        eagle_state_hash(pending_g_last[seq_id].data(), n_embd_dec));
+                GGML_ASSERT(fclose(trace) == 0);
+            }
 
             common_batch_add(batch, dp.id_last, pending_pos_last[seq_id], { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
@@ -899,6 +932,17 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         std::memcpy(pending_g_last[seq_id].data(),
                     verify_g[seq_id].data() + (size_t) i_g * n_embd_dec,
                     (size_t) n_embd_dec * sizeof(float));
+        if (FILE * trace = eagle_state_trace_open()) {
+            GGML_ASSERT(n_accepted < n_rows);
+            const float * selected = verify_g[seq_id].data() + (size_t) i_g * n_embd_dec;
+            GGML_ASSERT(memcmp(selected, pending_g_last[seq_id].data(), (size_t) n_embd_dec*sizeof(float)) == 0);
+            fprintf(trace, "{\"schema\":\"eagle_state_v1\",\"event\":\"accept\",\"seq_id\":%d,"
+                    "\"accepted\":%u,\"verify_rows\":%d,\"selected_row\":%d,\"verify_pos_first\":%d,"
+                    "\"position\":%d,\"selected_hash\":\"%016" PRIx64 "\",\"pending_hash\":\"%016" PRIx64 "\"}\n",
+                    seq_id, (unsigned) n_accepted, n_rows, i_g, verify_pos_first[seq_id], pending_pos_last[seq_id],
+                    eagle_state_hash(selected, n_embd_dec), eagle_state_hash(pending_g_last[seq_id].data(), n_embd_dec));
+            GGML_ASSERT(fclose(trace) == 0);
+        }
     }
 
     // we only need to stash the deferred boundary's g_embd row for recurrent/hybrid targets:

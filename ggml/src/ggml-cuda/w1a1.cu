@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -200,6 +201,27 @@ static __global__ void w1a16_signadd(
     output[token*m + row] = sum * weight_scales[row];
 }
 
+// Quality reference: separate F32 group products and sums, never FMA.
+static __global__ void w1a16_group128_signadd(
+        const uint32_t * weights, const float * scales, const float * acts,
+        int64_t m, int64_t k, int64_t words, float * output) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t token = blockIdx.y;
+    if (row >= m) return;
+    const int64_t groups = (k + 127)/128;
+    float total = 0.0f;
+    for (int64_t group = 0; group < groups; ++group) {
+        float dot = 0.0f;
+        const int64_t end = k < (group + 1)*128 ? k : (group + 1)*128;
+        for (int64_t i = group*128; i < end; ++i) {
+            const float x = __half2float(__float2half_rn(acts[token*k + i]));
+            dot = __fadd_rn(dot, (weights[row*words + i/32] & (1u << (i%32))) ? x : -x);
+        }
+        total = __fadd_rn(total, __fmul_rn(dot, scales[row*groups + group]));
+    }
+    output[token*m + row] = total;
+}
+
 // Diagnostic capture for identical-input replay. Enable only for a short run:
 // GGML_W1AX_CAPTURE_DIR must name an existing directory. Files contain an
 // eight-byte magic, five little-endian integer fields, a fixed 128-byte
@@ -223,6 +245,7 @@ static void w1ax_capture_activations(
     std::vector<float> host((size_t) k*n);
     CUDA_CHECK(cudaMemcpyAsync(host.data(), acts->data, host.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (float value : host) GGML_ASSERT(std::isfinite(value));
     static std::atomic<unsigned long long> sequence{0};
     const unsigned long long id = sequence.fetch_add(1);
     char path[1024];
@@ -285,7 +308,9 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(k > 0 && m > 0 && n > 0);
     GGML_ASSERT(weights->type == GGML_TYPE_I32 && scales->type == GGML_TYPE_F32);
     GGML_ASSERT(acts->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(weights->ne[0] == words && scales->ne[0] == m && acts->ne[0] == k);
+    const bool grouped = scales->ne[0] != m || scales->ne[1] != 1;
+    GGML_ASSERT(weights->ne[0] == words && scales->ne[0] == (grouped ? (k + 127)/128 : m) && acts->ne[0] == k);
+    GGML_ASSERT(!grouped || bits == 16);
     GGML_ASSERT(bits == 1 || bits == 4 || bits == 8 || bits == 16);
     GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
@@ -311,6 +336,13 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const unsigned token_blocks = (unsigned) (n < 65535 ? n : 65535);
     GGML_ASSERT(n <= 65535);
     w1ax_capture_activations(stream, weights, acts, k, m, n, bits);
+    if (bits == 16 && grouped) {
+        w1a16_group128_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
+                (const uint32_t *) weights->data, (const float *) scales->data,
+                (const float *) acts->data, m, k, words, (float *) dst->data);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (bits == 16) {
         w1a16_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
@@ -348,4 +380,14 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const uint32_t *) weights->data, (const float *) scales->data,
             packed.ptr, act_scales.ptr, m, n, k, words, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Only EAGLE graph builders assign this marker; target linears remain untouched.
+void ggml_cuda_eagle_capture_dense(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weights, const ggml_tensor * acts) {
+    if (strncmp(acts->name, "eagle_capture_", 14) != 0) return;
+    GGML_ASSERT(acts->type == GGML_TYPE_F32 && ggml_is_contiguous(acts));
+    GGML_ASSERT(acts->ne[2] == 1 && acts->ne[3] == 1);
+    w1ax_capture_activations(ctx.stream(), weights, acts, acts->ne[0], weights->ne[1], acts->ne[1],
+            strncmp(acts->name, "eagle_capture_a16_", 18) == 0 ? 16 : 32);
 }

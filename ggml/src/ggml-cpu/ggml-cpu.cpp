@@ -450,9 +450,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             }
             int64_t k;
             memcpy(&k, op->op_params, sizeof(k));
-            return k > 0 && src0->ne[0] == (k - 1)/32 + 1 &&
+            const bool grouped = scales->ne[0] != src0->ne[1] || scales->ne[1] != 1;
+            return k > 0 && (!grouped || ggml_get_op_params_i32(op, 2) == 16) && src0->ne[0] == (k - 1)/32 + 1 &&
                 src0->ne[1] > 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
-                scales->ne[0] == src0->ne[1] && scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1 &&
+                scales->ne[0] == (grouped ? (k + 127)/128 : src0->ne[1]) &&
+                scales->ne[1] == (grouped ? src0->ne[1] : 1) && scales->ne[2] == 1 && scales->ne[3] == 1 &&
                 acts->ne[0] == k && acts->ne[1] > 0 && acts->ne[2] == 1 && acts->ne[3] == 1 &&
                 op->ne[0] == src0->ne[1] && op->ne[1] == acts->ne[1];
         }

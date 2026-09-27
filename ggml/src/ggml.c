@@ -3380,8 +3380,11 @@ struct ggml_tensor * ggml_w1ax_mul_mat(
     GGML_ASSERT(activations->type == GGML_TYPE_F32);
     GGML_ASSERT(packed_weights->ne[0] == (logical_k - 1)/32 + 1);
     GGML_ASSERT(packed_weights->ne[1] > 0 && packed_weights->ne[2] == 1 && packed_weights->ne[3] == 1);
-    GGML_ASSERT(weight_scales->ne[0] == packed_weights->ne[1]);
-    GGML_ASSERT(weight_scales->ne[1] == 1 && weight_scales->ne[2] == 1 && weight_scales->ne[3] == 1);
+    const bool grouped = weight_scales->ne[0] != packed_weights->ne[1] || weight_scales->ne[1] != 1;
+    GGML_ASSERT(weight_scales->ne[0] == (grouped ? (logical_k + 127)/128 : packed_weights->ne[1]));
+    GGML_ASSERT(weight_scales->ne[1] == (grouped ? packed_weights->ne[1] : 1));
+    GGML_ASSERT(weight_scales->ne[2] == 1 && weight_scales->ne[3] == 1);
+    GGML_ASSERT(!grouped || activation_bits == 16);
     GGML_ASSERT(activations->ne[0] == logical_k && activations->ne[1] > 0);
     GGML_ASSERT(activations->ne[2] == 1 && activations->ne[3] == 1);
 

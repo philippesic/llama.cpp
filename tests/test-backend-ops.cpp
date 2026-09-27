@@ -5050,12 +5050,13 @@ struct test_w1a1_mul_mat : public test_case {
     const int bits;
     static constexpr int64_t m = 7;
     const int64_t n_tokens;
+    const bool grouped;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3)
-        : k(k), strided(strided), bits(bits), n_tokens(n_tokens) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false)
+        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped) {}
 
-    std::string vars() override { return VARS_TO_STR4(k, strided, bits, n_tokens); }
+    std::string vars() override { return VARS_TO_STR5(k, strided, bits, n_tokens, grouped); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5078,7 +5079,8 @@ struct test_w1a1_mul_mat : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (k - 1)/32 + 1, m);
-        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * s = grouped ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (k + 127)/128, m) :
+            ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (strided ? 1 : 0), n_tokens);
         if (strided) {
             ggml_set_name(a, "w1a1_activations_base");
@@ -5098,6 +5100,13 @@ struct test_w1a1_mul_mat : public test_case {
         std::vector<uint32_t> packed(words * m);
         std::vector<float> acts(k * n_tokens);
         const float scales[m] = { 0.5f, 1.25f, -0.75f, 0.0f, 0.3f, 1.0f, -0.125f };
+        const int64_t groups = (k + 127)/128;
+        std::vector<float> group_scales(m*groups);
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t group = 0; group < groups; ++group) {
+                group_scales[row*groups + group] = row == 3 ? 0.0f : std::abs(scales[row]) + float(group)*0.0712345f;
+            }
+        }
 
         for (int64_t row = 0; row < m; ++row) {
             for (int64_t i = 0; i < k; ++i) {
@@ -5107,7 +5116,11 @@ struct test_w1a1_mul_mat : public test_case {
             if (k % 32) packed[row * words + words - 1] |= ~((UINT32_C(1) << (k % 32)) - 1);
         }
         for (int64_t token = 0; token < n_tokens; ++token) {
-            for (int64_t i = 0; i < k; ++i) acts[token * k + i] = activation_value(token, i);
+            for (int64_t i = 0; i < k; ++i) {
+                const float x = activation_value(token, i);
+                // Non-FP16-exact values exercise source rounding as well as signs.
+                acts[token*k + i] = grouped ? x * 1.0002345f + (token == 1 ? 0.0f : float(i%13)*0.00012345f) : x;
+            }
         }
 
         expected.resize(m * n_tokens);
@@ -5120,6 +5133,20 @@ struct test_w1a1_mul_mat : public test_case {
             const int qmax = bits == 8 ? 127 : 7;
             const float quant_scale = absmax / float(qmax);
             for (int64_t row = 0; row < m; ++row) {
+                if (grouped) {
+                    float total = 0.0f;
+                    for (int64_t group = 0; group < groups; ++group) {
+                        float dot = 0.0f;
+                        for (int64_t i = group*128; i < std::min(k, (group + 1)*128); ++i) {
+                            const float x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(acts[token*k + i]));
+                            dot += weight_value(row, i) >= 0.0f ? x : -x;
+                        }
+                        volatile float weighted = dot * group_scales[row*groups + group];
+                        total += weighted;
+                    }
+                    expected[token*m + row] = total;
+                    continue;
+                }
                 int64_t matches = 0;
                 int32_t int_dot = 0;
                 float half_dot = 0.0f;
@@ -5142,7 +5169,8 @@ struct test_w1a1_mul_mat : public test_case {
         }
 
         ggml_backend_tensor_set(w, packed.data(), 0, packed.size() * sizeof(uint32_t));
-        ggml_backend_tensor_set(s, scales, 0, sizeof(scales));
+        if (grouped) ggml_backend_tensor_set(s, group_scales.data(), 0, group_scales.size()*sizeof(float));
+        else ggml_backend_tensor_set(s, scales, 0, sizeof(scales));
         if (strided) {
             ggml_tensor * base = ggml_get_tensor(ctx, "w1a1_activations_base");
             std::vector<float> padded((k + 1) * n_tokens, 1234.0f);
@@ -10029,6 +10057,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    for (int64_t k : {1, 127, 128, 129, 257, 2560}) {
+        for (int64_t n : {1, 3}) {
+            test_cases.emplace_back(new test_w1a1_mul_mat(k, false, 16, n, true));
+            test_cases.emplace_back(new test_w1a1_mul_mat(k, true, 16, n, true));
+        }
+    }
 
     // 2560 is the audited EAGLE drafter head K width.
     for (int bits : {1, 4, 8, 16}) {
