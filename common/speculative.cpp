@@ -550,6 +550,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // (used both for the encoder output g_embd and the decoder pre-norm output).
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
+        const char * capture = std::getenv("EAGLE_CAPTURE_PREFIX");
+        if (capture && *capture) llama_set_embeddings(ctx_dft, true);
+
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
 
@@ -840,6 +843,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                auto & dp = dparams.at(seq_id);
+                if (dp.capture_head) {
+                    const float * state = llama_get_embeddings_ith(ctx_dft, i_batch);
+                    const float * logits = llama_get_logits_ith(ctx_dft, i_batch);
+                    GGML_ASSERT(state && logits);
+                    const int32_t nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    common_speculative_head_row row;
+                    row.position = pending_pos_last[seq_id] + i;
+                    row.input_token = i == 0 ? dp.id_last : dp.result->back();
+                    row.normalized_state.assign(state, state + n_embd_dec);
+                    row.logits.assign(logits, logits + nv);
+                    dp.head_rows.push_back(std::move(row));
+                }
                 const int64_t t_sample = process_trace_enabled ? ggml_time_us() : 0;
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 if (process_trace_enabled) {
@@ -858,11 +874,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id = dp.forced_tokens.empty() ? cur_p->data[0].id : dp.forced_tokens.at(i);
 
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                if (dp.forced_tokens.empty() && cur_p->data[0].p < params.p_min) {
                     auto & dp = dparams.at(seq_id);
                     dp.stopped_low_confidence = true;
                     dp.stop_probability = cur_p->data[0].p;
@@ -874,12 +890,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() ||
+                    (!dp.forced_tokens.empty() && dp.forced_tokens.size() <= result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

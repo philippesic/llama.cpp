@@ -569,6 +569,9 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
+    // Exact normalized head input, before representation-specific operand conversion.
+    // Extracted only when embeddings are enabled by the diagnostic capture mode.
+    if (cparams.embeddings) res->t_embd = cur;
 
     // lm_head - projects to draft vocabulary
     // if the draft has no own output projection, inherit the target model's lm_head

@@ -301,6 +301,17 @@ struct server_slot {
     int64_t spec_trace_begin_end_us = 0;
     server_round_trace spec_trace_round;
     int64_t verify_trace_round_index = 0;
+    int64_t head_capture_round_index = 0;
+    const bool digest_enabled = std::getenv("EAGLE_REQUEST_DIGEST") != nullptr;
+    uint64_t proposal_digest = UINT64_C(14695981039346656037);
+    uint64_t output_digest = UINT64_C(14695981039346656037);
+    uint64_t digest_rounds = 0, digest_output_tokens = 0, digest_no_proposal = 0;
+    static void digest_integer(uint64_t & hash, uint32_t value) {
+        for (int b = 0; b < 4; ++b) {
+            hash = (hash ^ ((value >> (8*b)) & 255)) * UINT64_C(1099511628211);
+        }
+    }
+
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -419,6 +430,9 @@ struct server_slot {
         spec_trace_begin_end_us = 0;
         spec_trace_round = {};
         verify_trace_round_index = 0;
+        head_capture_round_index = 0;
+        proposal_digest = output_digest = UINT64_C(14695981039346656037);
+        digest_rounds = digest_output_tokens = digest_no_proposal = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -679,6 +693,11 @@ struct server_slot {
     }
 
     void print_timings() const {
+        if (digest_enabled) {
+            SLT_INF(*this, "eagle_request_digest task_id=%d proposal=%016" PRIx64 " output=%016" PRIx64
+                    " rounds=%" PRIu64 " no_proposal=%" PRIu64 " output_tokens=%" PRIu64 "\n",
+                    task->id, proposal_digest, output_digest, digest_rounds, digest_no_proposal, digest_output_tokens);
+        }
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
 
@@ -947,6 +966,106 @@ private:
     std::ofstream round_trace_file; // enabled by W1AX_ROUND_TRACE_JSONL
     std::ofstream verify_trace_file; // enabled by W1AX_VERIFY_TRACE_JSONL
     std::set<int64_t> verify_trace_positions;
+
+    std::ofstream head_capture_json, head_capture_states, head_capture_logits, record_rounds;
+    uint64_t head_capture_logits_rows = 0, head_capture_logits_limit = 32;
+    uint64_t head_capture_state_row = 0;
+    std::map<std::string, json> forced_rounds;
+    bool force_rounds_enabled = false;
+
+    static std::string eagle_prefix_key(const llama_tokens & prefix, llama_token seed) {
+        // The complete prefix is the key: no hash collisions and no request-ID assumptions.
+        return json({{"prefix_token_ids", prefix}, {"seed_token_id", seed}}).dump();
+    }
+
+    std::vector<json> capture_head_rows(const server_slot & slot) {
+        std::vector<json> result;
+        if (!head_capture_json.is_open()) return result;
+        const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+        GGML_ASSERT(!slot.spec_is_replay && "head capture requires full sequence rollback support");
+        GGML_ASSERT(dp.head_rows.size() >= slot.spec_draft.size());
+        GGML_ASSERT(slot.spec_i_batch.size() == slot.spec_draft.size() + 1);
+        llama_tokens prefix = slot.spec_prompt;
+        prefix.push_back(dp.id_last);
+        GGML_ASSERT(slot.task->params.sampling.temp <= 0.0f && "head labels require deterministic greedy verification");
+        common_sampler_ptr label_sampler(common_sampler_clone(slot.smpl.get()));
+        const int32_t nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
+        for (size_t d = 0; d < slot.spec_draft.size(); ++d) {
+            const auto & row = dp.head_rows[d];
+            GGML_ASSERT(row.position + 1 == dp.pos0 + (llama_pos) d);
+            GGML_ASSERT(row.input_token == prefix.back());
+            GGML_ASSERT(prefix.size() == (size_t) row.position + 2 && "head capture does not support shifted prefixes");
+            const float * logits = llama_get_logits_ith(slot.ctx_tgt, slot.spec_i_batch[d]);
+            GGML_ASSERT(logits && row.logits.size() == (size_t) nv);
+            llama_token label = LLAMA_TOKEN_NULL, predicted = LLAMA_TOKEN_NULL;
+            bool finite = true;
+            for (llama_token t = 0; t < nv; ++t) {
+                finite = finite && !std::isnan(logits[t]) && logits[t] != INFINITY;
+                finite = finite && !std::isnan(row.logits[t]) && row.logits[t] != INFINITY;
+                if (std::isfinite(logits[t]) && (label < 0 || logits[t] > logits[label])) label = t;
+                if (std::isfinite(row.logits[t]) && (predicted < 0 || row.logits[t] > row.logits[predicted])) predicted = t;
+            }
+            const llama_token raw_argmax = label;
+            // Mirror actual verifier processing (including model suppression), but advance
+            // the cloned sampler along THIS row's real proposal prefix, even after rejection.
+            // common_sampler_sample copies logits into sampler-owned candidate storage.
+            label = common_sampler_sample(label_sampler.get(), slot.ctx_tgt, slot.spec_i_batch[d]);
+            common_sampler_accept(label_sampler.get(), slot.spec_draft[d], true);
+            GGML_ASSERT(label >= 0 && label < nv);
+            finite = finite && raw_argmax >= 0 && predicted >= 0;
+            const bool supported = label >= 0 && std::isfinite(row.logits[label]);
+            int64_t rank = 1;
+            float best_other = -INFINITY;
+            if (supported) for (llama_token t = 0; t < nv; ++t) {
+                rank += row.logits[t] > row.logits[label];
+                if (t != label) best_other = std::max(best_other, row.logits[t]);
+            }
+            for (float v : row.normalized_state) finite = finite && std::isfinite(v);
+            json record = {
+                {"schema", "eagle_head_state_v1"},
+                {"task_id", slot.task->id}, {"parent_task_id", slot.task->id_parent}, {"slot_id", slot.id},
+                {"round_index", slot.head_capture_round_index - 1}, {"depth", d}, {"verifier_row", d},
+                {"parent_position", dp.pos0 - 1}, {"input_position", row.position + 1},
+                {"label_position", row.position + 2}, {"input_token_id", row.input_token},
+                {"prefix_token_ids", prefix}, {"proposed_token_id", slot.spec_draft[d]},
+                {"verifier_token_id", label}, {"raw_verifier_argmax_id", raw_argmax},
+                {"label_source", "cloned_native_verifier_sampler_at_actual_proposal_prefix"},
+                {"draft_argmax_id", predicted},
+                {"alignment_valid", true}, {"finite", finite}, {"label_supported", supported},
+                {"valid", finite && label >= 0}, {"trainable", finite && label >= 0 && supported}, {"is_bonus", false},
+                {"forced", !dp.forced_tokens.empty()},
+                {"state_row", head_capture_state_row++}, {"state_dim", row.normalized_state.size()},
+                {"state_boundary", "native_output_norm_f32_before_head_operand_conversion"},
+                {"state_dtype", "float32_native_endian"}, {"target_rank", supported ? json(rank) : json(nullptr)},
+                {"target_margin", supported ? json(row.logits[label] - best_other) : json(nullptr)},
+                {"rank_convention", "one_plus_count_of_strictly_greater_draft_logits"},
+                {"draft_argmax_logit", predicted >= 0 ? json(row.logits[predicted]) : json(nullptr)},
+                {"verifier_label_logit", supported ? json(row.logits[label]) : json(nullptr)},
+                {"verifier_sampled_token_id", nullptr}, {"verifier_reached", false}
+            };
+            // Small stable probe gives offline FP16 export parity checks beyond top-1.
+            json probe = json::array();
+            for (llama_token t = 0; t < nv && probe.size() < 8; ++t) {
+                if (std::isfinite(row.logits[t])) probe.push_back({{"token_id", t}, {"logit", row.logits[t]}});
+            }
+            record["draft_logit_probe"] = std::move(probe);
+            record["full_logits_row"] = nullptr;
+            if (head_capture_logits.is_open() && head_capture_logits_rows < head_capture_logits_limit) {
+                record["full_logits_row"] = head_capture_logits_rows++;
+                record["full_logits_dim"] = nv;
+                record["full_logits_boundary"] = "native_mapped_target_vocabulary_before_sampler";
+                head_capture_logits.write(reinterpret_cast<const char *>(row.logits.data()), nv * sizeof(float));
+                GGML_ASSERT(head_capture_logits.good());
+            }
+            head_capture_states.write(reinterpret_cast<const char *>(row.normalized_state.data()),
+                    row.normalized_state.size() * sizeof(float));
+            GGML_ASSERT(head_capture_states.good());
+            result.push_back(std::move(record));
+            prefix.push_back(slot.spec_draft[d]);
+        }
+        return result;
+    }
+
 
     // Read the untouched model output, before any sampler can transform it.
     // This scan runs only at explicitly selected zero-based generated positions.
@@ -1465,6 +1584,55 @@ private:
                 } else {
                     SRV_WRN("cannot open EAGLE round trace at %s\n", trace_path);
                 }
+            }
+        }
+
+        if (const char * path = std::getenv("EAGLE_CAPTURE_PREFIX")) {
+            if (*path) {
+                GGML_ASSERT(spec && ctx_dft);
+                head_capture_json.open(std::string(path) + ".jsonl", std::ios::out | std::ios::trunc);
+                head_capture_states.open(std::string(path) + ".f32", std::ios::out | std::ios::binary | std::ios::trunc);
+                GGML_ASSERT(head_capture_json.is_open() && head_capture_states.is_open());
+                if (std::getenv("EAGLE_CAPTURE_FULL_LOGITS")) {
+                    if (const char * limit = std::getenv("EAGLE_CAPTURE_FULL_LOGITS_LIMIT")) {
+                        head_capture_logits_limit = std::stoull(limit);
+                        GGML_ASSERT(head_capture_logits_limit > 0);
+                    }
+                    head_capture_logits.open(std::string(path) + ".logits.f32", std::ios::out | std::ios::binary | std::ios::trunc);
+                    GGML_ASSERT(head_capture_logits.is_open());
+                }
+                // Capture reads logits before sampling. Backend sampling may alter them in graph.
+                GGML_ASSERT(!params_base.speculative.draft.backend_sampling);
+                GGML_ASSERT(!params_base.speculative.has_synth());
+                GGML_ASSERT(llama_pooling_type(ctx_dft) == LLAMA_POOLING_TYPE_NONE);
+            }
+        }
+        if (const char * path = std::getenv("EAGLE_RECORD_ROUNDS_JSONL")) {
+            if (*path) {
+                record_rounds.open(path, std::ios::out | std::ios::trunc);
+                GGML_ASSERT(record_rounds.is_open());
+            }
+        }
+        if (const char * path = std::getenv("EAGLE_FORCE_ROUNDS_JSONL")) {
+            if (*path) {
+                std::ifstream input(path);
+                GGML_ASSERT(input.is_open());
+                std::string line;
+                while (std::getline(input, line)) {
+                    const json row = json::parse(line);
+                    GGML_ASSERT(row.at("schema") == "eagle_forced_round_v1");
+                    const auto key = eagle_prefix_key(row.at("prefix_token_ids").get<llama_tokens>(), row.at("seed_token_id").get<llama_token>());
+                    const auto found = forced_rounds.find(key);
+                    if (found != forced_rounds.end()) {
+                        GGML_ASSERT(found->second.at("draft_token_ids") == row.at("draft_token_ids"));
+                        GGML_ASSERT(found->second.at("pos0") == row.at("pos0"));
+                        GGML_ASSERT(found->second.at("accepted_drafts") == row.at("accepted_drafts"));
+                        GGML_ASSERT(found->second.at("verifier_token_ids") == row.at("verifier_token_ids"));
+                    }
+                    forced_rounds[key] = row;
+                }
+                GGML_ASSERT(!forced_rounds.empty());
+                force_rounds_enabled = true;
             }
         }
 
@@ -2016,7 +2184,9 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
+            const bool need_pre_sample_logits =
+                (task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs) ||
+                verify_trace_file.is_open() || head_capture_json.is_open();
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
@@ -2060,6 +2230,10 @@ private:
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
+        if (slot.digest_enabled) {
+            server_slot::digest_integer(slot.output_digest, result.tok);
+            ++slot.digest_output_tokens;
+        }
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -3278,7 +3452,26 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .stopped_low_confidence = */ false,
+                            /* .stop_probability = */ -1.0f,
+                            /* .discarded_below_min = */ false,
+                            /* .capture_head = */ false,
+                            /* .forced_tokens = */ {},
+                            /* .head_rows = */ {},
                         };
+
+                        auto & diagnostic = common_speculative_get_draft_params(spec.get(), slot.id);
+                        diagnostic.capture_head = head_capture_json.is_open();
+                        if (force_rounds_enabled) {
+                            const auto key = eagle_prefix_key(slot.spec_prompt, slot.sampled);
+                            const auto found = forced_rounds.find(key);
+                            GGML_ASSERT(found != forced_rounds.end() && "forced round has no exact prefix match");
+                            GGML_ASSERT(found->second.at("pos0").get<llama_pos>() == diagnostic.pos0);
+                            diagnostic.forced_tokens = found->second.at("draft_token_ids").get<llama_tokens>();
+                            GGML_ASSERT(!diagnostic.forced_tokens.empty());
+                            GGML_ASSERT((int) diagnostic.forced_tokens.size() <= n_draft_max);
+                        }
+                        ++slot.head_capture_round_index;
 
                         drafting.push_back(&slot);
                     }
@@ -4186,6 +4379,12 @@ private:
 
             slot.i_batch = -1;
 
+            if (slot.digest_enabled) {
+                server_slot::digest_integer(slot.proposal_digest, 0); // no-proposal event
+                server_slot::digest_integer(slot.proposal_digest, slot.prompt.tokens.size());
+                server_slot::digest_integer(slot.proposal_digest, id);
+                ++slot.digest_no_proposal;
+            }
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -4250,6 +4449,9 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            auto head_rows = capture_head_rows(slot);
+
+
             std::vector<server_verify_trace> verify_traces;
             if (verify_trace_file.is_open()) {
                 const int64_t round = slot.verify_trace_round_index++;
@@ -4291,6 +4493,52 @@ private:
                             tr.row == n_draft ? "bonus" :
                             selected == slot.spec_draft[tr.row] ? "accepted" : "rejected";
                     }
+                }
+                if (record_rounds.is_open() || force_rounds_enabled) {
+                    const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                    const json canonical = {{"schema", "eagle_forced_round_v1"},
+                        {"task_id", slot.task->id}, {"round_index", slot.head_capture_round_index - 1},
+                        {"prefix_token_ids", slot.spec_prompt}, {"seed_token_id", dp.id_last},
+                        {"pos0", dp.pos0}, {"draft_token_ids", slot.spec_draft},
+                        {"accepted_drafts", accepted.size() - 1}, {"verifier_token_ids", accepted}};
+                    if (record_rounds.is_open()) {
+                        record_rounds << canonical.dump() << '\n';
+                        record_rounds.flush();
+                    }
+                    if (force_rounds_enabled) {
+                        const auto & expected = forced_rounds.at(eagle_prefix_key(slot.spec_prompt, dp.id_last));
+                        GGML_ASSERT(expected.at("draft_token_ids") == canonical.at("draft_token_ids"));
+                        GGML_ASSERT(expected.at("accepted_drafts") == canonical.at("accepted_drafts"));
+                        GGML_ASSERT(expected.at("verifier_token_ids") == canonical.at("verifier_token_ids"));
+                    }
+                }
+                if (slot.digest_enabled) {
+                    if (slot.digest_rounds == 0) {
+                        for (auto token : slot.spec_prompt) server_slot::digest_integer(slot.proposal_digest, token);
+                    }
+                    server_slot::digest_integer(slot.proposal_digest, 1); // verified-proposal event
+                    server_slot::digest_integer(slot.proposal_digest, slot.digest_rounds);
+                    server_slot::digest_integer(slot.proposal_digest, slot.spec_prompt.size());
+                    server_slot::digest_integer(slot.proposal_digest, slot.sampled);
+                    server_slot::digest_integer(slot.proposal_digest, slot.spec_draft.size());
+                    for (auto token : slot.spec_draft) server_slot::digest_integer(slot.proposal_digest, token);
+                    server_slot::digest_integer(slot.proposal_digest, accepted.size() - 1);
+                    ++slot.digest_rounds;
+                }
+                for (size_t d = 0; d < head_rows.size(); ++d) {
+                    if (d < accepted.size()) {
+                        head_rows[d]["verifier_reached"] = true;
+                        head_rows[d]["verifier_sampled_token_id"] = accepted[d];
+                        head_rows[d]["raw_argmax_matches_sampler"] = head_rows[d]["raw_verifier_argmax_id"] == accepted[d];
+                        GGML_ASSERT(head_rows[d]["verifier_token_id"] == accepted[d] && "cloned verifier alignment mismatch");
+                    }
+                    head_capture_json << head_rows[d].dump() << '\n';
+                }
+                if (!head_rows.empty()) {
+                    head_capture_json.flush();
+                    head_capture_states.flush();
+                    if (head_capture_logits.is_open()) head_capture_logits.flush();
+                    GGML_ASSERT(head_capture_json.good() && head_capture_states.good());
                 }
                 slot.spec_i_batch.clear();
 

@@ -50,6 +50,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// Opt-in diagnostic rows, captured before any draft sampler mutates logits.
+struct common_speculative_head_row {
+    llama_pos position = -1; // decoder memory position; label is position + 2
+    llama_token input_token = LLAMA_TOKEN_NULL;
+    std::vector<float> normalized_state;
+    std::vector<float> logits; // mapped target vocabulary, -inf outside draft vocabulary
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -74,6 +82,11 @@ struct common_speculative_draft_params {
     bool  stopped_low_confidence = false;
     float stop_probability = -1.0f;
     bool  discarded_below_min = false;
+
+    // Diagnostics only. Forced tokens are consumed INSIDE body recurrence.
+    bool capture_head = false;
+    llama_tokens forced_tokens;
+    std::vector<common_speculative_head_row> head_rows;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
