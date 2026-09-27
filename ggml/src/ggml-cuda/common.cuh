@@ -1465,17 +1465,19 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-#ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-
     struct {
         uint64_t calls = 0, launches = 0, captures = 0, recaptures = 0;
         uint64_t direct_disabled = 0, direct_incompatible = 0, direct_warmup = 0;
         uint64_t warmup_resets = 0, update_reinstantiations = 0, evictions = 0;
         uint64_t w1ax_launches = 0, w1ax_captures = 0;
     } graph_stats;
+    const bool graph_stats_enabled = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
+
+#ifdef USE_CUDA_GRAPH
+    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {

@@ -700,10 +700,10 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
-#ifdef USE_CUDA_GRAPH
-    if (getenv("GGML_CUDA_GRAPH_STATS")) {
+    if (graph_stats_enabled) {
         const auto & s = graph_stats;
-        GGML_LOG_INFO("CUDA_GRAPH_STATS {\"schema\":1,\"device\":%d,\"context\":\"%p\","
+        // Bypass log filtering and asynchronous logger teardown.
+        fprintf(stderr, "CUDA_GRAPH_STATS {\"schema\":1,\"device\":%d,\"context\":\"%p\","
             "\"calls\":%llu,\"launches\":%llu,\"captures\":%llu,\"recaptures\":%llu,"
             "\"direct_disabled\":%llu,\"direct_incompatible\":%llu,\"direct_warmup\":%llu,"
             "\"warmup_resets\":%llu,\"update_reinstantiations\":%llu,\"evictions\":%llu,"
@@ -714,8 +714,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             (unsigned long long) s.direct_warmup, (unsigned long long) s.warmup_resets,
             (unsigned long long) s.update_reinstantiations, (unsigned long long) s.evictions,
             (unsigned long long) s.w1ax_launches, (unsigned long long) s.w1ax_captures);
+        fflush(stderr);
     }
-#endif
 
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -4454,8 +4454,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
-#ifdef USE_CUDA_GRAPH
     ++cuda_ctx->graph_stats.calls;
+#ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4503,6 +4503,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (graph->has_w1ax) ++cuda_ctx->graph_stats.w1ax_captures;
         }
     }
+#else
+    ++cuda_ctx->graph_stats.direct_disabled;
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -4516,6 +4518,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#ifdef USE_CUDA_GRAPH
+    if (cuda_ctx->graph_stats_enabled && use_cuda_graph &&
+            (cuda_ctx->graph_stats.launches == 1 || (graph->has_w1ax && cuda_ctx->graph_stats.w1ax_launches == 1))) {
+        fprintf(stderr, "CUDA_GRAPH_FIRST_LAUNCH {\"schema\":1,\"device\":%d,\"context\":\"%p\",\"w1ax\":%s}\n",
+                cuda_ctx->device, (void *) cuda_ctx, graph->has_w1ax ? "true" : "false");
+        fflush(stderr);
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5889,6 +5899,18 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
+    }
+
+    if (ctx->graph_stats_enabled) {
+#ifdef USE_CUDA_GRAPH
+        const char * compiled = "true";
+#else
+        const char * compiled = "false";
+#endif
+        fprintf(stderr, "CUDA_GRAPH_STATUS {\"schema\":1,\"device\":%d,\"context\":\"%p\","
+                "\"compiled\":%s,\"disabled_by_env\":%s}\n", device, (void *) ctx, compiled,
+                getenv("GGML_CUDA_DISABLE_GRAPHS") ? "true" : "false");
+        fflush(stderr);
     }
 
     ggml_backend_t cuda_backend = new ggml_backend {
