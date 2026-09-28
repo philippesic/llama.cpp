@@ -969,8 +969,9 @@ private:
     std::ofstream verify_trace_file; // enabled by W1AX_VERIFY_TRACE_JSONL
     std::set<int64_t> verify_trace_positions;
 
-    std::ofstream head_capture_json, head_capture_states, head_capture_logits, record_rounds;
+    std::ofstream head_capture_json, head_capture_states, head_capture_logits, target_capture_logits, record_rounds;
     uint64_t head_capture_logits_rows = 0, head_capture_logits_limit = 32;
+    uint64_t target_capture_logits_rows = 0, target_capture_logits_limit = 32;
     uint64_t head_capture_state_row = 0;
     std::map<std::string, json> forced_rounds;
     bool force_rounds_enabled = false;
@@ -999,6 +1000,15 @@ private:
             GGML_ASSERT(prefix.size() == (size_t) row.position + 2 && "head capture does not support shifted prefixes");
             const float * logits = llama_get_logits_ith(slot.ctx_tgt, slot.spec_i_batch[d]);
             GGML_ASSERT(logits && row.logits.size() == (size_t) nv);
+            // Copy the untouched target/verifier output before the cloned sampler
+            // processes this exact proposal prefix. The draft-head logits below
+            // are a separate output with a separate file and row index.
+            json target_logits_row = nullptr;
+            if (target_capture_logits.is_open() && target_capture_logits_rows < target_capture_logits_limit) {
+                target_logits_row = target_capture_logits_rows++;
+                target_capture_logits.write(reinterpret_cast<const char *>(logits), nv * sizeof(float));
+                GGML_ASSERT(target_capture_logits.good());
+            }
             llama_token label = LLAMA_TOKEN_NULL, predicted = LLAMA_TOKEN_NULL;
             bool finite = true;
             for (llama_token t = 0; t < nv; ++t) {
@@ -1039,6 +1049,8 @@ private:
                 {"state_row", head_capture_state_row++}, {"state_dim", row.normalized_state.size()},
                 {"state_boundary", "native_output_norm_f32_before_head_operand_conversion"},
                 {"state_dtype", "float32_native_endian"}, {"target_rank", supported ? json(rank) : json(nullptr)},
+                {"target_logits_row", target_logits_row}, {"target_logits_dim", nv},
+                {"target_logits_source", "raw_target_verifier_at_exact_proposal_prefix"},
                 {"target_margin", supported ? json(row.logits[label] - best_other) : json(nullptr)},
                 {"rank_convention", "one_plus_count_of_strictly_greater_draft_logits"},
                 {"draft_argmax_logit", predicted >= 0 ? json(row.logits[predicted]) : json(nullptr)},
@@ -1056,6 +1068,7 @@ private:
                 record["full_logits_row"] = head_capture_logits_rows++;
                 record["full_logits_dim"] = nv;
                 record["full_logits_boundary"] = "native_mapped_target_vocabulary_before_sampler";
+                record["full_logits_source"] = "draft_head_mapped_target_vocabulary_before_sampler";
                 head_capture_logits.write(reinterpret_cast<const char *>(row.logits.data()), nv * sizeof(float));
                 GGML_ASSERT(head_capture_logits.good());
             }
@@ -1602,6 +1615,14 @@ private:
                     }
                     head_capture_logits.open(std::string(path) + ".logits.f32", std::ios::out | std::ios::binary | std::ios::trunc);
                     GGML_ASSERT(head_capture_logits.is_open());
+                }
+                if (std::getenv("EAGLE_CAPTURE_TARGET_LOGITS")) {
+                    if (const char * limit = std::getenv("EAGLE_CAPTURE_TARGET_LOGITS_LIMIT")) {
+                        target_capture_logits_limit = std::stoull(limit);
+                        GGML_ASSERT(target_capture_logits_limit > 0);
+                    }
+                    target_capture_logits.open(std::string(path) + ".target_logits.f32", std::ios::out | std::ios::binary | std::ios::trunc);
+                    GGML_ASSERT(target_capture_logits.is_open());
                 }
                 // Capture reads logits before sampling. Backend sampling may alter them in graph.
                 GGML_ASSERT(!params_base.speculative.draft.backend_sampling);
@@ -4553,7 +4574,10 @@ private:
                     head_capture_json.flush();
                     head_capture_states.flush();
                     if (head_capture_logits.is_open()) head_capture_logits.flush();
+                    if (target_capture_logits.is_open()) target_capture_logits.flush();
                     GGML_ASSERT(head_capture_json.good() && head_capture_states.good());
+                    if (head_capture_logits.is_open()) GGML_ASSERT(head_capture_logits.good());
+                    if (target_capture_logits.is_open()) GGML_ASSERT(target_capture_logits.good());
                 }
                 slot.spec_i_batch.clear();
 
