@@ -1241,6 +1241,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -2750,6 +2756,51 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+std::vector<llama_kv_cache_context::captured_f16_row> llama_kv_cache_context::capture_current_f16_rows(
+        const llama_ubatch & ubatch) const {
+    if (ubatches.empty() || &ubatch != &ubatches[i_cur] || !ubatch.token || !ubatch.pos ||
+            ubatch.n_seqs_unq != 1 || sinfos[i_cur].n_stream() != 1 ||
+            kv->type_k() != GGML_TYPE_F16 || kv->type_v() != GGML_TYPE_F16 ||
+            kv->get_layer_ids() != std::vector<uint32_t>{0}) {
+        throw std::runtime_error("EAGLE cache capture requires one F16 CPU draft layer and one sequence");
+    }
+
+    const auto & sinfo = sinfos[i_cur];
+    if (sinfo.size() != (size_t) ubatch.n_tokens || sinfo.strm[0] >= kv->get_n_stream()) {
+        throw std::runtime_error("EAGLE cache capture slot count differs from ubatch");
+    }
+    const auto * k = kv->get_k_storage(0);
+    const auto * v = kv->get_v_storage(0);
+    if (!k || !v || !k->buffer || !v->buffer ||
+            !ggml_backend_buffer_is_host(k->buffer) || !ggml_backend_buffer_is_host(v->buffer) ||
+            k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+            k->ne[0] != 1024 || v->ne[0] != 1024 ||
+            k->nb[1] != 2048 || v->nb[1] != 2048 ||
+            k->nb[2] != k->nb[1]*kv->get_size() ||
+            v->nb[2] != v->nb[1]*kv->get_size()) {
+        throw std::runtime_error("EAGLE cache capture requires contiguous host F16 K/V rows");
+    }
+
+    std::vector<captured_f16_row> rows;
+    rows.reserve(ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const uint32_t slot = sinfo.strm[0]*kv->get_size() + sinfo.idxs[0][i];
+        if (sinfo.idxs[0][i] >= kv->get_size()) {
+            throw std::runtime_error("EAGLE cache capture slot exceeds KV size");
+        }
+        captured_f16_row row;
+        row.position = ubatch.pos[i];
+        row.token = ubatch.token[i];
+        row.slot = slot;
+        row.key.resize(2048);
+        row.value.resize(2048);
+        ggml_backend_tensor_get(k, row.key.data(), slot*k->nb[1], row.key.size());
+        ggml_backend_tensor_get(v, row.value.data(), slot*v->nb[1], row.value.size());
+        rows.push_back(std::move(row));
+    }
+    return rows;
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

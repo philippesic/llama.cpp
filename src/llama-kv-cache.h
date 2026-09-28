@@ -165,6 +165,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -349,6 +350,14 @@ private:
 
 class llama_kv_cache_context : public llama_memory_context_i {
 public:
+    struct captured_f16_row {
+        llama_pos position;
+        llama_token token;
+        uint32_t slot;
+        std::vector<uint8_t> key;
+        std::vector<uint8_t> value;
+    };
+
     // some shorthands
     using slot_info_vec_t  = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -393,6 +402,9 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    // Diagnostic only: read the rows just written by the current CPU ubatch.
+    std::vector<captured_f16_row> capture_current_f16_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

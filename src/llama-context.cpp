@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-kv-cache.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -15,11 +16,123 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// CPU-only diagnostic of actual post-write EAGLE draft cache rows. This is
+// separate from graph projection capture: the latter cannot prove the F16
+// bytes stored at physical cache slots after ggml_set_rows.
+struct eagle_draft_cache_capture {
+    std::string prefix;
+    const llama_context * owner;
+    std::ofstream index;
+    std::ofstream rows;
+    std::ofstream masks;
+    uint64_t executions = 0;
+    uint64_t row_count = 0;
+    uint64_t row_bytes = 0;
+    uint64_t mask_bytes = 0;
+    uint64_t max_rows = 512;
+    uint64_t max_bytes = 64ull * 1024 * 1024;
+
+    eagle_draft_cache_capture(const char * path, const llama_context * context) : prefix(path), owner(context) {
+        index.open(prefix + ".draft_cache.jsonl", std::ios::out | std::ios::trunc);
+        rows.open(prefix + ".draft_cache.f16", std::ios::out | std::ios::binary | std::ios::trunc);
+        masks.open(prefix + ".draft_cache.mask", std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!index || !rows || !masks) {
+            throw std::runtime_error("cannot open EAGLE draft cache capture files");
+        }
+    }
+
+    ~eagle_draft_cache_capture() {
+        if (index) {
+            index << "{\"schema\":\"eagle_draft_cache_v1\",\"event\":\"capture_end\",\"executions\":"
+                  << executions << ",\"rows\":" << row_count << ",\"row_bytes\":" << row_bytes
+                  << ",\"mask_bytes\":" << mask_bytes << "}\n";
+        }
+    }
+
+    void capture(const llama_ubatch & ubatch, const llama_kv_cache_context & mctx, const llm_graph_result & res) {
+        const auto written = mctx.capture_current_f16_rows(ubatch);
+        if (written.empty() || row_count + written.size() > max_rows) {
+            throw std::runtime_error("EAGLE draft cache capture row limit exceeded");
+        }
+
+        ggml_tensor * mask = nullptr;
+        for (const auto & input : res.inputs) {
+            if (auto * attn = dynamic_cast<llm_graph_input_attn_kv *>(input.get())) {
+                if (mask != nullptr) throw std::runtime_error("multiple EAGLE draft attention masks");
+                mask = attn->self_kq_mask;
+            }
+        }
+        if (!mask || !mask->buffer || !ggml_backend_buffer_is_host(mask->buffer) ||
+                (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
+                mask->ne[1] != ubatch.n_tokens || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                !ggml_is_contiguous(mask)) {
+            throw std::runtime_error("EAGLE draft cache capture requires one host causal mask");
+        }
+        const uint64_t nmask = ggml_nbytes(mask);
+        const uint64_t nrows = written.size() * 4096ull;
+        if (nmask + nrows > max_bytes - row_bytes - mask_bytes) {
+            throw std::runtime_error("EAGLE draft cache capture byte limit exceeded");
+        }
+        std::vector<uint8_t> mask_data(nmask);
+        ggml_backend_tensor_get(mask, mask_data.data(), 0, nmask);
+        masks.write((const char *) mask_data.data(), mask_data.size());
+        index << "{\"schema\":\"eagle_draft_cache_v1\",\"event\":\"execution\",\"execution\":"
+              << executions << ",\"n_tokens\":" << written.size() << ",\"n_kv\":" << mask->ne[0]
+              << ",\"mask_dtype\":\"" << ggml_type_name(mask->type) << "\",\"mask_offset\":"
+              << mask_bytes << ",\"mask_bytes\":" << nmask << "}\n";
+        mask_bytes += nmask;
+        for (size_t i = 0; i < written.size(); ++i) {
+            const auto & row = written[i];
+            if (row.key.size() != 2048 || row.value.size() != 2048) {
+                throw std::runtime_error("EAGLE draft cache row has wrong width");
+            }
+            rows.write((const char *) row.key.data(), row.key.size());
+            rows.write((const char *) row.value.data(), row.value.size());
+            index << "{\"schema\":\"eagle_draft_cache_v1\",\"event\":\"row\",\"execution\":"
+                  << executions << ",\"column\":" << i << ",\"position\":" << row.position
+                  << ",\"token_id\":" << row.token << ",\"slot\":" << row.slot
+                  << ",\"row_offset\":" << row_bytes << ",\"key_bytes\":2048,\"value_bytes\":2048}\n";
+            row_bytes += 4096;
+            row_count++;
+        }
+        executions++;
+        if (!index || !rows || !masks) throw std::runtime_error("failed EAGLE draft cache capture write");
+        index.flush();
+        rows.flush();
+        masks.flush();
+    }
+};
+
+static void capture_eagle_draft_cache(const llama_context * owner, const llama_ubatch & ubatch,
+        const llama_memory_context_i * mctx, const llm_graph_result & res) {
+    const char * enabled = std::getenv("EAGLE_CAPTURE_DRAFT_CACHE");
+    if (!enabled) return;
+    if (std::strcmp(enabled, "1") != 0) {
+        throw std::runtime_error("EAGLE_CAPTURE_DRAFT_CACHE must be set to 1");
+    }
+    const char * prefix = std::getenv("EAGLE_CAPTURE_PREFIX");
+    if (!prefix || !*prefix) throw std::runtime_error("EAGLE_CAPTURE_DRAFT_CACHE requires EAGLE_CAPTURE_PREFIX");
+    const auto * kv = dynamic_cast<const llama_kv_cache_context *>(mctx);
+    if (!kv) throw std::runtime_error("EAGLE draft cache capture requires KV memory context");
+
+    static std::mutex mutex;
+    static std::unique_ptr<eagle_draft_cache_capture> state;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!state) state.reset(new eagle_draft_cache_capture(prefix, owner));
+    if (state->owner != owner || state->prefix != prefix) {
+        throw std::runtime_error("EAGLE draft cache capture cannot mix contexts or prefixes");
+    }
+    state->capture(ubatch, *kv, res);
+}
 
 //
 // llama_context
@@ -1456,6 +1569,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (model.arch == LLM_ARCH_EAGLE3 && mctx && std::getenv("EAGLE_CAPTURE_DRAFT_CACHE")) {
+        ggml_backend_sched_synchronize(sched.get());
+        capture_eagle_draft_cache(this, ubatch, mctx, *res);
     }
 
     ret = GGML_STATUS_SUCCESS;
