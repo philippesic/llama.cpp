@@ -135,8 +135,16 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         }
         if (full_w1a1_version == 2 || full_w1a1_version == 3) {
             ml->get_key("eagle3.w1a1.scale_group_size", scale_group_size);
-            if ((scale_group_size != 0 && scale_group_size != 128) || eagle3_w1ax_activation_bits() != 16) {
-                throw std::runtime_error("EAGLE3 scale-reference v2/v3 requires row/group128 and explicit A16");
+            if ((scale_group_size != 0 && scale_group_size != 128) ||
+                    (scale_group_size == 128 && eagle3_w1ax_activation_bits() != 16)) {
+                throw std::runtime_error("EAGLE3 scale-reference v2/v3 requires row scales or group128 with explicit A16");
+            }
+            uint32_t declared_activation_bits = 0;
+            if (ml->get_key("eagle3.w1a1.activation_bits", declared_activation_bits, false) &&
+                    ((declared_activation_bits != 1 && declared_activation_bits != 4 &&
+                      declared_activation_bits != 8 && declared_activation_bits != 16) ||
+                     declared_activation_bits != (uint32_t) eagle3_w1ax_activation_bits())) {
+                throw std::runtime_error("EAGLE3 W1Ax activation bits metadata does not match runtime selector");
             }
         }
         const bool valid_scale_rule = scale_rule == "f32_mean_abs" ||
@@ -382,6 +390,15 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     // store in t_h_nextn (same as MTP) so can be read via llama_get_embeddings_nextn(ctx_dft)
     ggml_set_output(cur);
     res->t_h_nextn = cur;
+
+    // Cache catch-up asks for no logits. The prenorm state and KV writes are
+    // still needed, but the output norm, draft head and d2t expansion are not.
+    // Keep this opt-in until paired native trajectories and CUDA timings are run.
+    const char * prune_head = std::getenv("GGML_EAGLE_PRUNE_UNUSED_HEAD");
+    if (n_outputs == 0 && !cparams.embeddings && prune_head && std::string(prune_head) == "1") {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
     // The embedding flag is shared by encoder and decoder graphs. Generic graph
     // finalization requires t_embd even for this feature-fusion-only encoder.
     // Alias its existing output; head capture only reads embeddings after decode.
