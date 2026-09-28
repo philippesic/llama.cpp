@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API for raw target layer-input taps
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -23,6 +24,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -970,11 +972,114 @@ private:
     std::set<int64_t> verify_trace_positions;
 
     std::ofstream head_capture_json, head_capture_states, head_capture_logits, target_capture_logits, record_rounds;
+    std::ofstream target_feature_json, target_feature_data;
+    uint64_t target_feature_rows = 0, target_feature_limit = 4096, target_decode_ordinal = 0;
+    std::map<int32_t, uint64_t> target_feature_pending; // global batch row -> binary feature row
     uint64_t head_capture_logits_rows = 0, head_capture_logits_limit = 32;
     uint64_t target_capture_logits_rows = 0, target_capture_logits_limit = 32;
     uint64_t head_capture_state_row = 0;
     std::map<std::string, json> forced_rounds;
     bool force_rounds_enabled = false;
+
+    void capture_target_feature_disposition(uint64_t feature_row, const server_slot & slot,
+            bool retained, const char * reason, json round_index = nullptr, json accepted_drafts = nullptr) {
+        target_feature_json << json{
+            {"schema", "eagle_target_feature_v1"}, {"event", "disposition"},
+            {"feature_row", feature_row}, {"task_id", slot.task->id}, {"slot_id", slot.id},
+            {"round_index", round_index}, {"retained_input", retained},
+            {"reason", reason}, {"accepted_drafts", accepted_drafts},
+        }.dump() << '\n';
+        if (!target_feature_json.good()) throw std::runtime_error("target feature disposition write failed");
+    }
+
+    // Capture the target's raw layer-input taps before speculative_process consumes them.
+    // The embedding buffers are indexed by the *local* llama_decode batch row, even
+    // when server_batch has been split into sub-batches with a nonzero global off.
+    void capture_target_features(int32_t off, const llama_batch & batch_view) {
+        if (!target_feature_json.is_open()) return;
+        if (!target_feature_pending.empty()) throw std::runtime_error("target feature disposition missing from prior decode");
+        if (!batch_view.token || batch.has_embd) throw std::runtime_error("target feature capture requires text-only token batches");
+        if (batch_view.n_tokens <= 0 || target_feature_rows > target_feature_limit ||
+                (uint64_t) batch_view.n_tokens > target_feature_limit - target_feature_rows) {
+            throw std::runtime_error("target feature capture limit exceeded; refusing a truncated ledger");
+        }
+        const auto * ids = llama_model_target_layer_ids(model_dft);
+        const uint32_t n_ids = llama_model_target_layer_ids_n(model_dft);
+        const int32_t n_layers = llama_model_n_layer(llama_get_model(ctx_tgt));
+        const int32_t hidden = llama_model_n_embd(llama_get_model(ctx_tgt));
+        if (!ids || !n_ids || hidden <= 0) throw std::runtime_error("target feature capture needs draft-declared target layers");
+        json tap_ids = json::array();
+        std::vector<const float *> taps;
+        taps.reserve(n_ids);
+        for (uint32_t k = 0; k < n_ids; ++k) {
+            if (ids[k] < 0 || ids[k] > n_layers) throw std::runtime_error("invalid draft target layer ID");
+            const float * data = ids[k] == n_layers
+                ? llama_get_embeddings_nextn(ctx_tgt)
+                : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) ids[k]);
+            if (!data) throw std::runtime_error("raw target layer input was not extracted");
+            tap_ids.push_back(ids[k]);
+            taps.push_back(data);
+        }
+        const uint64_t decode_ordinal = target_decode_ordinal++;
+        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+            const int32_t global = off + i;
+            if (batch_view.n_seq_id[i] != 1 || batch_view.seq_id[i][0] < 0 ||
+                    (size_t) batch_view.seq_id[i][0] >= slots.size()) {
+                throw std::runtime_error("target feature capture cannot identify a unique sequence");
+            }
+            const auto & slot = slots[batch_view.seq_id[i][0]];
+            if (!slot.task || batch.tokens[global].id_slot != slot.id ||
+                    slot.task->params.cache_prompt || slot.task->params.n_cache_reuse ||
+                    slot.prompt.tokens.has_mtmd || slot.truncated) {
+                throw std::runtime_error("target feature capture cannot certify an unreused text prefix");
+            }
+            const auto pos = batch_view.pos[i];
+            const auto prefix_all = slot.prompt.tokens.get_text_tokens();
+            if (pos < 0 || (size_t) pos >= prefix_all.size() ||
+                    prefix_all[pos] != batch_view.token[i] ||
+                    batch.tokens[global].pos != pos || batch.tokens[global].token != batch_view.token[i]) {
+                throw std::runtime_error("target feature input row does not match its exact token prefix");
+            }
+            const auto spec_it = std::find(slot.spec_i_batch.begin(), slot.spec_i_batch.end(), global);
+            const bool speculative = spec_it != slot.spec_i_batch.end();
+            if (slot.spec_is_replay) throw std::runtime_error("target feature capture does not support checkpoint replay");
+            const char * phase = batch.tokens[global].is_prompt ? "prefill" : speculative ? "speculative" : "target_only";
+            const uint64_t row = target_feature_rows++;
+            const llama_tokens prefix(prefix_all.begin(), prefix_all.begin() + (size_t) pos + 1);
+            target_feature_json << json{
+                {"schema", "eagle_target_feature_v1"}, {"event", "decoded_row"},
+                {"feature_row", row}, {"task_id", slot.task->id},
+                {"parent_task_id", slot.task->id_parent}, {"slot_id", slot.id},
+                {"decode_ordinal", decode_ordinal}, {"batch_row_local", i}, {"batch_row_global", global},
+                {"position", pos}, {"token_id", batch_view.token[i]}, {"prefix_token_ids", prefix},
+                {"target_layer_ids", tap_ids}, {"feature_dim", (uint64_t) n_ids * hidden},
+                {"feature_dtype", "float32_native_endian"},
+                {"boundary", "raw_target_layer_input_before_eagle_encoder"},
+                {"source", "target_verifier"}, {"phase", phase},
+                {"round_index", speculative ? json(slot.head_capture_round_index - 1) : json(nullptr)},
+                {"spec_input_row", speculative ? json(spec_it - slot.spec_i_batch.begin()) : json(nullptr)},
+            }.dump() << '\n';
+            for (const float * tap : taps) {
+                const float * src = tap + (size_t) i * hidden;
+                target_feature_data.write(reinterpret_cast<const char *>(src), (size_t) hidden * sizeof(float));
+            }
+            if (!target_feature_json.good() || !target_feature_data.good()) {
+                throw std::runtime_error("target feature row write failed");
+            }
+            if (speculative) {
+                if (!target_feature_pending.emplace(global, row).second) {
+                    throw std::runtime_error("duplicate speculative target feature row");
+                }
+            } else {
+                capture_target_feature_disposition(row, slot, true, "accepted_prefix");
+            }
+        }
+        target_feature_data.flush();
+        target_feature_json.flush();
+        if (!target_feature_data.good() || !target_feature_json.good()) {
+            throw std::runtime_error("target feature capture flush failed");
+        }
+    }
 
     static std::string eagle_prefix_key(const llama_tokens & prefix, llama_token seed) {
         // The complete prefix is the key: no hash collisions and no request-ID assumptions.
@@ -1602,6 +1707,10 @@ private:
             }
         }
 
+        if (std::getenv("EAGLE_CAPTURE_TARGET_FEATURES") &&
+                (!std::getenv("EAGLE_CAPTURE_PREFIX") || !*std::getenv("EAGLE_CAPTURE_PREFIX"))) {
+            throw std::runtime_error("EAGLE_CAPTURE_TARGET_FEATURES requires EAGLE_CAPTURE_PREFIX");
+        }
         if (const char * path = std::getenv("EAGLE_CAPTURE_PREFIX")) {
             if (*path) {
                 GGML_ASSERT(spec && ctx_dft);
@@ -1623,6 +1732,32 @@ private:
                     }
                     target_capture_logits.open(std::string(path) + ".target_logits.f32", std::ios::out | std::ios::binary | std::ios::trunc);
                     GGML_ASSERT(target_capture_logits.is_open());
+                }
+                if (std::getenv("EAGLE_CAPTURE_TARGET_FEATURES")) {
+                    // A feature ledger must never silently omit a decoded row. The
+                    // caller chooses a finite row budget; crossing it fails the run.
+                    if (const char * limit = std::getenv("EAGLE_CAPTURE_TARGET_FEATURES_LIMIT")) {
+                        if (!*limit || !std::all_of(limit, limit + std::strlen(limit), [](char c) { return c >= '0' && c <= '9'; })) {
+                            throw std::runtime_error("invalid EAGLE_CAPTURE_TARGET_FEATURES_LIMIT");
+                        }
+                        size_t end = 0;
+                        target_feature_limit = std::stoull(limit, &end);
+                        if (!target_feature_limit || limit[end] != '\0') {
+                            throw std::runtime_error("invalid EAGLE_CAPTURE_TARGET_FEATURES_LIMIT");
+                        }
+                    }
+                    if (params_base.n_parallel != 1 || params_base.ctx_shift ||
+                            params_base.n_cache_reuse || params_base.n_ctx_checkpoints || mctx) {
+                        throw std::runtime_error("target feature capture requires one text slot, no context shift, cache reuse, or checkpoints");
+                    }
+                    if (!llama_model_target_layer_ids(model_dft) || !llama_model_target_layer_ids_n(model_dft)) {
+                        throw std::runtime_error("target feature capture needs draft-declared target layer IDs");
+                    }
+                    target_feature_json.open(std::string(path) + ".target_features.jsonl", std::ios::out | std::ios::trunc);
+                    target_feature_data.open(std::string(path) + ".target_features.f32", std::ios::out | std::ios::binary | std::ios::trunc);
+                    if (!target_feature_json.is_open() || !target_feature_data.is_open()) {
+                        throw std::runtime_error("cannot open target feature capture files");
+                    }
                 }
                 // Capture reads logits before sampling. Backend sampling may alter them in graph.
                 GGML_ASSERT(!params_base.speculative.draft.backend_sampling);
@@ -4268,6 +4403,10 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
+        // These per-token buffers are overwritten by the next target decode.
+        // Capture before common_speculative_process encodes the same taps.
+        capture_target_features(off, batch_view);
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -4515,6 +4654,22 @@ private:
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                if (accepted.empty()) throw std::runtime_error("speculative verifier returned no token");
+                if (target_feature_json.is_open()) {
+                    const size_t n_accepted = accepted.size() - 1;
+                    for (size_t j = 0; j < slot.spec_i_batch.size(); ++j) {
+                        const auto found = target_feature_pending.find(slot.spec_i_batch[j]);
+                        if (found == target_feature_pending.end()) {
+                            throw std::runtime_error("missing decoded speculative feature input row");
+                        }
+                        capture_target_feature_disposition(found->second, slot, j <= n_accepted,
+                                j <= n_accepted ? "accepted_prefix" : "rejected_suffix",
+                                slot.head_capture_round_index - 1, n_accepted);
+                        target_feature_pending.erase(found);
+                    }
+                    target_feature_json.flush();
+                    if (!target_feature_json.good()) throw std::runtime_error("target feature disposition flush failed");
+                }
                 if (slot.spec_trace_round.active) slot.spec_trace_round.check_end_us = ggml_time_us();
                 for (auto & tr : verify_traces) {
                     if (tr.row < accepted.size()) {
@@ -4714,6 +4869,9 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+        if (!target_feature_pending.empty()) {
+            throw std::runtime_error("target feature capture has undisposed speculative rows");
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
