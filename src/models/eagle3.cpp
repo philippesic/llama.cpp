@@ -140,7 +140,8 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
             }
         }
         const bool valid_scale_rule = scale_rule == "f32_mean_abs" ||
-            ((full_w1a1_version == 2 || full_w1a1_version == 3) && scale_rule == "f32_nonnegative_least_squares");
+            ((full_w1a1_version == 2 || full_w1a1_version == 3) &&
+             (scale_rule == "f32_nonnegative_least_squares" || scale_rule == "f32_learned_nonnegative"));
         if ((full_w1a1_version != 1 && full_w1a1_version != 2 && full_w1a1_version != 3) || w1a1_groups.empty() || declared_groups.size() != w1a1_groups.size() ||
                 declared.size() != w1a1_tensors.size() ||
                 declared != expected || bit_order != "little" || sign_rule != "nonnegative_is_one" ||
