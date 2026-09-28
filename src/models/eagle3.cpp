@@ -541,10 +541,14 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (layer.ffn_up_w1a1_packed || layer.ffn_gate_w1a1_packed || layer.ffn_down_w1a1_packed || eagle3_dense_diagnostics()) {
             ggml_tensor * up = eagle_linear(layer.ffn_up, layer.ffn_up_w1a1_packed,
                     layer.ffn_up_w1a1_scale, cur, n_embd);
+            cb(up, "ffn_up", il);
             ggml_tensor * gate = eagle_linear(layer.ffn_gate, layer.ffn_gate_w1a1_packed,
                     layer.ffn_gate_w1a1_scale, cur, n_embd);
+            cb(gate, "ffn_gate", il);
             gate = ggml_silu(ctx0, gate);
+            cb(gate, "ffn_gate_silu", il);
             cur = ggml_mul(ctx0, up, gate);
+            cb(cur, "ffn_mul", il);
             cur = eagle_linear(layer.ffn_down, layer.ffn_down_w1a1_packed,
                     layer.ffn_down_w1a1_scale, cur, hparams.n_ff(il));
         } else {

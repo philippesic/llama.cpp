@@ -98,10 +98,11 @@ struct draft_graph_capture_state {
 };
 
 static bool draft_graph_tensor_name(const char * name) {
-    static const std::array<const char *, 17> names = {
+    static const std::array<const char *, 21> names = {
         "fc_out", "inp_embd", "embd_norm-0", "g_norm-0", "concat_embd-0",
         "Qcur-0", "Kcur-0", "Vcur-0", "Qcur_rope-0", "Kcur_rope-0",
-        "kqv_out-0", "ffn_inp-0", "post_attn_norm-0", "ffn_out-0",
+        "kqv_out-0", "ffn_inp-0", "post_attn_norm-0",
+        "ffn_up-0", "ffn_gate-0", "ffn_gate_silu-0", "ffn_mul-0", "ffn_out-0",
         "eagle3_prenorm-0", "result_norm", "result_output",
     };
     for (const char * expected : names) {
