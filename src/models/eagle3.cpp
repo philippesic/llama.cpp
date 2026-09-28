@@ -391,14 +391,6 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_set_output(cur);
     res->t_h_nextn = cur;
 
-    // Cache catch-up asks for no logits. The prenorm state and KV writes are
-    // still needed, but the output norm, draft head and d2t expansion are not.
-    // Keep this opt-in until paired native trajectories and CUDA timings are run.
-    const char * prune_head = std::getenv("GGML_EAGLE_PRUNE_UNUSED_HEAD");
-    if (n_outputs == 0 && !cparams.embeddings && prune_head && std::string(prune_head) == "1") {
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
     // The embedding flag is shared by encoder and decoder graphs. Generic graph
     // finalization requires t_embd even for this feature-fusion-only encoder.
     // Alias its existing output; head capture only reads embeddings after decode.
@@ -590,6 +582,15 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     // Output prenorm state (for next token's g_embeddings in autoregressive generation)
     ggml_set_output(cur);
     res->t_h_nextn = cur;
+
+    // Cache catch-up asks for no logits. The prenorm state and KV writes are
+    // still needed, but the output norm, draft head and d2t expansion are not.
+    // Keep this opt-in until paired native trajectories and CUDA timings are run.
+    const char * prune_head = std::getenv("GGML_EAGLE_PRUNE_UNUSED_HEAD");
+    if (n_outputs == 0 && !cparams.embeddings && prune_head && std::string(prune_head) == "1") {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
