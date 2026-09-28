@@ -17,6 +17,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <array>
@@ -44,6 +45,338 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+struct draft_graph_capture_entry {
+    std::string tensor_name;
+    std::string group_kind;
+    uint64_t execution_ordinal = 0;
+    uint64_t group_order = 0;
+    uint64_t group_execution = 0;
+    uint64_t offset = 0;
+    uint64_t count = 0;
+    uint64_t n_tokens = 0;
+    uint64_t token_width = 0;
+    uint32_t token_axis = 1;
+    std::array<int64_t, GGML_MAX_DIMS> ne{};
+    std::array<size_t, GGML_MAX_DIMS> nb{};
+    std::string dtype;
+    bool group_begin = false;
+    bool group_end = false;
+    std::vector<float> values;
+};
+
+struct draft_graph_capture_state {
+    std::ofstream index;
+    std::ofstream data;
+    std::ofstream node_probe;
+    uint64_t max_executions = 4096;
+    uint64_t max_bytes = 256ull * 1024 * 1024;
+    uint64_t bytes_reserved = 0;
+    uint64_t bytes_written = 0;
+    uint64_t tensor_rows_written = 0;
+    uint64_t next_execution_ordinal = 0;
+    uint64_t next_group_order = 0;
+    uint64_t decoder_execution = 0;
+    uint64_t encoder_execution = 0;
+    uint64_t decoder_n_tokens = 0;
+    bool decoder_active = false;
+    bool pending_input = false;
+    bool pending_prenorm = false;
+    bool pending_result_norm = false;
+    bool finished = false;
+    bool node_probe_truncated = false;
+    std::map<std::string, std::array<uint64_t, 2>> node_probe_counts;
+    draft_graph_capture_entry pending;
+    draft_graph_capture_entry pending_prenorm_entry;
+    draft_graph_capture_entry pending_result_norm_entry;
+
+    static bool callback(struct ggml_tensor * tensor, bool ask, void * user_data);
+    void flush_prenorm(bool terminal);
+    void flush_result_norm(bool terminal);
+    void finish() noexcept;
+    void note_node(const char * name, bool evaluated);
+};
+
+static bool draft_graph_tensor_name(const char * name) {
+    static const std::array<const char *, 17> names = {
+        "fc_out", "inp_embd", "embd_norm-0", "g_norm-0", "concat_embd-0",
+        "Qcur-0", "Kcur-0", "Vcur-0", "Qcur_rope-0", "Kcur_rope-0",
+        "kqv_out-0", "ffn_inp-0", "post_attn_norm-0", "ffn_out-0",
+        "eagle3_prenorm-0", "result_norm", "result_output",
+    };
+    for (const char * expected : names) {
+        if (std::strcmp(name, expected) == 0) return true;
+    }
+    return false;
+}
+
+static uint64_t draft_graph_env_limit(const char * name, uint64_t fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr) return fallback;
+    if (!*value || !std::all_of(value, value + std::strlen(value), [](char c) { return c >= '0' && c <= '9'; })) {
+        throw std::runtime_error(std::string("invalid ") + name);
+    }
+    size_t end = 0;
+    const uint64_t result = std::stoull(value, &end);
+    if (value[end] != '\0' || result == 0) throw std::runtime_error(std::string("invalid ") + name);
+    return result;
+}
+
+static draft_graph_capture_entry draft_graph_copy_tensor(struct ggml_tensor * tensor,
+        draft_graph_capture_state & state) {
+    if (tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer)) {
+        throw std::runtime_error("draft graph capture requires host-resident CPU tensors");
+    }
+    draft_graph_capture_entry entry;
+    entry.tensor_name = tensor->name;
+    entry.execution_ordinal = state.next_execution_ordinal++;
+    entry.dtype = ggml_type_name(tensor->type);
+    entry.count = (uint64_t) ggml_nelements(tensor);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        entry.ne[d] = tensor->ne[d];
+        entry.nb[d] = tensor->nb[d];
+    }
+    if (entry.count > (uint64_t) std::numeric_limits<int>::max()) {
+        throw std::runtime_error("EAGLE draft graph tensor exceeds CPU callback indexing range");
+    }
+    const uint64_t bytes = entry.count * sizeof(float);
+    if (bytes > state.max_bytes - state.bytes_reserved) {
+        throw std::runtime_error("EAGLE draft graph capture byte limit exceeded");
+    }
+    state.bytes_reserved += bytes;
+    entry.values.reserve(entry.count);
+    for (uint64_t i = 0; i < entry.count; ++i) {
+        entry.values.push_back(ggml_get_f32_1d(tensor, (int) i));
+    }
+    return entry;
+}
+
+static void draft_graph_write_entry(draft_graph_capture_entry & entry, draft_graph_capture_state & state) {
+    const uint64_t bytes = entry.count * sizeof(float);
+    if (bytes > state.max_bytes - state.bytes_written) {
+        throw std::runtime_error("EAGLE draft graph capture byte limit exceeded");
+    }
+    entry.offset = state.bytes_written / sizeof(float);
+    state.data.write(reinterpret_cast<const char *>(entry.values.data()), (std::streamsize) bytes);
+    if (!state.data) throw std::runtime_error("failed writing EAGLE draft graph values");
+    state.bytes_written += bytes;
+    json ne = json::array();
+    json nb = json::array();
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        ne.push_back(entry.ne[d]);
+        nb.push_back(entry.nb[d]);
+    }
+    state.index << json{
+        {"schema", "eagle_draft_graph_v1"}, {"event", "tensor"},
+        {"tensor_name", entry.tensor_name}, {"dtype", entry.dtype},
+        {"ne", ne}, {"nb", nb},
+        {"execution_ordinal", entry.execution_ordinal},
+        {"group_kind", entry.group_kind}, {"group_order", entry.group_order},
+        {"group_execution", entry.group_execution}, {"group_begin", entry.group_begin},
+        {"group_end", entry.group_end}, {"n_tokens", entry.n_tokens},
+        {"token_axis", entry.token_axis}, {"token_width", entry.token_width},
+        {"f32_offset", entry.offset}, {"f32_count", entry.count},
+        {"f32_bytes", bytes},
+    }.dump() << '\n';
+    if (!state.index) throw std::runtime_error("failed writing EAGLE draft graph index");
+    state.tensor_rows_written++;
+}
+
+void draft_graph_capture_state::flush_prenorm(bool terminal) {
+    if (!pending_prenorm) return;
+    pending_prenorm_entry.group_kind = "decoder";
+    pending_prenorm_entry.group_order = next_group_order - 1;
+    pending_prenorm_entry.group_execution = decoder_execution - 1;
+    pending_prenorm_entry.n_tokens = decoder_n_tokens;
+    pending_prenorm_entry.token_axis = 1;
+    pending_prenorm_entry.token_width = (uint64_t) pending_prenorm_entry.ne[0];
+    pending_prenorm_entry.group_end = terminal;
+    draft_graph_write_entry(pending_prenorm_entry, *this);
+    pending_prenorm = false;
+    if (terminal) decoder_active = false;
+}
+
+void draft_graph_capture_state::flush_result_norm(bool terminal) {
+    if (!pending_result_norm) return;
+    pending_result_norm_entry.group_kind = "decoder";
+    pending_result_norm_entry.group_order = next_group_order - 1;
+    pending_result_norm_entry.group_execution = decoder_execution - 1;
+    pending_result_norm_entry.n_tokens = decoder_n_tokens;
+    pending_result_norm_entry.token_axis = 1;
+    pending_result_norm_entry.token_width = (uint64_t) pending_result_norm_entry.ne[0];
+    pending_result_norm_entry.group_end = terminal;
+    draft_graph_write_entry(pending_result_norm_entry, *this);
+    pending_result_norm = false;
+    if (terminal) decoder_active = false;
+}
+
+void draft_graph_capture_state::note_node(const char * name, bool evaluated) {
+    constexpr size_t max_names = 2048;
+    auto it = node_probe_counts.find(name);
+    if (it == node_probe_counts.end()) {
+        if (node_probe_counts.size() >= max_names) {
+            node_probe_truncated = true;
+            return;
+        }
+        it = node_probe_counts.emplace(name, std::array<uint64_t, 2>{0, 0}).first;
+    }
+    it->second[evaluated ? 1 : 0]++;
+}
+
+void draft_graph_capture_state::finish() noexcept {
+    if (finished) return;
+    finished = true;
+    try {
+        flush_prenorm(true);
+        flush_result_norm(true);
+        const bool incomplete = pending_input || decoder_active;
+        index << json{
+            {"schema", "eagle_draft_graph_v1"}, {"event", "capture_end"},
+            {"status", incomplete ? "incomplete" : "complete"},
+            {"decoder_groups", decoder_execution}, {"encoder_groups", encoder_execution},
+            {"execution_count", next_execution_ordinal}, {"tensor_rows", tensor_rows_written},
+            {"bytes_written", bytes_written},
+            {"reason", incomplete ? (pending_input ? "unresolved_inp_embd" : "decoder_group_without_boundary") : ""},
+        }.dump() << '\n';
+        index.flush();
+        data.flush();
+        index.close();
+        data.close();
+        if (node_probe.is_open()) {
+            for (const auto & item : node_probe_counts) {
+                node_probe << json{
+                    {"schema", "eagle_draft_graph_node_probe_v1"}, {"event", "node_name"},
+                    {"tensor_name", item.first}, {"ask_count", item.second[0]},
+                    {"eval_count", item.second[1]},
+                }.dump() << '\n';
+            }
+            node_probe << json{
+                {"schema", "eagle_draft_graph_node_probe_v1"}, {"event", "probe_end"},
+                {"distinct_names", node_probe_counts.size()}, {"truncated", node_probe_truncated},
+            }.dump() << '\n';
+            node_probe.flush();
+            node_probe.close();
+        }
+        if (!index || !data) SRV_ERR("%s", "failed flushing EAGLE draft graph capture files\n");
+    } catch (const std::exception & e) {
+        SRV_ERR("failed finalizing EAGLE draft graph capture: %s\n", e.what());
+    } catch (...) {
+        SRV_ERR("%s", "failed finalizing EAGLE draft graph capture\n");
+    }
+}
+
+bool draft_graph_capture_state::callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
+    auto & state = *static_cast<draft_graph_capture_state *>(user_data);
+    if (ask) {
+        if (state.node_probe.is_open()) state.note_node(tensor->name, false);
+        return draft_graph_tensor_name(tensor->name);
+    }
+
+    if (state.finished) throw std::runtime_error("EAGLE draft graph callback invoked after capture finalization");
+    if (state.node_probe.is_open()) state.note_node(tensor->name, true);
+    const bool is_head_norm = std::strcmp(tensor->name, "result_norm") == 0;
+    const bool is_head_output = std::strcmp(tensor->name, "result_output") == 0;
+    state.flush_prenorm(!(is_head_norm || is_head_output));
+    state.flush_result_norm(!is_head_output);
+
+    draft_graph_capture_entry entry = draft_graph_copy_tensor(tensor, state);
+    if (entry.tensor_name == "inp_embd") {
+        if (state.pending_input || state.decoder_active) {
+            throw std::runtime_error("unexpected nested EAGLE draft graph input");
+        }
+        state.pending = std::move(entry);
+        state.pending_input = true;
+        return true;
+    }
+    if (entry.tensor_name == "fc_out") {
+        if (state.encoder_execution + state.decoder_execution >= state.max_executions) {
+            throw std::runtime_error("EAGLE draft graph capture execution limit exceeded");
+        }
+        const uint64_t group_order = state.next_group_order++;
+        const uint64_t encoder_execution = state.encoder_execution++;
+        uint64_t n_tokens = (uint64_t) entry.ne[1];
+        const bool has_encoder_input = state.pending_input;
+        if (state.pending_input) {
+            n_tokens = (uint64_t) state.pending.ne[1];
+            state.pending.group_kind = "encoder";
+            state.pending.group_order = group_order;
+            state.pending.group_execution = encoder_execution;
+            state.pending.n_tokens = (uint64_t) state.pending.ne[1];
+            state.pending.token_axis = 1;
+            state.pending.token_width = (uint64_t) state.pending.ne[0];
+            state.pending.group_begin = true;
+            draft_graph_write_entry(state.pending, state);
+            state.pending_input = false;
+        }
+        entry.group_kind = "encoder";
+        entry.group_order = group_order;
+        entry.group_execution = encoder_execution;
+        entry.n_tokens = n_tokens;
+        entry.token_axis = 1;
+        entry.token_width = (uint64_t) entry.ne[0];
+        entry.group_begin = !has_encoder_input;
+        entry.group_end = true;
+        draft_graph_write_entry(entry, state);
+        return true;
+    }
+    if (entry.tensor_name == "embd_norm-0") {
+        if (!state.pending_input || state.decoder_active) {
+            throw std::runtime_error("EAGLE decoder graph did not begin with inp_embd");
+        }
+        if (state.encoder_execution + state.decoder_execution >= state.max_executions) {
+            throw std::runtime_error("EAGLE draft graph capture execution limit exceeded");
+        }
+        const uint64_t group_order = state.next_group_order++;
+        const uint64_t decoder_execution = state.decoder_execution++;
+        state.decoder_active = true;
+        const uint64_t n_tokens = (uint64_t) state.pending.ne[1];
+        state.decoder_n_tokens = n_tokens;
+        state.pending.group_kind = "decoder";
+        state.pending.group_order = group_order;
+        state.pending.group_execution = decoder_execution;
+        state.pending.n_tokens = n_tokens;
+        state.pending.token_axis = 1;
+        state.pending.token_width = (uint64_t) state.pending.ne[0];
+        state.pending.group_begin = true;
+        draft_graph_write_entry(state.pending, state);
+        state.pending_input = false;
+        entry.group_kind = "decoder";
+        entry.group_order = group_order;
+        entry.group_execution = decoder_execution;
+        entry.n_tokens = n_tokens;
+        entry.token_axis = 1;
+        entry.token_width = (uint64_t) entry.ne[0];
+        draft_graph_write_entry(entry, state);
+        return true;
+    }
+    if (entry.tensor_name == "result_norm") {
+        if (!state.decoder_active || state.pending_result_norm) {
+            throw std::runtime_error("EAGLE result_norm appeared outside an active decoder group");
+        }
+        state.pending_result_norm_entry = std::move(entry);
+        state.pending_result_norm = true;
+        return true;
+    }
+    if (!state.decoder_active) {
+        throw std::runtime_error("EAGLE decoder tensor appeared outside an inp_embd/result_norm group");
+    }
+    entry.group_kind = "decoder";
+    entry.group_order = state.next_group_order - 1;
+    entry.group_execution = state.decoder_execution - 1;
+    entry.n_tokens = state.decoder_n_tokens;
+    entry.token_axis = (entry.tensor_name == "Qcur_rope-0" || entry.tensor_name == "Kcur_rope-0") ? 2 : 1;
+    entry.token_width = (uint64_t) entry.ne[0] *
+            (entry.token_axis == 2 ? (uint64_t) entry.ne[1] : 1);
+    if (entry.tensor_name == "eagle3_prenorm-0") {
+        state.pending_prenorm_entry = std::move(entry);
+        state.pending_prenorm = true;
+        return true;
+    }
+    entry.group_end = entry.tensor_name == "result_output";
+    draft_graph_write_entry(entry, state);
+    if (entry.tensor_name == "result_output") state.decoder_active = false;
+    return true;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -960,6 +1293,8 @@ private:
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
+    // Callback user data must outlive spec_init and the draft llama_context.
+    std::unique_ptr<draft_graph_capture_state> draft_graph_capture;
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1363,6 +1698,7 @@ private:
         round_trace_file.close();
         verify_trace_file.close();
         verify_trace_positions.clear();
+        if (draft_graph_capture) draft_graph_capture->finish();
         spec.reset();
         spec_init.reset();
 
@@ -1551,6 +1887,43 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+
+                const char * draft_graph_flag = std::getenv("EAGLE_CAPTURE_DRAFT_GRAPH");
+                if (draft_graph_flag != nullptr && *draft_graph_flag && std::strcmp(draft_graph_flag, "1") != 0) {
+                    throw std::runtime_error("EAGLE_CAPTURE_DRAFT_GRAPH must be set to 1");
+                }
+                if (draft_graph_flag != nullptr && std::strcmp(draft_graph_flag, "1") == 0) {
+                    const char * prefix = std::getenv("EAGLE_CAPTURE_PREFIX");
+                    if (prefix == nullptr || !*prefix) {
+                        throw std::runtime_error("EAGLE_CAPTURE_DRAFT_GRAPH requires EAGLE_CAPTURE_PREFIX");
+                    }
+                    draft_graph_capture.reset(new draft_graph_capture_state());
+                    draft_graph_capture->max_executions = draft_graph_env_limit(
+                            "EAGLE_CAPTURE_DRAFT_GRAPH_MAX_EXECUTIONS", draft_graph_capture->max_executions);
+                    draft_graph_capture->max_bytes = draft_graph_env_limit(
+                            "EAGLE_CAPTURE_DRAFT_GRAPH_MAX_BYTES", draft_graph_capture->max_bytes);
+                    draft_graph_capture->index.open(std::string(prefix) + ".draft_graph.jsonl",
+                            std::ios::out | std::ios::trunc);
+                    draft_graph_capture->data.open(std::string(prefix) + ".draft_graph.f32",
+                            std::ios::out | std::ios::binary | std::ios::trunc);
+                    if (!draft_graph_capture->index.is_open() || !draft_graph_capture->data.is_open()) {
+                        throw std::runtime_error("cannot open EAGLE draft graph capture files");
+                    }
+                    const char * node_probe_flag = std::getenv("EAGLE_CAPTURE_DRAFT_GRAPH_NODE_PROBE");
+                    if (node_probe_flag != nullptr && *node_probe_flag && std::strcmp(node_probe_flag, "1") != 0) {
+                        throw std::runtime_error("EAGLE_CAPTURE_DRAFT_GRAPH_NODE_PROBE must be set to 1");
+                    }
+                    if (node_probe_flag != nullptr && std::strcmp(node_probe_flag, "1") == 0) {
+                        draft_graph_capture->node_probe.open(std::string(prefix) + ".draft_graph_nodes.jsonl",
+                                std::ios::out | std::ios::trunc);
+                        if (!draft_graph_capture->node_probe.is_open()) {
+                            throw std::runtime_error("cannot open EAGLE draft graph node probe file");
+                        }
+                    }
+                    params_dft.cb_eval = draft_graph_capture_state::callback;
+                    params_dft.cb_eval_user_data = draft_graph_capture.get();
+                    SRV_INF("capturing bounded CPU EAGLE draft graph values to %s.draft_graph.*\n", prefix);
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
