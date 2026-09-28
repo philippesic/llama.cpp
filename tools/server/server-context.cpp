@@ -1310,6 +1310,11 @@ private:
     std::ofstream target_feature_json, target_feature_data;
     uint64_t target_feature_rows = 0, target_feature_limit = 4096, target_decode_ordinal = 0;
     std::map<int32_t, uint64_t> target_feature_pending; // global batch row -> binary feature row
+    std::ofstream target_ladder_json, target_ladder_data;
+    std::vector<uint32_t> target_ladder_layers;
+    uint64_t target_ladder_rows = 0, target_ladder_max_rows = 0;
+    uint64_t target_ladder_bytes = 0, target_ladder_max_bytes = 0;
+    uint64_t target_ladder_decode_ordinal = 0;
     uint64_t head_capture_logits_rows = 0, head_capture_logits_limit = 32;
     uint64_t target_capture_logits_rows = 0, target_capture_logits_limit = 32;
     uint64_t head_capture_state_row = 0;
@@ -1413,6 +1418,88 @@ private:
         target_feature_json.flush();
         if (!target_feature_data.good() || !target_feature_json.good()) {
             throw std::runtime_error("target feature capture flush failed");
+        }
+    }
+
+    // This independent diagnostic records only prefill rows. It does not change
+    // the three draft-declared taps consumed by the EAGLE encoder.
+    void capture_target_layer_ladder(int32_t off, const llama_batch & batch_view) {
+        if (!target_ladder_json.is_open()) return;
+        if (!batch_view.token || batch.has_embd || batch_view.n_tokens <= 0) {
+            throw std::runtime_error("target layer ladder requires text-only token batches");
+        }
+        const int32_t hidden = llama_model_n_embd(model_tgt);
+        if (hidden <= 0 || target_ladder_layers.empty()) {
+            throw std::runtime_error("target layer ladder has unsupported target geometry");
+        }
+        uint64_t n_prefill = 0;
+        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+            n_prefill += batch.tokens[off + i].is_prompt ? 1 : 0;
+        }
+        if (!n_prefill) {
+            ++target_ladder_decode_ordinal;
+            return;
+        }
+        const uint64_t bytes_per_row = (uint64_t) hidden * sizeof(float) * target_ladder_layers.size();
+        if (target_ladder_rows > target_ladder_max_rows ||
+                n_prefill > target_ladder_max_rows - target_ladder_rows ||
+                target_ladder_bytes > target_ladder_max_bytes ||
+                n_prefill > (target_ladder_max_bytes - target_ladder_bytes) / bytes_per_row) {
+            throw std::runtime_error("target layer ladder cap exceeded; refusing a truncated capture");
+        }
+        std::vector<const float *> layers;
+        layers.reserve(target_ladder_layers.size());
+        for (uint32_t layer : target_ladder_layers) {
+            const float * data = llama_get_embeddings_layer_inp(ctx_tgt, layer);
+            if (!data) throw std::runtime_error("target layer ladder input was not extracted");
+            layers.push_back(data);
+        }
+        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+            const int32_t global = off + i;
+            if (!batch.tokens[global].is_prompt) continue;
+            if (batch_view.n_seq_id[i] != 1 || batch_view.seq_id[i][0] < 0 ||
+                    (size_t) batch_view.seq_id[i][0] >= slots.size()) {
+                throw std::runtime_error("target layer ladder cannot identify a unique prefill sequence");
+            }
+            const auto & slot = slots[batch_view.seq_id[i][0]];
+            if (!slot.task || batch.tokens[global].id_slot != slot.id ||
+                    slot.task->params.cache_prompt || slot.task->params.n_cache_reuse ||
+                    slot.prompt.tokens.has_mtmd || slot.truncated || slot.spec_is_replay) {
+                throw std::runtime_error("target layer ladder cannot certify an unreused text prefill");
+            }
+            const auto pos = batch_view.pos[i];
+            const auto prefix = slot.prompt.tokens.get_text_tokens();
+            if (pos < 0 || (size_t) pos >= prefix.size() || prefix[pos] != batch_view.token[i] ||
+                    batch.tokens[global].pos != pos || batch.tokens[global].token != batch_view.token[i]) {
+                throw std::runtime_error("target layer ladder row does not match its prompt position");
+            }
+            target_ladder_json << json{
+                {"schema", "eagle_target_layer_ladder_v1"},
+                {"row", target_ladder_rows}, {"task_id", slot.task->id}, {"slot_id", slot.id},
+                {"decode_ordinal", target_ladder_decode_ordinal},
+                {"batch_row_local", i}, {"batch_row_global", global},
+                {"position", pos}, {"token_id", batch_view.token[i]},
+                {"layer_ids", target_ladder_layers}, {"hidden", hidden},
+                {"byte_offset", target_ladder_bytes}, {"byte_count", bytes_per_row},
+                {"dtype", "float32_native_endian"},
+                {"boundary", "raw_target_layer_input"},
+                {"source", "target_verifier"}, {"target_source", params_base.model.path},
+            }.dump() << '\n';
+            for (const float * layer : layers) {
+                target_ladder_data.write(reinterpret_cast<const char *>(layer + (size_t) i * hidden),
+                        (size_t) hidden * sizeof(float));
+            }
+            if (!target_ladder_json.good() || !target_ladder_data.good()) {
+                throw std::runtime_error("target layer ladder write failed");
+            }
+            ++target_ladder_rows;
+            target_ladder_bytes += bytes_per_row;
+        }
+        ++target_ladder_decode_ordinal;
+        target_ladder_data.flush();
+        target_ladder_json.flush();
+        if (!target_ladder_data.good() || !target_ladder_json.good()) {
+            throw std::runtime_error("target layer ladder flush failed");
         }
     }
 
@@ -1697,6 +1784,12 @@ private:
     void destroy() {
         round_trace_file.close();
         verify_trace_file.close();
+        target_ladder_json.close();
+        target_ladder_data.close();
+        target_ladder_layers.clear();
+        target_ladder_rows = target_ladder_max_rows = 0;
+        target_ladder_bytes = target_ladder_max_bytes = 0;
+        target_ladder_decode_ordinal = 0;
         verify_trace_positions.clear();
         if (draft_graph_capture) draft_graph_capture->finish();
         spec.reset();
@@ -2136,6 +2229,53 @@ private:
                 GGML_ASSERT(!params_base.speculative.draft.backend_sampling);
                 GGML_ASSERT(!params_base.speculative.has_synth());
                 GGML_ASSERT(llama_pooling_type(ctx_dft) == LLAMA_POOLING_TYPE_NONE);
+            }
+        }
+        if (const char * flag = std::getenv("EAGLE_CAPTURE_TARGET_LAYER_LADDER")) {
+            if (std::strcmp(flag, "1") != 0) {
+                throw std::runtime_error("EAGLE_CAPTURE_TARGET_LAYER_LADDER must be set to 1");
+            }
+            const char * prefix = std::getenv("EAGLE_CAPTURE_PREFIX");
+            const char * selected = std::getenv("EAGLE_CAPTURE_TARGET_LAYER_LADDER_LAYERS");
+            if (!prefix || !*prefix || !selected) {
+                throw std::runtime_error("target layer ladder requires EAGLE_CAPTURE_PREFIX and explicit LAYERS");
+            }
+            if (std::strcmp(selected, "0-18") == 0 || std::strcmp(selected, "0-18,33") == 0) {
+                for (uint32_t layer = 0; layer <= 18; ++layer) target_ladder_layers.push_back(layer);
+                if (std::strcmp(selected, "0-18,33") == 0) target_ladder_layers.push_back(33);
+            } else {
+                throw std::runtime_error("target layer ladder LAYERS must be 0-18 or 0-18,33");
+            }
+            const auto required_limit = [](const char * name, uint64_t hard_max) {
+                if (!std::getenv(name)) throw std::runtime_error(std::string("target layer ladder requires ") + name);
+                const uint64_t value = draft_graph_env_limit(name, 0);
+                if (value > hard_max) throw std::runtime_error(std::string("target layer ladder exceeds hard cap: ") + name);
+                return value;
+            };
+            const uint64_t max_layers = required_limit("EAGLE_CAPTURE_TARGET_LAYER_LADDER_MAX_LAYERS", 20);
+            target_ladder_max_rows = required_limit("EAGLE_CAPTURE_TARGET_LAYER_LADDER_MAX_ROWS", 4096);
+            target_ladder_max_bytes = required_limit("EAGLE_CAPTURE_TARGET_LAYER_LADDER_MAX_BYTES", 256ull * 1024 * 1024);
+            const int32_t n_layers = llama_model_n_layer(model_tgt);
+            const int32_t hidden = llama_model_n_embd(model_tgt);
+            if (!spec || !ctx_dft || !model_dft || params_base.n_parallel != 1 || params_base.ctx_shift ||
+                    params_base.n_cache_reuse || params_base.n_ctx_checkpoints || mctx ||
+                    llama_model_is_recurrent(model_tgt) || hidden <= 0 ||
+                    n_layers <= 0 || target_ladder_layers.size() > max_layers ||
+                    target_ladder_layers.back() >= (uint32_t) n_layers ||
+                    params_base.model.path.empty()) {
+                throw std::runtime_error("target layer ladder has unsupported geometry or server configuration");
+            }
+            const uint64_t bytes_per_row = (uint64_t) hidden * sizeof(float) * target_ladder_layers.size();
+            if (bytes_per_row > target_ladder_max_bytes) {
+                throw std::runtime_error("target layer ladder byte cap is smaller than one row");
+            }
+            for (uint32_t layer : target_ladder_layers) {
+                llama_set_embeddings_layer_inp(ctx_tgt, layer, true);
+            }
+            target_ladder_json.open(std::string(prefix) + ".target_layer_ladder.jsonl", std::ios::out | std::ios::trunc);
+            target_ladder_data.open(std::string(prefix) + ".target_layer_ladder.f32", std::ios::out | std::ios::binary | std::ios::trunc);
+            if (!target_ladder_json.is_open() || !target_ladder_data.is_open()) {
+                throw std::runtime_error("cannot open target layer ladder capture files");
             }
         }
         if (const char * path = std::getenv("EAGLE_RECORD_ROUNDS_JSONL")) {
@@ -4779,6 +4919,7 @@ private:
         // These per-token buffers are overwritten by the next target decode.
         // Capture before common_speculative_process encodes the same taps.
         capture_target_features(off, batch_view);
+        capture_target_layer_ladder(off, batch_view);
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
