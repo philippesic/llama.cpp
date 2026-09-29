@@ -76,6 +76,7 @@ struct draft_graph_capture_state {
     uint64_t bytes_written = 0;
     uint64_t tensor_rows_written = 0;
     uint64_t result_output_markers = 0;
+    uint64_t ignored_result_output_markers = 0;
     uint64_t next_execution_ordinal = 0;
     uint64_t next_group_order = 0;
     uint64_t decoder_execution = 0;
@@ -88,6 +89,10 @@ struct draft_graph_capture_state {
     bool finished = false;
     bool node_probe_truncated = false;
     std::map<std::string, std::array<uint64_t, 2>> node_probe_counts;
+    std::vector<json> decoder_boundaries;
+    uint64_t last_decoder_execution = std::numeric_limits<uint64_t>::max();
+    std::string last_decoder_tensor;
+    bool decoder_result_norm_captured = false;
     draft_graph_capture_entry pending;
     draft_graph_capture_entry pending_prenorm_entry;
     draft_graph_capture_entry pending_result_norm_entry;
@@ -241,6 +246,10 @@ static void draft_graph_write_entry(draft_graph_capture_entry & entry, draft_gra
     }.dump() << '\n';
     if (!state.index) throw std::runtime_error("failed writing EAGLE draft graph index");
     state.tensor_rows_written++;
+    if (entry.group_kind == "decoder") {
+        state.last_decoder_execution = entry.group_execution;
+        state.last_decoder_tensor = entry.tensor_name;
+    }
 }
 
 void draft_graph_capture_state::flush_prenorm(bool terminal) {
@@ -294,6 +303,8 @@ void draft_graph_capture_state::finish() noexcept {
         index << json{
             {"schema", "eagle_draft_graph_v1"}, {"event", "capture_end"},
             {"scope", scope}, {"result_output_markers", result_output_markers},
+            {"ignored_result_output_markers", ignored_result_output_markers},
+            {"decoder_boundaries", scope == "cache" ? decoder_boundaries : std::vector<json>{}},
             {"status", incomplete ? "incomplete" : "complete"},
             {"decoder_groups", decoder_execution}, {"encoder_groups", encoder_execution},
             {"execution_count", next_execution_ordinal}, {"tensor_rows", tensor_rows_written},
@@ -339,13 +350,29 @@ bool draft_graph_capture_state::callback(struct ggml_tensor * tensor, bool ask, 
     const bool is_head_norm = std::strcmp(tensor->name, "result_norm") == 0;
     const bool is_head_output = std::strcmp(tensor->name, "result_output") == 0;
     if (state.scope == "cache" && is_head_output) {
-        if (!state.decoder_active || !state.pending_result_norm) {
-            throw std::runtime_error("EAGLE result_output marker appeared without a pending result_norm");
+        if (!state.decoder_active) {
+            state.ignored_result_output_markers++;
+            return true;
         }
-        state.flush_prenorm(false);
-        state.flush_result_norm(true);
+        if (state.pending_result_norm) {
+            state.flush_prenorm(false);
+            state.flush_result_norm(true);
+        } else if (state.pending_prenorm) {
+            state.flush_prenorm(true);
+        } else {
+            throw std::runtime_error("active EAGLE decoder lacks a captured prenorm or result_norm boundary");
+        }
+        const uint64_t execution = state.decoder_execution - 1;
+        if (state.last_decoder_execution != execution || state.last_decoder_tensor.empty()) {
+            throw std::runtime_error("EAGLE result_output boundary does not match its last decoder tensor");
+        }
+        state.decoder_boundaries.push_back(json{
+            {"execution", execution}, {"last_tensor", state.last_decoder_tensor},
+            {"result_norm_captured", state.decoder_result_norm_captured},
+        });
         state.decoder_active = false;
         state.result_output_markers++;
+        state.decoder_result_norm_captured = false;
         return true;
     }
     state.flush_prenorm(!(is_head_norm || is_head_output));
@@ -401,6 +428,7 @@ bool draft_graph_capture_state::callback(struct ggml_tensor * tensor, bool ask, 
         const uint64_t group_order = state.next_group_order++;
         const uint64_t decoder_execution = state.decoder_execution++;
         state.decoder_active = true;
+        state.decoder_result_norm_captured = false;
         const uint64_t n_tokens = (uint64_t) state.pending.ne[1];
         state.decoder_n_tokens = n_tokens;
         state.pending.group_kind = "decoder";
@@ -427,6 +455,7 @@ bool draft_graph_capture_state::callback(struct ggml_tensor * tensor, bool ask, 
         }
         state.pending_result_norm_entry = std::move(entry);
         state.pending_result_norm = true;
+        state.decoder_result_norm_captured = true;
         return true;
     }
     if (!state.decoder_active) {
