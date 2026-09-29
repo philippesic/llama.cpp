@@ -51,7 +51,7 @@ static __global__ void w1a1_pack_activations(
 static __global__ void w1a1_xor_popc(
         const uint32_t * weights, const float * weight_scales,
         const uint32_t * activations, const float * activation_scales,
-        int64_t m, int64_t n, int64_t k, int64_t words, float * output) {
+        int64_t m, int64_t n, int64_t k, int64_t words, float * output, bool warp_reduce) {
     __shared__ int counts[4][32];
     const int64_t row = (int64_t) blockIdx.x*4 + threadIdx.y;
     const bool valid_row = row < m;
@@ -65,18 +65,27 @@ static __global__ void w1a1_xor_popc(
                 mismatches += __popc((weights[row*words + word] ^ activations[token*words + word]) & mask);
             }
         }
-        counts[threadIdx.y][lane] = mismatches;
-        __syncthreads();
-        for (int stride = 16; stride > 0; stride /= 2) {
-            if (lane < stride) counts[threadIdx.y][lane] += counts[threadIdx.y][lane + stride];
+        int total = mismatches;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (warp_reduce) {
+            for (int stride = 16; stride > 0; stride /= 2) total += __shfl_down_sync(0xffffffffu, total, stride, 32);
+        } else
+#endif
+        {
+            counts[threadIdx.y][lane] = mismatches;
             __syncthreads();
+            for (int stride = 16; stride > 0; stride /= 2) {
+                if (lane < stride) counts[threadIdx.y][lane] += counts[threadIdx.y][lane + stride];
+                __syncthreads();
+            }
+            total = counts[threadIdx.y][0];
         }
         if (valid_row && lane == 0) {
-            const float dot = (float) (k - 2*(int64_t) counts[threadIdx.y][0]);
+            const float dot = (float) (k - 2*(int64_t) total);
             const float weighted = dot*weight_scales[row];
             output[token*m + row] = weighted*activation_scales[token];
         }
-        __syncthreads();
+        if (!warp_reduce) __syncthreads();
     }
 }
 
@@ -132,7 +141,7 @@ static __global__ void w1ax_quantize(
 static __global__ void w1ax_integer_dot(
         const uint32_t * weights, const float * weight_scales,
         const int8_t * codes, const uint32_t * planes, const float * act_scales,
-        int64_t m, int64_t k, int64_t words, int bits, bool bitserial, float * output, int32_t * raw_dots) {
+        int64_t m, int64_t k, int64_t words, int bits, bool bitserial, float * output, int32_t * raw_dots, bool warp_reduce) {
     __shared__ int sums[4][32];
     const int64_t row = (int64_t) blockIdx.x*4 + threadIdx.y;
     const int64_t token = blockIdx.y;
@@ -155,15 +164,23 @@ static __global__ void w1ax_integer_dot(
             }
         }
     }
-    sums[threadIdx.y][lane] = sum;
-    __syncthreads();
-    for (int stride = 16; stride > 0; stride /= 2) {
-        if (lane < stride) sums[threadIdx.y][lane] += sums[threadIdx.y][lane + stride];
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (warp_reduce) {
+        for (int stride = 16; stride > 0; stride /= 2) sum += __shfl_down_sync(0xffffffffu, sum, stride, 32);
+    } else
+#endif
+    {
+        sums[threadIdx.y][lane] = sum;
         __syncthreads();
+        for (int stride = 16; stride > 0; stride /= 2) {
+            if (lane < stride) sums[threadIdx.y][lane] += sums[threadIdx.y][lane + stride];
+            __syncthreads();
+        }
+        sum = sums[threadIdx.y][0];
     }
     if (row < m && lane == 0) {
-        if (raw_dots) raw_dots[token*m + row] = sums[threadIdx.y][0];
-        const float weighted = (float) sums[threadIdx.y][0] * weight_scales[row];
+        if (raw_dots) raw_dots[token*m + row] = sum;
+        const float weighted = (float) sum * weight_scales[row];
         output[token*m + row] = weighted * act_scales[token];
     }
 }
@@ -343,6 +360,15 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(bits != 4 || !a4_kernel || !*a4_kernel ||
             strcmp(a4_kernel, "bitserial") == 0 || strcmp(a4_kernel, "conventional") == 0);
     const bool bitserial = bits == 4 && (!a4_kernel || strcmp(a4_kernel, "conventional") != 0);
+    const char * warp_value = getenv("GGML_W1AX_WARP_REDUCE");
+    bool warp_reduce = warp_value && strcmp(warp_value, "1") == 0;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    warp_reduce = false;
+#endif
+    if (warp_reduce && bits != 16) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) GGML_LOG_INFO("CUDA W1Ax opt-in warp32 integer reduction dispatch\n");
+    }
     const unsigned flag = bits == 1 ? 1u : bits == 4 ? (bitserial ? 2u : 4u) : bits == 8 ? 8u : 16u;
     if (!(logged.fetch_or(flag) & flag)) {
         const char * marker = bits == 1 ? "CUDA packed W1A1 XOR/POPCOUNT dispatch" :
@@ -393,12 +419,12 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             CUDA_CHECK(cudaGetLastError());
         }
         {
-        ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output", dst);
-        w1ax_integer_dot<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
-                (const uint32_t *) weights->data, (const float *) scales->data,
-                code_ptr, plane_ptr, scale_ptr, m, k, words, bits, bitserial, (float *) dst->data,
-                check_integer_dots ? raw_dots.ptr : nullptr);
-        CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output", dst);
+            w1ax_integer_dot<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
+                    (const uint32_t *) weights->data, (const float *) scales->data,
+                    code_ptr, plane_ptr, scale_ptr, m, k, words, bits, bitserial, (float *) dst->data,
+                    check_integer_dots ? raw_dots.ptr : nullptr, warp_reduce);
+            CUDA_CHECK(cudaGetLastError());
         }
         if (check_integer_dots) {
             w1ax_validate_integer_dots<<<dim3((unsigned) ((m*n + 127)/128)), 128, 0, stream>>>(
@@ -420,7 +446,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output", dst);
     w1a1_xor_popc<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
             (const uint32_t *) weights->data, (const float *) scales->data,
-            packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data);
+            packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data, warp_reduce);
     CUDA_CHECK(cudaGetLastError());
 }
 
