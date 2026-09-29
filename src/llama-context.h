@@ -79,6 +79,7 @@ struct llama_context {
 
     enum llama_pooling_type pooling_type() const;
 
+    int decode_eagle3_kv_only(const llama_batch & batch);
     bool set_eagle3_compact_logits(bool value);
     const float * get_eagle3_compact_logits_ith(int32_t i, const llama_token ** ids, size_t * count);
     void expand_eagle3_logits(int64_t row);

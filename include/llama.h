@@ -1048,6 +1048,11 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Cache-only EAGLE3 decode. Caller consumes no decoder outputs.
+    // Ineligible calls use normal decode: one layer, no logits/embeddings/taps,
+    // and nextn extraction disabled or masked with no output rows.
+    LLAMA_API int32_t llama_decode_eagle3_kv_only(struct llama_context * ctx, struct llama_batch batch);
+
     // Opt-in EAGLE3 mapped logits. Full-logit getters still expand on demand.
     // Enabling requires a unique valid d2t map and no backend samplers.
     LLAMA_API bool llama_set_eagle3_compact_logits(struct llama_context * ctx, bool value);

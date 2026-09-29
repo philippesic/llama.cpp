@@ -526,6 +526,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     common_params_speculative_draft params;
     llama_batch batch;
+    bool kv_only_catchup = false;
     bool compact_logits_enabled = false;
 
     std::vector<common_sampler_ptr> smpls;
@@ -611,6 +612,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
         }
 
+        const char * kv_only = std::getenv("GGML_EAGLE_KV_ONLY_CATCHUP");
+        kv_only_catchup = kv_only && std::string(kv_only) == "1";
+        if (kv_only_catchup) SPC_WRN("%s", "EAGLE3 opt-in K/V-only process catch-up enabled\n");
         const char * compact = std::getenv("GGML_EAGLE_COMPACT_LOGITS");
         if (compact && std::string(compact) == "1") {
             compact_logits_enabled = !this->params.backend_sampling && llama_set_eagle3_compact_logits(ctx_dft, true);
@@ -836,7 +840,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         if (batch.n_tokens > 0) {
             const int64_t t_decode_start = process_trace_enabled ? ggml_time_us() : 0;
-            const int32_t rc = llama_decode(ctx_dft, batch);
+            const int32_t rc = kv_only_catchup ? llama_decode_eagle3_kv_only(ctx_dft, batch) : llama_decode(ctx_dft, batch);
             if (process_trace_enabled) {
                 process_trace.draft_decode_us = ggml_time_us() - t_decode_start;
             }

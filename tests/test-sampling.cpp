@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "../src/llama-model.h"
+#include "../src/llama-ext.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -354,7 +355,7 @@ static void test_eagle_compact() {
     params.top_k = 10;
     params.samplers = {COMMON_SAMPLER_TYPE_TOP_K};
     // Bias uses absolute target IDs, including one outside the mapped vocabulary.
-    params.logit_bias = {{84, -INFINITY}, {90, 0.25f}, {111, 7.0f}};
+    params.logit_bias = {{6, -INFINITY}, {90, 0.25f}, {111, 7.0f}};
     common_sampler * compact = common_sampler_init(&model, params);
     llama_sampler * expanded = llama_sampler_clone(common_sampler_get(compact));
     std::vector<llama_token> ids;
@@ -403,7 +404,107 @@ static void test_eagle_compact() {
     llama_sampler_free(rng_before);
 }
 
-int main(void) {
+
+static void test_eagle_runtime_fixture(const char * path) {
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(path, mp);
+    GGML_ASSERT(model);
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_batch = 32;
+    cp.n_ubatch = 32;
+    cp.n_threads = cp.n_threads_batch = 1;
+    cp.offload_kqv = false;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    auto * full = llama_init_from_model(model, cp);
+    auto * compact = llama_init_from_model(model, cp);
+    auto * kv = llama_init_from_model(model, cp);
+    GGML_ASSERT(full && compact && kv);
+    llama_set_embeddings_nextn(full, true, true);
+    llama_set_embeddings_nextn(compact, true, true);
+    llama_set_embeddings_nextn(kv, true, true);
+    GGML_ASSERT(llama_set_eagle3_compact_logits(compact, true));
+    const int32_t dim = llama_model_n_embd(model);
+    llama_batch batch = llama_batch_init(3, dim, 1);
+    std::vector<llama_token> tokens = {5, 6, 7};
+    batch.token = tokens.data();
+    batch.n_tokens = 3;
+    for (int j = 0; j < 3; ++j) {
+        batch.pos[j] = j;
+        batch.n_seq_id[j] = 1;
+        batch.seq_id[j][0] = 0;
+        batch.logits[j] = false;
+        for (int k = 0; k < dim; ++k) batch.embd[j*dim + k] = 0.125f*(j + 1) + 0.01f*k;
+    }
+    GGML_ASSERT(llama_decode(full, batch) == 0);
+    GGML_ASSERT(llama_decode_eagle3_kv_only(kv, batch) == 0);
+    // Compare serialized used cache rows, including positions and sequence ancestry.
+    const size_t full_size = llama_state_seq_get_size(full, 0);
+    const size_t kv_size = llama_state_seq_get_size(kv, 0);
+    GGML_ASSERT(full_size == kv_size);
+    std::vector<uint8_t> full_cache(full_size), kv_cache(kv_size);
+    GGML_ASSERT(llama_state_seq_get_data(full, full_cache.data(), full_cache.size(), 0) == full_size);
+    GGML_ASSERT(llama_state_seq_get_data(kv, kv_cache.data(), kv_cache.size(), 0) == kv_size);
+    GGML_ASSERT(full_cache == kv_cache);
+    // Ordinary decode from equivalent cache must produce the same state and logits.
+    batch.n_tokens = 1;
+    batch.pos[0] = 3;
+    batch.logits[0] = true;
+    GGML_ASSERT(llama_decode(full, batch) == 0);
+    // Output-consuming call must fall back to the ordinary graph.
+    GGML_ASSERT(llama_decode_eagle3_kv_only(kv, batch) == 0);
+    const float * lf = llama_get_logits_ith(full, 0);
+    const float * lk = llama_get_logits_ith(kv, 0);
+    const int32_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    for (int j = 0; j < vocab; ++j) GGML_ASSERT(lf[j] == lk[j]);
+    const float * hf = llama_get_embeddings_nextn_ith(full, 0);
+    const float * hk = llama_get_embeddings_nextn_ith(kv, 0);
+    for (int j = 0; j < dim; ++j) GGML_ASSERT(hf[j] == hk[j]);
+    // Multirow compact output, explicit mapping, and on-demand full expansion.
+    batch.n_tokens = 3;
+    for (int j = 0; j < 3; ++j) { batch.pos[j] = j; batch.logits[j] = true; }
+    llama_memory_clear(llama_get_memory(full), true);
+    GGML_ASSERT(llama_decode(full, batch) == 0);
+    GGML_ASSERT(llama_decode(compact, batch) == 0);
+    for (int j = 0; j < 3; ++j) {
+        const llama_token * ids = nullptr;
+        size_t count = 0;
+        const float * lc = llama_get_eagle3_compact_logits_ith(compact, j, &ids, &count);
+        GGML_ASSERT(lc && count == 32);
+        lf = llama_get_logits_ith(full, j);
+        for (size_t k = 0; k < count; ++k) GGML_ASSERT(lc[k] == lf[ids[k]]);
+        lc = llama_get_logits_ith(compact, j);
+        for (int k = 0; k < vocab; ++k) GGML_ASSERT(lc[k] == lf[k]);
+        GGML_ASSERT(!llama_get_eagle3_compact_logits_ith(compact, j, &ids, &count));
+        GGML_ASSERT(!ids && count == 0);
+    }
+    GGML_ASSERT(llama_set_eagle3_compact_logits(compact, false));
+    GGML_ASSERT(llama_set_eagle3_compact_logits(compact, true));
+    const llama_token * ids = nullptr;
+    size_t count = 0;
+    GGML_ASSERT(!llama_get_eagle3_compact_logits_ith(compact, 0, &ids, &count));
+    GGML_ASSERT(llama_get_logits_ith(compact, 0)[0] == llama_get_logits_ith(full, 0)[0]);
+    llama_batch enc_batch = llama_batch_init(1, 3*dim, 1);
+    enc_batch.n_tokens = 1;
+    for (int k = 0; k < 3*dim; ++k) enc_batch.embd[k] = 0.1f*k;
+    GGML_ASSERT(llama_encode(compact, enc_batch) == 0);
+    GGML_ASSERT(!llama_get_eagle3_compact_logits_ith(compact, 0, &ids, &count));
+    GGML_ASSERT(llama_set_eagle3_compact_logits(compact, false));
+    llama_batch_free(enc_batch);
+    batch.token = nullptr;
+    llama_batch_free(batch);
+    llama_free(full);
+    llama_free(compact);
+    llama_free(kv);
+    llama_model_free(model);
+    llama_backend_free();
+    printf("EAGLE runtime fixture OK\n");
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--eagle-fixture") { test_eagle_runtime_fixture(argv[2]); return 0; }
     ggml_time_init();
 
     test_dist_singleton_rng();

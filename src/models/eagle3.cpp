@@ -1,4 +1,6 @@
 #include "models.h"
+#include "llama-impl.h"
+#include "llama-kv-cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -466,6 +468,8 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     auto * inp_attn = build_attn_inp_kv();
 
+    const bool kv_only = cparams.eagle3_kv_only;
+    GGML_ASSERT(!kv_only || (n_outputs == 0 && hparams.n_layer() == 1 && !cparams.embeddings));
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     // Single decoder layer (il = 0)
@@ -494,9 +498,12 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "concat_embd", il);
 
         // Self-attention with concatenated input
-        ggml_tensor * Qcur = eagle_linear(model.layers[il].wq,
-                model.layers[il].wq_w1a1_packed, model.layers[il].wq_w1a1_scale, cur, 2 * n_embd);
-        cb(Qcur, "Qcur", il);
+        ggml_tensor * Qcur = nullptr;
+        if (!kv_only) {
+            Qcur = eagle_linear(model.layers[il].wq,
+                    model.layers[il].wq_w1a1_packed, model.layers[il].wq_w1a1_scale, cur, 2 * n_embd);
+            cb(Qcur, "Qcur", il);
+        }
 
         ggml_tensor * Kcur = eagle_linear(model.layers[il].wk,
                 model.layers[il].wk_w1a1_packed, model.layers[il].wk_w1a1_scale, cur, 2 * n_embd);
@@ -506,7 +513,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
                 model.layers[il].wv_w1a1_packed, model.layers[il].wv_w1a1_scale, cur, 2 * n_embd);
         cb(Vcur, "Vcur", il);
 
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+        if (Qcur) Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
@@ -514,7 +521,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
         // RoPE
-        Qcur = ggml_rope_ext(
+        if (Qcur) Qcur = ggml_rope_ext(
                 ctx0, Qcur, inp_pos, rope_factors,
                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow
@@ -525,8 +532,19 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
                 ext_factor, attn_factor, beta_fast, beta_slow
                 );
 
-        cb(Qcur, "Qcur_rope", il);
+        if (Qcur) cb(Qcur, "Qcur_rope", il);
         cb(Kcur, "Kcur_rope", il);
+
+        if (kv_only) {
+            if (inp_attn->self_k_rot) Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+            if (inp_attn->self_v_rot) Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+            ggml_build_forward_expand(gf, Vcur);
+            ggml_build_forward_expand(gf, Kcur);
+            const auto * mctx = inp_attn->mctx;
+            ggml_build_forward_expand(gf, mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+            return;
+        }
 
         cur = build_attn(inp_attn,
                 (model.layers[il].wo_w1a1_packed || eagle3_dense_diagnostics()) ? nullptr : model.layers[il].wo, NULL, nullptr,

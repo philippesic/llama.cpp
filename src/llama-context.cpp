@@ -1051,6 +1051,21 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+int llama_context::decode_eagle3_kv_only(const llama_batch & batch) {
+    const bool no_taps = std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool value) { return value; });
+    bool eligible = model.arch == LLM_ARCH_EAGLE3 && model.hparams.n_layer() == 1 &&
+        !cparams.embeddings && no_taps && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
+        batch.token && batch.embd && batch.logits && batch.n_tokens > 0;
+    for (int32_t j = 0; eligible && j < batch.n_tokens; ++j) eligible = !batch.logits[j];
+    if (!eligible) return decode(batch);
+    struct reset_flag {
+        bool & flag;
+        ~reset_flag() { flag = false; }
+    } reset{cparams.eagle3_kv_only};
+    cparams.eagle3_kv_only = true;
+    return decode(batch);
+}
+
 bool llama_context::set_eagle3_compact_logits(bool value) {
     synchronize();
     if (value == cparams.eagle3_compact_logits) return true;
@@ -1078,9 +1093,9 @@ bool llama_context::set_eagle3_compact_logits(bool value) {
 }
 
 const float * llama_context::get_eagle3_compact_logits_ith(int32_t i, const llama_token ** ids, size_t * count) {
+    if (ids) *ids = nullptr;
+    if (count) *count = 0;
     if (!ids || !count) return nullptr;
-    *ids = nullptr;
-    *count = 0;
     if (!cparams.eagle3_compact_logits || !logits.data) return nullptr;
     output_reorder();
     try {
@@ -1728,6 +1743,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     n_outputs = n_tokens;
+    if (cparams.eagle3_compact_logits) eagle3_logits_expanded.assign(n_outputs, true);
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -2068,6 +2084,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    if (cparams.eagle3_compact_logits) eagle3_logits_expanded.assign(n_outputs_all, true);
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -2155,6 +2172,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     for (int64_t row = 0; row < n_outputs; ++row) {
                         ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + row*n_vocab,
                             row*width*sizeof(float), width*sizeof(float));
+                        eagle3_logits_expanded[n_outputs_prev + row] = false;
                     }
                 } else {
                     ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -2259,7 +2277,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
-    if (cparams.eagle3_compact_logits) eagle3_logits_expanded.assign(n_outputs, false);
+
 
     // set output mappings
     if (n_outputs > 0) {
@@ -4150,6 +4168,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+int32_t llama_decode_eagle3_kv_only(llama_context * ctx, llama_batch batch) {
+    return ctx->decode_eagle3_kv_only(batch);
 }
 
 bool llama_set_eagle3_compact_logits(llama_context * ctx, bool value) {
