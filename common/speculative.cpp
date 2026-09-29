@@ -526,6 +526,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     common_params_speculative_draft params;
     llama_batch batch;
+    bool device_state_enabled = false;
     bool kv_only_catchup = false;
     bool compact_logits_enabled = false;
 
@@ -635,6 +636,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // turn on extraction of the draft model's pre-norm hidden state
         // (used both for the encoder output g_embd and the decoder pre-norm output).
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        const char * device_state = std::getenv("GGML_EAGLE_DEVICE_STATE");
+        if (device_state && std::string(device_state) == "1") {
+            device_state_enabled = n_seq == 1 && llama_set_eagle3_device_state(ctx_dft, true);
+            SPC_WRN("EAGLE3 resident state: %s\n", device_state_enabled ? "enabled" : "fallback");
+        }
 
         const char * capture = std::getenv("EAGLE_CAPTURE_PREFIX");
         if (capture && *capture) llama_set_embeddings(ctx_dft, true);
@@ -649,6 +655,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     ~common_speculative_impl_draft_eagle3() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (device_state_enabled && ctx_dft) llama_set_eagle3_device_state(ctx_dft, false);
         if (compact_logits_enabled && ctx_dft) llama_set_eagle3_compact_logits(ctx_dft, false);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -926,6 +933,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         int i = 0;
 
         while (n_drafting > 0) {
+            const bool device_recurrent = device_state_enabled && !stage.enabled() &&
+                llama_eagle3_device_state_available(ctx_dft);
             int i_batch = 0;
 
             common_batch_clear(batch);
@@ -977,7 +986,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 }
                 stage.next("step_bookkeeping", i);
                 // pre-norm hidden state of this position becomes g_embd for the next step
-                if (!stage.enabled()) prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                if (!stage.enabled() && !device_recurrent) prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1017,7 +1026,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 stage.next("recurrent_input_pack", i + 1);
                 common_batch_add(batch, id, pending_pos_last[seq_id] + (i + 1), { seq_id }, true);
-                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec, prenorm, row_bytes);
+                if (device_recurrent) std::memset(batch.embd, 0, row_bytes);
+                else std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec, prenorm, row_bytes);
                 stage.next("step_bookkeeping", i);
             }
 
@@ -1028,7 +1038,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             if (stage.enabled()) { stage.recurrent_rows += batch.n_tokens; ++stage.decode_calls; }
             stage.next("recurrent_decode_call", i + 1);
             const int64_t t_step = process_trace_enabled ? ggml_time_us() : 0;
-            ret = llama_decode(ctx_dft, batch);
+            ret = device_recurrent ? llama_decode_eagle3_recurrent(ctx_dft, batch) : llama_decode(ctx_dft, batch);
             if (process_trace_enabled) draft_trace.step_decode_us.push_back(ggml_time_us() - t_step);
             stage.next("step_bookkeeping", i + 1);
             if (ret != 0) {

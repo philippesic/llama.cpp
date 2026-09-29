@@ -95,6 +95,14 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Bounded one-sequence EAGLE prenorm state retained on its actual backend.
+// The recurrent call ignores batch.embd values and requires the next position
+// after the latest successful one-row decode, with no external cache mutation.
+// Ineligible recurrent calls return -1. Full state getters read back on demand.
+LLAMA_API bool llama_set_eagle3_device_state(struct llama_context * ctx, bool value);
+LLAMA_API bool llama_eagle3_device_state_available(struct llama_context * ctx);
+LLAMA_API int32_t llama_decode_eagle3_recurrent(struct llama_context * ctx, struct llama_batch batch);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

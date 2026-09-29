@@ -629,6 +629,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    eagle3_state_buffer.reset();
+    eagle3_state_meta.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1053,6 +1055,79 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+bool llama_context::set_eagle3_device_state(bool value) {
+    synchronize();
+    if (value && (model.arch != LLM_ARCH_EAGLE3 || model.hparams.n_layer() != 1 ||
+            cparams.n_seq_max != 1 || !cparams.embeddings_nextn || !cparams.embeddings_nextn_masked ||
+            cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) return false;
+    if (value == cparams.eagle3_device_state) return true;
+    refresh_eagle3_device_state_host();
+    cparams.eagle3_device_state = value;
+    eagle3_state_valid = false;
+    sched_need_reserve = true;
+    if (!value) {
+        eagle3_state_tensor = nullptr;
+        eagle3_state_backend = nullptr;
+        eagle3_state_buffer.reset();
+        eagle3_state_meta.reset();
+    }
+    return true;
+}
+
+bool llama_context::eagle3_device_state_available() const {
+    return cparams.eagle3_device_state && cparams.embeddings_nextn && cparams.embeddings_nextn_masked &&
+        eagle3_state_valid && memory && memory->mutation_generation == eagle3_state_generation &&
+        memory->seq_pos_max(eagle3_state_seq) == eagle3_state_pos;
+}
+
+int llama_context::decode_eagle3_recurrent(const llama_batch & batch) {
+    const llama_seq_id seq = batch.n_tokens == 1 && batch.seq_id && batch.seq_id[0] ? batch.seq_id[0][0] : 0;
+    const bool valid_batch = batch.n_tokens == 1 && batch.token && batch.embd && batch.pos &&
+        batch.logits && batch.logits[0] && (!batch.n_seq_id || batch.n_seq_id[0] == 1) &&
+        (!batch.seq_id || batch.seq_id[0]) && seq == eagle3_state_seq;
+    if (!valid_batch || !eagle3_device_state_available() || batch.pos[0] != eagle3_state_pos + 1) {
+        LLAMA_LOG_WARN("%s: recurrent state precondition failed\n", __func__);
+        return -1;
+    }
+    struct reset_flag { bool & flag; ~reset_flag() { flag = false; } } reset{eagle3_device_input};
+    eagle3_device_input = true;
+    const int rc = decode(batch);
+    if (rc != 0 && memory) ++memory->mutation_generation;
+    return rc;
+}
+
+void llama_context::refresh_eagle3_device_state_host() {
+    if (eagle3_state_valid && embd_nextn.data) {
+        ggml_backend_tensor_get(eagle3_state_tensor, embd_nextn.data, 0, ggml_nbytes(eagle3_state_tensor));
+    }
+}
+
+bool llama_context::capture_eagle3_device_state(ggml_tensor * state, const llama_ubatch & ubatch) {
+    if (!cparams.eagle3_device_state || !state || ubatch.n_tokens != 1 || ubatch.n_seq_id[0] != 1 ||
+            state->ne[1] != 1 || !ggml_is_contiguous(state)) return false;
+    auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), state);
+    GGML_ASSERT(backend && state->type == GGML_TYPE_F32 && state->ne[0] == model.hparams.n_embd_out());
+    if (!eagle3_state_tensor) {
+        eagle3_state_meta.reset(ggml_init({ggml_tensor_overhead()*2, nullptr, true}));
+        if (!eagle3_state_meta) return false;
+        eagle3_state_tensor = ggml_new_tensor_2d(eagle3_state_meta.get(), GGML_TYPE_F32, state->ne[0], 1);
+        ggml_set_name(eagle3_state_tensor, "eagle3_resident_prenorm");
+        eagle3_state_buffer.reset(ggml_backend_alloc_ctx_tensors(eagle3_state_meta.get(), backend));
+        if (!eagle3_state_buffer) { eagle3_state_tensor = nullptr; eagle3_state_meta.reset(); return false; }
+        eagle3_state_backend = backend;
+        LLAMA_LOG_INFO("EAGLE resident state: backend=%s buffer=%s logical_bytes=%zu allocated_bytes=%zu (one sequence)\n",
+            ggml_backend_name(backend), ggml_backend_buft_name(ggml_backend_buffer_get_type(eagle3_state_buffer.get())),
+            ggml_nbytes(eagle3_state_tensor), ggml_backend_buffer_get_size(eagle3_state_buffer.get()));
+    }
+    if (backend != eagle3_state_backend) return false;
+    ggml_backend_tensor_copy_async(backend, backend, state, eagle3_state_tensor);
+    eagle3_state_pos = ubatch.pos[0];
+    eagle3_state_seq = ubatch.seq_id[0][0];
+    eagle3_state_generation = memory->mutation_generation;
+    eagle3_state_valid = true;
+    return true;
+}
+
 int llama_context::decode_eagle3_kv_only(const llama_batch & batch) {
     const bool no_taps = std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool value) { return value; });
     bool eligible = model.arch == LLM_ARCH_EAGLE3 && model.hparams.n_layer() == 1 &&
@@ -1222,12 +1297,14 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
+    refresh_eagle3_device_state_host();
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
+    refresh_eagle3_device_state_host();
 
     try {
         if (embd_nextn.data == nullptr) {
@@ -1447,6 +1524,7 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) eagle3_state_valid = false;
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
@@ -1666,7 +1744,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if (res->eagle3_input) res->eagle3_input->skip_embd_host = eagle3_device_input;
         res->set_inputs(&ubatch);
+        if (eagle3_device_input) {
+            auto * input = res->t_inp_embd;
+            GGML_ASSERT(input && eagle3_state_valid && input->ne[0] == eagle3_state_tensor->ne[0] && input->ne[1] == 1);
+            auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), input);
+            if (backend == eagle3_state_backend) {
+                ggml_backend_tensor_copy_async(backend, backend, eagle3_state_tensor, input);
+            } else {
+                LLAMA_LOG_WARN("EAGLE resident state transfer fallback: input backend differs\n");
+                std::vector<float> host(input->ne[0]);
+                ggml_backend_synchronize(eagle3_state_backend);
+                ggml_backend_tensor_get(eagle3_state_tensor, host.data(), 0, ggml_nbytes(eagle3_state_tensor));
+                ggml_backend_tensor_set(input, host.data(), 0, ggml_nbytes(input));
+            }
+            eagle3_state_valid = false;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1689,6 +1783,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    eagle3_state_valid = false;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1928,6 +2023,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (!eagle3_device_input) eagle3_state_valid = false;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2259,7 +2355,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                const bool resident = n_tokens_all == 1 && n_outputs_all == 1 &&
+                    capture_eagle3_device_state(t_h_nextn, ubatch);
+                if (!resident) ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
             }
         }
 
@@ -2849,6 +2947,14 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
+        if (cparams.eagle3_device_state && model.arch == LLM_ARCH_EAGLE3 && strcmp(name, "inp_g_embeddings") == 0) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.dev_layer(0)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
+        }
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
@@ -3417,6 +3523,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (memory) ++memory->mutation_generation;
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -3456,6 +3563,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (memory) ++memory->mutation_generation;
     llama_file file(filepath, "rb");
 
     // sanity checks
@@ -3516,6 +3624,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 }
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (memory) ++memory->mutation_generation;
     llama_file file(filepath, "rb");
 
     // version checks
@@ -3610,6 +3719,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    if (memory) ++memory->mutation_generation;
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -3644,6 +3754,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (memory) ++memory->mutation_generation;
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -3685,6 +3796,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
         }
+    }
+    if (eagle3_state_buffer) {
+        ret[ggml_backend_buffer_get_type(eagle3_state_buffer.get())].context += ggml_backend_buffer_get_size(eagle3_state_buffer.get());
     }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -4172,6 +4286,10 @@ void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
 
+bool llama_set_eagle3_device_state(llama_context * ctx, bool value) { return ctx->set_eagle3_device_state(value); }
+bool llama_eagle3_device_state_available(llama_context * ctx) { return ctx->eagle3_device_state_available(); }
+int32_t llama_decode_eagle3_recurrent(llama_context * ctx, llama_batch batch) { return ctx->decode_eagle3_recurrent(batch); }
+
 int32_t llama_decode_eagle3_kv_only(llama_context * ctx, llama_batch batch) {
     return ctx->decode_eagle3_kv_only(batch);
 }
@@ -4357,6 +4475,7 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
         return;
     }
 
+    ++mem->mutation_generation;
     mem->clear(data);
 }
 
@@ -4369,6 +4488,7 @@ bool llama_memory_seq_rm(
         return true;
     }
 
+    ++mem->mutation_generation;
     return mem->seq_rm(seq_id, p0, p1);
 }
 
@@ -4382,6 +4502,7 @@ void llama_memory_seq_cp(
         return;
     }
 
+    ++mem->mutation_generation;
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -4392,6 +4513,7 @@ void llama_memory_seq_keep(
         return;
     }
 
+    ++mem->mutation_generation;
     mem->seq_keep(seq_id);
 }
 
@@ -4405,6 +4527,7 @@ void llama_memory_seq_add(
         return;
     }
 
+    ++mem->mutation_generation;
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -4418,6 +4541,7 @@ void llama_memory_seq_div(
         return;
     }
 
+    ++mem->mutation_generation;
     mem->seq_div(seq_id, p0, p1, d);
 }
 

@@ -79,6 +79,11 @@ struct llama_context {
 
     enum llama_pooling_type pooling_type() const;
 
+    bool set_eagle3_device_state(bool value);
+    bool eagle3_device_state_available() const;
+    int decode_eagle3_recurrent(const llama_batch & batch);
+    void refresh_eagle3_device_state_host();
+    bool capture_eagle3_device_state(ggml_tensor * state, const llama_ubatch & ubatch);
     int decode_eagle3_kv_only(const llama_batch & batch);
     bool set_eagle3_compact_logits(bool value);
     const float * get_eagle3_compact_logits_ith(int32_t i, const llama_token ** ids, size_t * count);
@@ -297,6 +302,15 @@ private:
     llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
+    ggml_context_ptr eagle3_state_meta;
+    ggml_backend_buffer_ptr eagle3_state_buffer;
+    ggml_tensor * eagle3_state_tensor = nullptr;
+    ggml_backend_t eagle3_state_backend = nullptr;
+    uint64_t eagle3_state_generation = 0;
+    bool eagle3_state_valid = false;
+    bool eagle3_device_input = false;
+    llama_pos eagle3_state_pos = -1;
+    llama_seq_id eagle3_state_seq = -1;
     std::vector<llama_token> eagle3_draft_ids;
     std::vector<bool> eagle3_logits_expanded;
     buffer_view<float> logits = {nullptr, 0};

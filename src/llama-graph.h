@@ -135,6 +135,7 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    bool skip_embd_host = false;
 
     const int64_t n_embd = 0;
 };
@@ -872,6 +873,7 @@ struct llm_graph_params {
         }
 
         return
+            cparams.eagle3_device_state     == other.cparams.eagle3_device_state     &&
             cparams.eagle3_kv_only          == other.cparams.eagle3_kv_only          &&
             cparams.eagle3_compact_logits   == other.cparams.eagle3_compact_logits   &&
             cparams.embeddings              == other.cparams.embeddings              &&
@@ -934,6 +936,7 @@ public:
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
+    llm_graph_input_embd * eagle3_input = nullptr;
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;

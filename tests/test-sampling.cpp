@@ -405,10 +405,18 @@ static void test_eagle_compact() {
 }
 
 
-static void test_eagle_runtime_fixture(const char * path) {
+static void test_eagle_runtime_fixture(const char * path, bool cuda = false) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    ggml_backend_dev_t devices[2] = {nullptr, nullptr};
+    if (cuda) {
+        ggml_backend_load_all();
+        devices[0] = ggml_backend_dev_by_name("CUDA0");
+        GGML_ASSERT(devices[0] && "CUDA fixture requires an actual CUDA device");
+        mp.devices = devices;
+        printf("EAGLE CUDA fixture device: %s\n", ggml_backend_dev_description(devices[0]));
+    }
+    mp.n_gpu_layers = cuda ? 99 : 0;
     llama_model * model = llama_model_load_from_file(path, mp);
     GGML_ASSERT(model);
     llama_context_params cp = llama_context_default_params();
@@ -416,7 +424,8 @@ static void test_eagle_runtime_fixture(const char * path) {
     cp.n_batch = 32;
     cp.n_ubatch = 32;
     cp.n_threads = cp.n_threads_batch = 1;
-    cp.offload_kqv = false;
+    cp.offload_kqv = cuda;
+    cp.kv_unified = true;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     auto * full = llama_init_from_model(model, cp);
     auto * compact = llama_init_from_model(model, cp);
@@ -462,6 +471,102 @@ static void test_eagle_runtime_fixture(const char * path) {
     const float * hf = llama_get_embeddings_nextn_ith(full, 0);
     const float * hk = llama_get_embeddings_nextn_ith(kv, 0);
     for (int j = 0; j < dim; ++j) GGML_ASSERT(hf[j] == hk[j]);
+    // One-sequence backend-resident recurrence must match the host state path.
+    GGML_ASSERT(llama_set_eagle3_device_state(kv, true));
+    GGML_ASSERT(!llama_eagle3_device_state_available(kv));
+    for (int step = 0; step < 4; ++step) {
+        hf = llama_get_embeddings_nextn_ith(full, 0);
+        std::copy_n(hf, dim, batch.embd);
+        batch.pos[0] = 4 + step;
+        GGML_ASSERT(llama_decode(full, batch) == 0);
+        if (step == 0) {
+            GGML_ASSERT(llama_decode(kv, batch) == 0);
+        } else {
+            std::fill_n(batch.embd, dim, 0.0f);
+            GGML_ASSERT(llama_decode_eagle3_recurrent(kv, batch) == 0);
+        }
+        GGML_ASSERT(llama_eagle3_device_state_available(kv));
+        lf = llama_get_logits_ith(full, 0);
+        lk = llama_get_logits_ith(kv, 0);
+        hf = llama_get_embeddings_nextn_ith(full, 0);
+        hk = llama_get_embeddings_nextn_ith(kv, 0);
+        for (int j = 0; j < vocab; ++j) GGML_ASSERT(lf[j] == lk[j]);
+        for (int j = 0; j < dim; ++j) GGML_ASSERT(hf[j] == hk[j]);
+        const size_t bytes = llama_state_seq_get_size(full, 0);
+        full_cache.resize(bytes); kv_cache.resize(bytes);
+        GGML_ASSERT(llama_state_seq_get_data(full, full_cache.data(), bytes, 0) == bytes);
+        GGML_ASSERT(llama_state_seq_get_data(kv, kv_cache.data(), bytes, 0) == bytes);
+        GGML_ASSERT(full_cache == kv_cache);
+    }
+    // Queue resident steps without reading their states or logits between calls.
+    for (int step = 0; step < 3; ++step) {
+        hf = llama_get_embeddings_nextn_ith(full, 0);
+        std::copy_n(hf, dim, batch.embd);
+        batch.pos[0] = 8 + step;
+        GGML_ASSERT(llama_decode(full, batch) == 0);
+        std::fill_n(batch.embd, dim, 0.0f);
+        GGML_ASSERT(llama_decode_eagle3_recurrent(kv, batch) == 0);
+    }
+    lf = llama_get_logits_ith(full, 0); lk = llama_get_logits_ith(kv, 0);
+    hf = llama_get_embeddings_nextn_ith(full, 0); hk = llama_get_embeddings_nextn_ith(kv, 0);
+    for (int j = 0; j < vocab; ++j) GGML_ASSERT(lf[j] == lk[j]);
+    for (int j = 0; j < dim; ++j) GGML_ASSERT(hf[j] == hk[j]);
+    const size_t queued_bytes = llama_state_seq_get_size(full, 0);
+    full_cache.resize(queued_bytes); kv_cache.resize(queued_bytes);
+    GGML_ASSERT(llama_state_seq_get_data(full, full_cache.data(), queued_bytes, 0) == queued_bytes);
+    GGML_ASSERT(llama_state_seq_get_data(kv, kv_cache.data(), queued_bytes, 0) == queued_bytes);
+    GGML_ASSERT(full_cache == kv_cache);
+    batch.pos[0] += 2;
+    GGML_ASSERT(llama_decode_eagle3_recurrent(kv, batch) == -1);
+    // Mutating an earlier row must invalidate even though the maximum is unchanged.
+    const llama_pos old_max = llama_memory_seq_pos_max(llama_get_memory(kv), 0);
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(kv), 0, 0, 1));
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(kv), 0) == old_max);
+    GGML_ASSERT(!llama_eagle3_device_state_available(kv));
+    batch.pos[0] = old_max + 1;
+    GGML_ASSERT(llama_decode_eagle3_recurrent(kv, batch) == -1);
+    // Restoring same-max cache rows also requires a fresh ordinary seed.
+    GGML_ASSERT(llama_state_seq_set_data(kv, kv_cache.data(), kv_cache.size(), 0) == kv_cache.size());
+    GGML_ASSERT(!llama_eagle3_device_state_available(kv));
+    std::copy_n(hf, dim, batch.embd);
+    GGML_ASSERT(llama_decode(kv, batch) == 0);
+    GGML_ASSERT(llama_eagle3_device_state_available(kv));
+    const size_t restore_bytes = llama_state_seq_get_size(kv, 0);
+    std::vector<uint8_t> restore_blob(restore_bytes);
+    GGML_ASSERT(llama_state_seq_get_data(kv, restore_blob.data(), restore_bytes, 0) == restore_bytes);
+    // A different state at the same maximum makes the restore gate independent.
+    const llama_pos restore_max = batch.pos[0];
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(kv), 0, restore_max, -1));
+    for (int j = 0; j < dim; ++j) batch.embd[j] += 0.125f;
+    GGML_ASSERT(llama_decode(kv, batch) == 0);
+    GGML_ASSERT(llama_eagle3_device_state_available(kv));
+    const float * before_restore = llama_get_embeddings_nextn_ith(kv, 0);
+    std::vector<float> last_output(before_restore, before_restore + dim);
+    GGML_ASSERT(llama_state_seq_set_data(kv, restore_blob.data(), restore_bytes, 0) == restore_bytes);
+    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(kv), 0) == restore_max);
+    GGML_ASSERT(!llama_eagle3_device_state_available(kv));
+    const float * after_restore = llama_get_embeddings_nextn_ith(kv, 0);
+    for (int j = 0; j < dim; ++j) GGML_ASSERT(after_restore[j] == last_output[j]);
+    ++batch.pos[0];
+    GGML_ASSERT(llama_decode(kv, batch) == 0);
+    GGML_ASSERT(llama_eagle3_device_state_available(kv));
+    const uint8_t bad_restore[8] = {};
+    GGML_ASSERT(llama_state_seq_set_data(kv, bad_restore, sizeof(bad_restore), 0) == 0);
+    GGML_ASSERT(!llama_eagle3_device_state_available(kv));
+    // An implicit sequence ID means zero; it must not reuse sequence one's state.
+    llama_memory_clear(llama_get_memory(kv), true);
+    batch.pos[0] = 0;
+    batch.seq_id[0][0] = 1;
+    GGML_ASSERT(llama_decode(kv, batch) == 0);
+    GGML_ASSERT(llama_eagle3_device_state_available(kv));
+    batch.pos[0] = 1;
+    auto ** explicit_seq_ids = batch.seq_id;
+    batch.seq_id = nullptr;
+    GGML_ASSERT(llama_decode_eagle3_recurrent(kv, batch) == -1);
+    batch.seq_id = explicit_seq_ids;
+    batch.seq_id[0][0] = 0;
+    GGML_ASSERT(llama_set_eagle3_device_state(kv, false));
+    GGML_ASSERT(!llama_eagle3_device_state_available(kv));
     // Multirow compact output, explicit mapping, and on-demand full expansion.
     batch.n_tokens = 3;
     for (int j = 0; j < 3; ++j) { batch.pos[j] = j; batch.logits[j] = true; }
@@ -504,8 +609,11 @@ static void test_eagle_runtime_fixture(const char * path) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc == 3 && std::string(argv[1]) == "--eagle-fixture") { test_eagle_runtime_fixture(argv[2]); return 0; }
     ggml_time_init();
+    if (argc == 3 && (std::string(argv[1]) == "--eagle-fixture" || std::string(argv[1]) == "--eagle-fixture-cuda")) {
+        test_eagle_runtime_fixture(argv[2], std::string(argv[1]) == "--eagle-fixture-cuda");
+        return 0;
+    }
 
     test_dist_singleton_rng();
     test_eagle_compact();

@@ -32,6 +32,7 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    bool eagle3_device_state = false;
     bool eagle3_kv_only = false;
     bool eagle3_compact_logits = false;
     bool embeddings;

@@ -71,6 +71,7 @@ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types
 struct llama_memory_i {
+    uint64_t mutation_generation = 0; // public mutations invalidate dependent recurrent inputs
     // this callback is used to filter out layers that should not be included in the cache
     using layer_filter_cb = std::function<bool(int32_t il)>;
 

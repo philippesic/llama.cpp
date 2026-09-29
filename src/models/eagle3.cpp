@@ -471,6 +471,8 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_g = inp->embd;
     cb(inp_g, "inp_g_embeddings", -1);
+    res->t_inp_embd = inp_g;
+    res->eagle3_input = inp.get();
 
     res->add_input(std::move(inp));
 
