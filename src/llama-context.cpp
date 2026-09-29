@@ -1687,6 +1687,19 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool event_trace = [] { const char * value = getenv("GGML_CUDA_EAGLE_EVENTS"); return value && strcmp(value, "1") == 0; }();
+    if (event_trace) {
+        using annotate_fn = void (*)(ggml_backend_t, const void *, const char *, const char *, int64_t, int64_t, int64_t);
+        const char * stage = model.arch == LLM_ARCH_EAGLE3
+            ? (gtype == LLM_GRAPH_TYPE_ENCODER || n_outputs == 0 ? "process" : "draft") : "target_or_other";
+        for (auto * backend : backend_ptrs) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            auto annotate = (annotate_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_eagle_set_scope");
+            if (annotate) annotate(backend, this, model.arch_name().c_str(), stage, ubatch.n_tokens,
+                ubatch.pos ? ubatch.pos[0] : -1, n_outputs);
+        }
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
