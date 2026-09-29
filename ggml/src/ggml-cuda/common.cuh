@@ -1457,6 +1457,9 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    std::string eagle_model_arch, eagle_stage;
+    const void * eagle_llama_context = nullptr;
+    int64_t eagle_n_tokens = 0, eagle_position = -1, eagle_n_outputs = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1580,6 +1583,20 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+};
+
+// Intrusive opt-in CUDA event scopes. Captured nodes provide inventory only.
+struct ggml_cuda_eagle_scope {
+    void * state = nullptr;
+    ggml_cuda_eagle_scope(ggml_backend_cuda_context & ctx, const char * kind,
+            const ggml_tensor * tensor = nullptr, int node = -1, const void * graph_key = nullptr,
+            bool graph_enabled = false, bool capture = false, size_t bytes = 0);
+    ggml_cuda_eagle_scope(int device, cudaStream_t stream, const char * kind,
+            const ggml_tensor * tensor, size_t bytes);
+    ~ggml_cuda_eagle_scope();
+    void set_node_count(int count);
+    ggml_cuda_eagle_scope(const ggml_cuda_eagle_scope &) = delete;
+    ggml_cuda_eagle_scope & operator=(const ggml_cuda_eagle_scope &) = delete;
 };
 
 void ggml_cuda_matmul_audit(ggml_backend_cuda_context & ctx, const ggml_tensor * weights,

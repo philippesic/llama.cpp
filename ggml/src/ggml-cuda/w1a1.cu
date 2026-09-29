@@ -296,6 +296,7 @@ static void w1ax_capture_activations(
 }
 
 void ggml_cuda_w1ax_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_eagle_scope eagle_pack_scope(ctx, "activation_pack_scales", dst);
     const ggml_tensor * acts = dst->src[0];
     const int bits = ggml_get_op_params_i32(dst, 0);
     const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
@@ -357,6 +358,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     w1ax_capture_activations(stream, weights, acts, k, m, n, bits);
     if (bits == 16 && grouped) {
         ggml_cuda_matmul_audit(ctx, weights, acts, "custom_A16_group128", "F16", "F32_signadd_and_scales", "inside_kernel_F16_round_no_separate_pack");
+        ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output_A16_inside_cast", dst);
         w1a16_group128_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
                 (const float *) acts->data, m, k, words, (float *) dst->data);
@@ -365,6 +367,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
     if (bits == 16) {
         ggml_cuda_matmul_audit(ctx, weights, acts, "custom_A16_row", "F16", "F32_signadd_and_scales", "inside_kernel_F16_round_no_separate_pack");
+        ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output_A16_inside_cast", dst);
         w1a16_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
                 (const float *) acts->data, m, k, words, (float *) dst->data);
@@ -384,15 +387,19 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const uint32_t * plane_ptr = shared ? (const uint32_t *) shared->data + layout.codes_words : planes.alloc(bits == 4 ? (size_t) n*words*4 : 1);
         ggml_cuda_pool_alloc<int32_t> raw_dots(ctx.pool(), check_integer_dots ? (size_t) n*m : 1);
         if (!shared) {
+            ggml_cuda_eagle_scope eagle_pack_scope(ctx, "activation_pack_scales", dst);
             w1ax_quantize<<<dim3(token_blocks), 256, 0, stream>>>(
                     (const float *) acts->data, k, words, bits, codes.ptr, planes.ptr, act_scales.ptr);
             CUDA_CHECK(cudaGetLastError());
         }
+        {
+        ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output", dst);
         w1ax_integer_dot<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
                 code_ptr, plane_ptr, scale_ptr, m, k, words, bits, bitserial, (float *) dst->data,
                 check_integer_dots ? raw_dots.ptr : nullptr);
         CUDA_CHECK(cudaGetLastError());
+        }
         if (check_integer_dots) {
             w1ax_validate_integer_dots<<<dim3((unsigned) ((m*n + 127)/128)), 128, 0, stream>>>(
                     (const uint32_t *) weights->data, code_ptr, raw_dots.ptr, m, n, k, words);
@@ -405,10 +412,12 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_pool_alloc<uint32_t> packed(ctx.pool());
     const uint32_t * packed_ptr = shared ? (const uint32_t *) shared->data : packed.alloc((size_t) n*words);
     if (!shared) {
+        ggml_cuda_eagle_scope eagle_pack_scope(ctx, "activation_pack_scales", dst);
         w1a1_pack_activations<<<dim3(token_blocks), 256, 0, stream>>>(
                 (const float *) acts->data, k, words, n, packed.ptr, act_scales.ptr);
         CUDA_CHECK(cudaGetLastError());
     }
+    ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output", dst);
     w1a1_xor_popc<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
             (const uint32_t *) weights->data, (const float *) scales->data,
             packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data);

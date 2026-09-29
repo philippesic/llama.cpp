@@ -1,4 +1,6 @@
 #include "ggml-cuda.h"
+
+#include <algorithm>
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -701,6 +703,232 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+
+namespace {
+struct eagle_cuda_event_state {
+    ggml_backend_cuda_context * ctx;
+    const void * context_id;
+    bool annotation_hint = false;
+    int device, node, node_count = 1;
+    uint64_t id, frame, parent = 0;
+    int64_t host_begin, position, tokens, outputs;
+    const void * graph_key;
+    const void * llama_context;
+    cudaStream_t stream;
+    cudaEvent_t begin = nullptr, end = nullptr, anchor = nullptr;
+    bool captured = false, graph_enabled, graph_capture;
+    size_t bytes;
+    std::string kind, name, op, arch, stage;
+    int64_t ne[4] = {};
+    int64_t k = 0, m = 0, n = 0;
+    int bits = 0;
+};
+static thread_local std::vector<eagle_cuda_event_state *> eagle_event_stack;
+struct eagle_cuda_annotation {
+    int device = -1;
+    const void * context = nullptr, * llama_context = nullptr;
+    std::string arch = "unassigned", stage = "unassigned";
+    int64_t position = -1, tokens = 0, outputs = 0;
+};
+static thread_local eagle_cuda_annotation eagle_event_annotation;
+static std::atomic<uint64_t> eagle_event_counter{0};
+static std::atomic<uint64_t> eagle_inventory_counter{0};
+static std::mutex eagle_event_mutex;
+
+static bool eagle_events_enabled() {
+    static const bool enabled = [] { const char * value = getenv("GGML_CUDA_EAGLE_EVENTS"); return value && strcmp(value, "1") == 0; }();
+    return enabled;
+}
+
+static std::string eagle_json_quote(const std::string & value) {
+    std::string result = "\"";
+    for (unsigned char ch : value) {
+        if (ch == '"' || ch == '\\') { result += '\\'; result += char(ch); }
+        else if (ch < 32) { char escaped[7]; snprintf(escaped, sizeof(escaped), "\\u%04x", ch); result += escaped; }
+        else result += char(ch);
+    }
+    return result + "\"";
+}
+
+static eagle_cuda_event_state * eagle_event_begin(ggml_backend_cuda_context * ctx, int device,
+        cudaStream_t stream, const char * kind, const ggml_tensor * tensor, int node,
+        const void * graph_key, bool graph_enabled, bool capture, size_t bytes) {
+    if (!eagle_events_enabled()) return nullptr;
+    static const uint64_t limit = [] { const char * value = getenv("GGML_CUDA_EAGLE_EVENT_LIMIT"); return value ? strtoull(value, nullptr, 10) : uint64_t(100000); }();
+    const uint64_t id = ++eagle_event_counter;
+    if (id > limit) {
+        if (id == limit + 1) {
+            std::lock_guard<std::mutex> lock(eagle_event_mutex);
+            fprintf(stderr, "CUDA_EAGLE_EVENT {\"schema\":\"cuda_eagle_event_v1\",\"kind\":\"truncation\",\"limit\":%llu}\n", (unsigned long long) limit);
+        }
+        return nullptr;
+    }
+    auto * state = new eagle_cuda_event_state;
+    state->ctx = ctx; state->context_id = ctx; state->device = device; state->stream = stream; state->node = node;
+    state->id = state->frame = id; state->host_begin = ggml_time_us();
+    state->kind = kind; state->graph_key = graph_key; state->graph_enabled = graph_enabled;
+    state->graph_capture = capture; state->bytes = bytes;
+    state->llama_context = ctx ? ctx->eagle_llama_context : nullptr;
+    state->position = ctx ? ctx->eagle_position : -1; state->tokens = ctx ? ctx->eagle_n_tokens : 0;
+    state->outputs = ctx ? ctx->eagle_n_outputs : 0;
+    state->arch = ctx ? ctx->eagle_model_arch : "unassigned";
+    state->stage = ctx ? ctx->eagle_stage : "unassigned";
+    if (!ctx && eagle_event_annotation.device == device) {
+        state->context_id = eagle_event_annotation.context;
+        state->llama_context = eagle_event_annotation.llama_context;
+        state->position = eagle_event_annotation.position; state->tokens = eagle_event_annotation.tokens;
+        state->outputs = eagle_event_annotation.outputs; state->arch = eagle_event_annotation.arch;
+        state->stage = eagle_event_annotation.stage; state->annotation_hint = true;
+    }
+    if (tensor) {
+        state->name = tensor->name; state->op = ggml_op_name(tensor->op);
+        for (int i = 0; i < 4; ++i) state->ne[i] = tensor->ne[i];
+        if (tensor->op == GGML_OP_W1A1_MUL_MAT) {
+            state->k = tensor->src[2]->ne[0]; state->m = tensor->ne[0]; state->n = tensor->src[2]->ne[1];
+            state->bits = ggml_get_op_params_i32(tensor, 2);
+        } else if (tensor->op == GGML_OP_W1AX_PACK) {
+            state->k = tensor->src[0]->ne[0]; state->n = tensor->src[0]->ne[1];
+            state->bits = ggml_get_op_params_i32(tensor, 0);
+        } else if (tensor->op == GGML_OP_MUL_MAT) {
+            state->k = tensor->src[0]->ne[0]; state->m = tensor->ne[0]; state->n = tensor->src[1]->ne[1];
+        }
+    }
+    for (auto it = eagle_event_stack.rbegin(); it != eagle_event_stack.rend(); ++it) {
+        auto * parent = *it;
+        if (parent->context_id == state->context_id && parent->device == device &&
+                (parent->stream == stream || std::string(kind) == "node")) {
+            state->parent = parent->id; state->frame = parent->frame; state->anchor = parent->anchor;
+            if (!graph_key) state->graph_key = parent->graph_key;
+            state->graph_enabled = parent->graph_enabled;
+            state->graph_capture = parent->graph_capture;
+            break;
+        }
+    }
+    ggml_cuda_set_device(device);
+    cudaStreamCaptureStatus status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    const bool ancestor_capture = std::any_of(eagle_event_stack.begin(), eagle_event_stack.end(), [&](const eagle_cuda_event_state * parent) {
+        return parent->device == device && parent->context_id == state->context_id && parent->graph_capture;
+    });
+    state->captured = status != cudaStreamCaptureStatusNone || ancestor_capture;
+    if (!state->captured) {
+        CUDA_CHECK(cudaEventCreate(&state->begin)); CUDA_CHECK(cudaEventCreate(&state->end));
+        CUDA_CHECK(cudaEventRecord(state->begin, stream));
+        if (!state->anchor) state->anchor = state->begin;
+    }
+    eagle_event_stack.push_back(state);
+    return state;
+}
+}
+
+ggml_cuda_eagle_scope::ggml_cuda_eagle_scope(ggml_backend_cuda_context & ctx, const char * kind,
+        const ggml_tensor * tensor, int node, const void * graph_key, bool enabled, bool capture, size_t bytes) {
+    if (eagle_events_enabled()) state = eagle_event_begin(&ctx, ctx.device, ctx.stream(), kind, tensor, node, graph_key, enabled, capture, bytes);
+}
+
+ggml_cuda_eagle_scope::ggml_cuda_eagle_scope(int device, cudaStream_t stream, const char * kind,
+        const ggml_tensor * tensor, size_t bytes) {
+    if (eagle_events_enabled()) state = eagle_event_begin(nullptr, device, stream, kind, tensor, -1, nullptr, false, false, bytes);
+}
+
+void ggml_cuda_eagle_scope::set_node_count(int count) {
+    if (state) ((eagle_cuda_event_state *) state)->node_count = count;
+}
+
+ggml_cuda_eagle_scope::~ggml_cuda_eagle_scope() {
+    if (!state) return;
+    auto * event = (eagle_cuda_event_state *) state;
+    ggml_cuda_set_device(event->device);
+    float begin_ms = 0.0f, end_ms = 0.0f;
+    if (!event->captured) {
+        CUDA_CHECK(cudaEventRecord(event->end, event->stream));
+        CUDA_CHECK(cudaEventSynchronize(event->end));
+        CUDA_CHECK(cudaEventElapsedTime(&begin_ms, event->anchor, event->begin));
+        CUDA_CHECK(cudaEventElapsedTime(&end_ms, event->anchor, event->end));
+    }
+    const int64_t host_end = ggml_time_us();
+#ifdef _WIN32
+    const char * host_clock = "ggml_relative_qpc";
+#else
+    const char * host_clock = "CLOCK_MONOTONIC";
+#endif
+    GGML_ASSERT(!eagle_event_stack.empty() && eagle_event_stack.back() == event);
+    eagle_event_stack.pop_back();
+    const std::string name = eagle_json_quote(event->name), op = eagle_json_quote(event->op);
+    const std::string arch = eagle_json_quote(event->arch), stage = eagle_json_quote(event->stage);
+    char gpu[128];
+    if (event->captured) snprintf(gpu, sizeof(gpu), "\"gpu_begin_ms\":null,\"gpu_end_ms\":null,\"cuda_ms\":null");
+    else snprintf(gpu, sizeof(gpu), "\"gpu_begin_ms\":%.9g,\"gpu_end_ms\":%.9g,\"cuda_ms\":%.9g", begin_ms, end_ms, end_ms - begin_ms);
+    {
+        std::lock_guard<std::mutex> lock(eagle_event_mutex);
+        fprintf(stderr, "CUDA_EAGLE_EVENT {\"schema\":\"cuda_eagle_event_v1\",\"kind\":\"%s\","
+            "\"id\":%llu,\"frame\":%llu,\"parent\":%llu,\"device\":%d,\"context\":\"%p\",\"llama_context\":\"%p\","
+            "\"stream\":\"%p\",\"graph_key\":\"%p\",\"node\":%d,\"node_count\":%d,\"tensor\":%s,\"op\":%s,"
+            "\"model_arch\":%s,\"stage\":%s,\"n_tokens\":%lld,\"position\":%lld,\"n_outputs\":%lld,\"bytes\":%zu,"
+            "\"ne\":[%lld,%lld,%lld,%lld],\"k\":%lld,\"m\":%lld,\"n\":%lld,\"activation_bits\":%d,"
+            "\"host_begin_us\":%lld,\"host_end_us\":%lld,%s,"
+            "\"graph_enabled\":%s,\"graph_capture\":%s,\"captured_inventory_only\":%s,"
+            "\"annotation_is_hint\":%s,\"host_clock\":\"%s\","
+            "\"instrumentation\":\"synchronized_cuda_events_not_throughput\",\"elapsed_includes_stream_idle\":true}\n",
+            event->kind.c_str(), (unsigned long long) event->id, (unsigned long long) event->frame,
+            (unsigned long long) event->parent, event->device, event->context_id, event->llama_context,
+            (void *) event->stream, event->graph_key, event->node, event->node_count, name.c_str(), op.c_str(),
+            arch.c_str(), stage.c_str(), (long long) event->tokens, (long long) event->position,
+            (long long) event->outputs, event->bytes, (long long) event->ne[0], (long long) event->ne[1],
+            (long long) event->ne[2], (long long) event->ne[3], (long long) event->k,
+            (long long) event->m, (long long) event->n, event->bits, (long long) event->host_begin,
+            (long long) host_end, gpu, event->graph_enabled ? "true" : "false", event->graph_capture ? "true" : "false",
+            event->captured ? "true" : "false", event->annotation_hint ? "true" : "false", host_clock);
+    }
+    if (event->begin) CUDA_CHECK(cudaEventDestroy(event->begin));
+    if (event->end) CUDA_CHECK(cudaEventDestroy(event->end));
+    delete event;
+}
+
+
+#ifdef USE_CUDA_GRAPH
+static void eagle_cuda_graph_inventory(ggml_backend_cuda_context * ctx, cudaGraph_t graph, const void * key) {
+    if (!eagle_events_enabled()) return;
+    size_t count = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &count));
+    std::vector<cudaGraphNode_t> nodes(count);
+    CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &count));
+    uint64_t frame = 0;
+    if (!eagle_event_stack.empty()) frame = eagle_event_stack.back()->frame;
+    const uint64_t already = eagle_inventory_counter.fetch_add(count);
+    const size_t remaining = already >= 100000 ? 0 : size_t(100000 - already);
+    const size_t limit = std::min({count, size_t(4096), remaining});
+    {
+        std::lock_guard<std::mutex> lock(eagle_event_mutex);
+        fprintf(stderr, "CUDA_EAGLE_GRAPH_INVENTORY {\"schema\":\"cuda_eagle_graph_inventory_v1\",\"frame\":%llu,"
+            "\"device\":%d,\"context\":\"%p\",\"graph_key\":\"%p\",\"emitted_nodes\":%zu,\"total_nodes\":%zu,"
+            "\"top_level_only\":true,\"node_timings_available\":false}\n", (unsigned long long) frame,
+            ctx->device, (void *) ctx, key, limit, count);
+    }
+    for (size_t i = 0; i < limit; ++i) {
+        cudaGraphNodeType type;
+        CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
+        std::lock_guard<std::mutex> lock(eagle_event_mutex);
+        fprintf(stderr, "CUDA_EAGLE_GRAPH_NODE {\"schema\":\"cuda_eagle_graph_node_v1\",\"frame\":%llu,"
+            "\"device\":%d,\"context\":\"%p\",\"graph_key\":\"%p\",\"index\":%zu,\"node\":\"%p\","
+            "\"cuda_node_type\":%d,\"cuda_ms\":null,\"inventory_count\":%zu,\"inventory_total\":%zu,"
+            "\"scope\":\"top_level_cuda_graph_nodes_inventory_not_timing\"}\n",
+            (unsigned long long) frame, ctx->device, (void *) ctx, key, i, (void *) nodes[i], (int) type, limit, count);
+    }
+}
+#endif
+
+static void ggml_backend_cuda_eagle_set_scope(ggml_backend_t backend, const void * llama_context,
+        const char * arch, const char * stage, int64_t tokens, int64_t position, int64_t outputs) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->eagle_llama_context = llama_context; ctx->eagle_model_arch = arch; ctx->eagle_stage = stage;
+    ctx->eagle_n_tokens = tokens; ctx->eagle_position = position; ctx->eagle_n_outputs = outputs;
+    eagle_event_annotation.device = ctx->device; eagle_event_annotation.context = ctx;
+    eagle_event_annotation.llama_context = llama_context; eagle_event_annotation.arch = arch;
+    eagle_event_annotation.stage = stage; eagle_event_annotation.tokens = tokens;
+    eagle_event_annotation.position = position; eagle_event_annotation.outputs = outputs;
+}
+
 void ggml_cuda_matmul_audit(ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
         const ggml_tensor * acts, const char * path, const char * activation, const char * accumulation,
         const char * conversion, const ggml_tensor * fused_gate) {
@@ -835,6 +1063,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_eagle_scope eagle_transfer_scope(ctx->device, cudaStreamPerThread, "transfer_h2d", tensor, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -843,6 +1072,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_eagle_scope eagle_transfer_scope(ctx->device, cudaStreamPerThread, "transfer_d2h", tensor, size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -852,6 +1082,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_eagle_scope eagle_transfer_scope(ctx->device, cudaStreamPerThread, "transfer_h2d", tensor, size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -862,6 +1093,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_eagle_scope eagle_transfer_scope(ctx->device, cudaStreamPerThread, "transfer_d2h", tensor, size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -2508,6 +2740,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_eagle_scope eagle_transfer_scope(*cuda_ctx, "transfer_h2d", tensor, -1, nullptr, false, false, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2517,6 +2750,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_eagle_scope eagle_transfer_scope(*cuda_ctx, "transfer_d2h", tensor, -1, nullptr, false, false, size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2527,6 +2761,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_eagle_scope eagle_transfer_scope(*cuda_ctx, "transfer_h2d", tensor, -1, nullptr, false, false, size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2538,6 +2773,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_eagle_scope eagle_transfer_scope(*cuda_ctx, "transfer_d2h", tensor, -1, nullptr, false, false, size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2568,6 +2804,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
+    ggml_cuda_eagle_scope eagle_transfer_scope(*cuda_ctx_src, "transfer_d2d", dst, -1, nullptr, false, false, ggml_nbytes(dst));
     if (backend_src != backend_dst) {
         // copy on src stream
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
@@ -4388,7 +4625,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_eagle_scope eagle_node_scope(*cuda_ctx, "node", node, i, graph_key);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                eagle_node_scope.set_node_count(nodes_to_skip + 1);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4438,6 +4677,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            eagle_cuda_graph_inventory(cuda_ctx, graph->graph, graph_key);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4545,6 +4785,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ++cuda_ctx->graph_stats.direct_disabled;
 #endif // USE_CUDA_GRAPH
 
+    ggml_cuda_eagle_scope eagle_graph_scope(*cuda_ctx, "graph", nullptr, -1, graph_key,
+        use_cuda_graph, cuda_graph_update_required);
+    eagle_graph_scope.set_node_count(cgraph->n_nodes);
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5845,6 +6088,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_eagle_set_scope") == 0) return (void *) ggml_backend_cuda_eagle_set_scope;
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
