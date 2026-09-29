@@ -593,6 +593,10 @@ static void test_eagle_runtime_fixture(const char * path, bool cuda = false) {
     GGML_ASSERT(llama_get_logits_ith(compact, 0)[0] == llama_get_logits_ith(full, 0)[0]);
     llama_batch enc_batch = llama_batch_init(1, 3*dim, 1);
     enc_batch.n_tokens = 1;
+    enc_batch.pos[0] = 0;
+    enc_batch.n_seq_id[0] = 1;
+    enc_batch.seq_id[0][0] = 0;
+    enc_batch.logits[0] = false;
     for (int k = 0; k < 3*dim; ++k) enc_batch.embd[k] = 0.1f*k;
     GGML_ASSERT(llama_encode(compact, enc_batch) == 0);
     GGML_ASSERT(!llama_get_eagle3_compact_logits_ith(compact, 0, &ids, &count));
