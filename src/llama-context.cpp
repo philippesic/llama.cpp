@@ -15,6 +15,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -25,7 +26,7 @@
 #include <string>
 #include <unordered_map>
 
-// CPU-only diagnostic of actual post-write EAGLE draft cache rows. This is
+// Opt-in diagnostic of actual post-write EAGLE draft cache rows. This is
 // separate from graph projection capture: the latter cannot prove the F16
 // bytes stored at physical cache slots after ggml_set_rows.
 struct eagle_draft_cache_capture {
@@ -38,10 +39,33 @@ struct eagle_draft_cache_capture {
     uint64_t row_count = 0;
     uint64_t row_bytes = 0;
     uint64_t mask_bytes = 0;
-    uint64_t max_rows = 512;
-    uint64_t max_bytes = 64ull * 1024 * 1024;
+    uint64_t max_rows;
+    uint64_t max_bytes;
 
-    eagle_draft_cache_capture(const char * path, const llama_context * context) : prefix(path), owner(context) {
+    static uint64_t read_limit(const char * name, uint64_t default_value, uint64_t hard_max) {
+        const char * value = std::getenv(name);
+        if (!value || !*value) return default_value;
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (errno || end == value || *end || parsed == 0 || parsed > hard_max) {
+            throw std::runtime_error(std::string(name) + " must be a positive integer no greater than " +
+                    std::to_string(hard_max));
+        }
+        return (uint64_t) parsed;
+    }
+
+    static bool capture_buffer_supported(ggml_backend_buffer_t buffer) {
+        if (!buffer) return false;
+        if (ggml_backend_buffer_is_host(buffer)) return true;
+        const char * type = ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer));
+        return type && std::strncmp(type, "CUDA", 4) == 0;
+    }
+
+    eagle_draft_cache_capture(const char * path, const llama_context * context) :
+            prefix(path), owner(context),
+            max_rows(read_limit("EAGLE_CAPTURE_MAX_ROWS", 8192, 65536)),
+            max_bytes(read_limit("EAGLE_CAPTURE_MAX_BYTES", 512ull * 1024 * 1024, 1024ull * 1024 * 1024)) {
         index.open(prefix + ".draft_cache.jsonl", std::ios::out | std::ios::trunc);
         rows.open(prefix + ".draft_cache.f16", std::ios::out | std::ios::binary | std::ios::trunc);
         masks.open(prefix + ".draft_cache.mask", std::ios::out | std::ios::binary | std::ios::trunc);
@@ -54,12 +78,15 @@ struct eagle_draft_cache_capture {
         if (index) {
             index << "{\"schema\":\"eagle_draft_cache_v1\",\"event\":\"capture_end\",\"executions\":"
                   << executions << ",\"rows\":" << row_count << ",\"row_bytes\":" << row_bytes
-                  << ",\"mask_bytes\":" << mask_bytes << "}\n";
+                  << ",\"mask_bytes\":" << mask_bytes << ",\"max_rows\":" << max_rows
+                  << ",\"max_bytes\":" << max_bytes << "}\n";
         }
     }
 
     void capture(const llama_ubatch & ubatch, const llama_kv_cache_context & mctx, const llm_graph_result & res) {
-        const auto written = mctx.capture_current_f16_rows(ubatch);
+        std::string cache_buffer_type;
+        bool cache_buffer_is_host = false;
+        const auto written = mctx.capture_current_f16_rows(ubatch, cache_buffer_type, cache_buffer_is_host);
         if (written.empty() || row_count + written.size() > max_rows) {
             throw std::runtime_error("EAGLE draft cache capture row limit exceeded");
         }
@@ -71,11 +98,11 @@ struct eagle_draft_cache_capture {
                 mask = attn->self_kq_mask;
             }
         }
-        if (!mask || !mask->buffer || !ggml_backend_buffer_is_host(mask->buffer) ||
+        if (!mask || !capture_buffer_supported(mask->buffer) ||
                 (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
                 mask->ne[1] != ubatch.n_tokens || mask->ne[2] != 1 || mask->ne[3] != 1 ||
                 !ggml_is_contiguous(mask)) {
-            throw std::runtime_error("EAGLE draft cache capture requires one host causal mask");
+            throw std::runtime_error("EAGLE draft cache capture requires one host or CUDA causal mask");
         }
         const uint64_t nmask = ggml_nbytes(mask);
         const uint64_t nrows = written.size() * 4096ull;
@@ -87,6 +114,11 @@ struct eagle_draft_cache_capture {
         masks.write((const char *) mask_data.data(), mask_data.size());
         index << "{\"schema\":\"eagle_draft_cache_v1\",\"event\":\"execution\",\"execution\":"
               << executions << ",\"n_tokens\":" << written.size() << ",\"n_kv\":" << mask->ne[0]
+              << ",\"cache_buffer_type\":\"" << cache_buffer_type << "\",\"cache_buffer_is_host\":"
+              << (cache_buffer_is_host ? "true" : "false")
+              << ",\"mask_buffer_type\":\""
+              << ggml_backend_buft_name(ggml_backend_buffer_get_type(mask->buffer))
+              << "\",\"mask_buffer_is_host\":" << (ggml_backend_buffer_is_host(mask->buffer) ? "true" : "false")
               << ",\"mask_dtype\":\"" << ggml_type_name(mask->type) << "\",\"mask_offset\":"
               << mask_bytes << ",\"mask_bytes\":" << nmask << "}\n";
         mask_bytes += nmask;

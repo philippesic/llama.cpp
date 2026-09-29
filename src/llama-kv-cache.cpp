@@ -2759,12 +2759,12 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 std::vector<llama_kv_cache_context::captured_f16_row> llama_kv_cache_context::capture_current_f16_rows(
-        const llama_ubatch & ubatch) const {
+        const llama_ubatch & ubatch, std::string & buffer_type, bool & buffer_is_host) const {
     if (ubatches.empty() || &ubatch != &ubatches[i_cur] || !ubatch.token || !ubatch.pos ||
             ubatch.n_seqs_unq != 1 || sinfos[i_cur].n_stream() != 1 ||
             kv->type_k() != GGML_TYPE_F16 || kv->type_v() != GGML_TYPE_F16 ||
             kv->get_layer_ids() != std::vector<uint32_t>{0}) {
-        throw std::runtime_error("EAGLE cache capture requires one F16 CPU draft layer and one sequence");
+        throw std::runtime_error("EAGLE cache capture requires one F16 draft layer and one sequence");
     }
 
     const auto & sinfo = sinfos[i_cur];
@@ -2773,15 +2773,23 @@ std::vector<llama_kv_cache_context::captured_f16_row> llama_kv_cache_context::ca
     }
     const auto * k = kv->get_k_storage(0);
     const auto * v = kv->get_v_storage(0);
-    if (!k || !v || !k->buffer || !v->buffer ||
-            !ggml_backend_buffer_is_host(k->buffer) || !ggml_backend_buffer_is_host(v->buffer) ||
+    const auto supports_capture_buffer = [](const ggml_tensor * tensor) {
+        if (!tensor || !tensor->buffer) return false;
+        if (ggml_backend_buffer_is_host(tensor->buffer)) return true;
+        const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer));
+        return name && std::strncmp(name, "CUDA", 4) == 0;
+    };
+    if (!k || !v || !supports_capture_buffer(k) || !supports_capture_buffer(v) ||
+            ggml_backend_buffer_get_type(k->buffer) != ggml_backend_buffer_get_type(v->buffer) ||
             k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
             k->ne[0] != 1024 || v->ne[0] != 1024 ||
             k->nb[1] != 2048 || v->nb[1] != 2048 ||
             k->nb[2] != k->nb[1]*kv->get_size() ||
             v->nb[2] != v->nb[1]*kv->get_size()) {
-        throw std::runtime_error("EAGLE cache capture requires contiguous host F16 K/V rows");
+        throw std::runtime_error("EAGLE cache capture requires contiguous host or CUDA F16 K/V rows");
     }
+    buffer_type = ggml_backend_buft_name(ggml_backend_buffer_get_type(k->buffer));
+    buffer_is_host = ggml_backend_buffer_is_host(k->buffer);
 
     std::vector<captured_f16_row> rows;
     rows.reserve(ubatch.n_tokens);

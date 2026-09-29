@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -403,8 +404,9 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
-    // Diagnostic only: read the rows just written by the current CPU ubatch.
-    std::vector<captured_f16_row> capture_current_f16_rows(const llama_ubatch & ubatch) const;
+    // Diagnostic only: read the rows just written by the current ubatch.
+    std::vector<captured_f16_row> capture_current_f16_rows(
+            const llama_ubatch & ubatch, std::string & buffer_type, bool & buffer_is_host) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
