@@ -309,6 +309,8 @@ private:
     uint64_t eagle3_state_generation = 0;
     bool eagle3_state_valid = false;
     bool eagle3_device_input = false;
+    bool eagle3_input_source_logged = false;
+    bool eagle3_input_fallback_logged = false;
     llama_pos eagle3_state_pos = -1;
     llama_seq_id eagle3_state_seq = -1;
     std::vector<llama_token> eagle3_draft_ids;

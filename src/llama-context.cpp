@@ -1749,11 +1749,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (eagle3_device_input) {
             auto * input = res->t_inp_embd;
             GGML_ASSERT(input && eagle3_state_valid && input->ne[0] == eagle3_state_tensor->ne[0] && input->ne[1] == 1);
-            auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), input);
-            if (backend == eagle3_state_backend) {
-                ggml_backend_tensor_copy_async(backend, backend, eagle3_state_tensor, input);
+            static const bool host_input = [] {
+                const char * value = getenv("GGML_EAGLE_DEVICE_HOST_INPUT");
+                return value && strcmp(value, "1") == 0;
+            }();
+            const char * reason = "diagnostic host input";
+            if (!host_input && ggml_backend_sched_set_input_source(sched.get(), input,
+                    eagle3_state_backend, eagle3_state_tensor, &reason)) {
+                if (!eagle3_input_source_logged) {
+                    LLAMA_LOG_INFO("EAGLE resident input: existing scheduler copy backend=%s (ordinary placement)\n",
+                        ggml_backend_name(eagle3_state_backend));
+                    eagle3_input_source_logged = true;
+                }
+                LLAMA_LOG_DEBUG("EAGLE resident input copy: position=%d backend=%s\n",
+                    ubatch.pos[0], ggml_backend_name(eagle3_state_backend));
             } else {
-                LLAMA_LOG_WARN("EAGLE resident state transfer fallback: input backend differs\n");
+                if (host_input || !eagle3_input_fallback_logged) {
+                    LLAMA_LOG_WARN("EAGLE resident state transfer fallback: %s\n", reason);
+                    eagle3_input_fallback_logged = true;
+                }
                 std::vector<float> host(input->ne[0]);
                 ggml_backend_synchronize(eagle3_state_backend);
                 ggml_backend_tensor_get(eagle3_state_tensor, host.data(), 0, ggml_nbytes(eagle3_state_tensor));
@@ -2937,12 +2951,6 @@ ggml_status llama_context::graph_compute(
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    // Diagnostic control: retain resident capture/recurrence but use the
-    // scheduler's ordinary input placement and its synchronized host fallback.
-    static const bool eagle3_device_host_input = [] {
-        const char * value = getenv("GGML_EAGLE_DEVICE_HOST_INPUT");
-        return value && strcmp(value, "1") == 0;
-    }();
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
@@ -2953,15 +2961,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
-        if (cparams.eagle3_device_state && !eagle3_device_host_input &&
-                model.arch == LLM_ARCH_EAGLE3 && strcmp(name, "inp_g_embeddings") == 0) {
-            for (const auto & backend : backends) {
-                if (ggml_backend_get_device(backend.get()) == model.dev_layer(0)) {
-                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
-                    break;
-                }
-            }
-        }
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {

@@ -5,6 +5,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <vector>
@@ -22,6 +23,11 @@ struct dummy_backend_context {
     ggml_backend_device                device;
     ggml_backend                       backend;
     std::vector<ggml_backend_buffer_t> buffers;
+    int input_source_copies = 0;
+    int ordinary_sets = 0;
+    const ggml_tensor * last_copy_source = nullptr;
+    ggml_tensor * last_copy_destination = nullptr;
+    ggml_status compute_status = GGML_STATUS_SUCCESS;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -79,7 +85,9 @@ static ggml_status dummy_backend_buffer_init_tensor(ggml_backend_buffer_t, ggml_
 
 static void dummy_backend_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor *, uint8_t, size_t, size_t) {}
 
-static void dummy_backend_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t) {}
+static void dummy_backend_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor *, const void *, size_t, size_t) {
+    ++((dummy_backend_context *) buffer->context)->ordinary_sets;
+}
 
 static void dummy_backend_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor *, void *, size_t, size_t) {}
 
@@ -103,6 +111,20 @@ static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_b
 
 static const char * dummy_backend_get_name(ggml_backend_t) {
     return "dummy_backend";
+}
+
+static bool dummy_backend_copy_async(ggml_backend_t src_backend, ggml_backend_t dst_backend,
+        const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_ASSERT(src_backend == dst_backend);
+    auto * ctx = (dummy_backend_context *) dst_backend->context;
+    ++ctx->input_source_copies;
+    ctx->last_copy_source = src;
+    ctx->last_copy_destination = dst;
+    return true;
+}
+
+static ggml_status dummy_backend_compute(ggml_backend_t backend, ggml_cgraph *) {
+    return ((dummy_backend_context *) backend->context)->compute_status;
 }
 
 // dummy_backend
@@ -650,6 +672,96 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+// Routing and admission tests use dummy separated buffer types, not GPU computation.
+static void test_scheduler_input_source(bool cpu_consumer, bool input_view, bool pipeline, bool mixed_backend = false) {
+    auto [ctx, graph, ctx_ptr] = make_context();
+    auto [source_ctx, source_graph, source_ctx_ptr] = make_context();
+    GGML_UNUSED(source_graph);
+    auto device = dummy_backend_init(SIZE_MAX);
+    auto other_device = dummy_backend_init(SIZE_MAX);
+    auto host = dummy_backend_init(SIZE_MAX);
+    device.context->backend.iface.cpy_tensor_async = dummy_backend_copy_async;
+    device.context->backend.iface.graph_compute = dummy_backend_compute;
+    host.context->backend.iface.graph_compute = dummy_backend_compute;
+    ggml_backend_t backends[] = {&device.context->backend, &other_device.context->backend, &host.context->backend};
+    ggml_backend_buffer_type_t bufts[] = {&device.buffer_type, &other_device.buffer_type, &host.buffer_type};
+    auto * input = make_input_with_size(ctx, 16);
+    auto * operand = input_view ? ggml_view_tensor(ctx, input) : input;
+    auto * output = ggml_scale(ctx, operand, 2.0f);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    auto * host_output = cpu_consumer ? ggml_scale(ctx, input, 3.0f) : nullptr;
+    if (host_output) {
+        ggml_set_output(host_output);
+        ggml_build_forward_expand(graph, host_output);
+    }
+    auto * other_output = mixed_backend ? ggml_scale(ctx, input, 4.0f) : nullptr;
+    if (other_output) {
+        ggml_set_output(other_output);
+        ggml_build_forward_expand(graph, other_output);
+    }
+    auto * source = ggml_new_tensor_1d(source_ctx, GGML_TYPE_F32, 4);
+    ggml_backend_buffer_ptr source_buffer(ggml_backend_alloc_ctx_tensors_from_buft(source_ctx, bufts[0]));
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 3, 32, pipeline, false));
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, backends[0]);
+    if (input_view) ggml_backend_sched_set_tensor_backend(sched.get(), operand, backends[2]);
+    if (host_output) ggml_backend_sched_set_tensor_backend(sched.get(), host_output, backends[2]);
+    if (other_output) ggml_backend_sched_set_tensor_backend(sched.get(), other_output, backends[1]);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    const char * reason = nullptr;
+    if (cpu_consumer || input_view || pipeline || mixed_backend) {
+        GGML_ASSERT(!ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, &reason));
+        GGML_ASSERT(reason);
+        if (cpu_consumer) GGML_ASSERT(strcmp(reason, "direct CPU input consumer") == 0);
+        if (mixed_backend) GGML_ASSERT(strcmp(reason, "input copy required on another backend") == 0);
+        GGML_ASSERT(device.context->input_source_copies == 0);
+        return;
+    }
+    auto * original_copy = output->src[0];
+    GGML_ASSERT(original_copy != input);
+    const int original_splits = ggml_backend_sched_get_n_splits(sched.get());
+    GGML_ASSERT(ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, &reason));
+    GGML_ASSERT(!reason);
+    GGML_ASSERT(output->src[0] == original_copy);
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == original_splits);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(device.context->input_source_copies == 1);
+    GGML_ASSERT(device.context->ordinary_sets == 0);
+    GGML_ASSERT(device.context->last_copy_source == source);
+    GGML_ASSERT(device.context->last_copy_destination == original_copy);
+    // Registration is one invocation: the next call uses the ordinary host copy.
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(device.context->input_source_copies == 1);
+    GGML_ASSERT(device.context->ordinary_sets == 1);
+    // A failed compute also clears registration.
+    GGML_ASSERT(ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, nullptr));
+    device.context->compute_status = GGML_STATUS_FAILED;
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_FAILED);
+    GGML_ASSERT(device.context->input_source_copies == 2);
+    device.context->compute_status = GGML_STATUS_SUCCESS;
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(device.context->input_source_copies == 2);
+    GGML_ASSERT(device.context->ordinary_sets == 2);
+    // Graph storage and evaluation callbacks cannot be supplied as an override.
+    GGML_ASSERT(!ggml_backend_sched_set_input_source(sched.get(), input, backends[0], original_copy, &reason));
+    GGML_ASSERT(strcmp(reason, "source uses graph allocation") == 0);
+    ggml_backend_sched_set_eval_callback(sched.get(), [](ggml_tensor *, bool, void *) { return true; }, nullptr);
+    GGML_ASSERT(!ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, &reason));
+    ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
+    // Changing a callback after admission must fail before consuming stale host input.
+    GGML_ASSERT(ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, nullptr));
+    ggml_backend_sched_set_eval_callback(sched.get(), [](ggml_tensor *, bool, void *) { return true; }, nullptr);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_FAILED);
+    ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(device.context->input_source_copies == 2);
+    GGML_ASSERT(device.context->ordinary_sets == 3);
+    // Reset discards the descriptor before the graph's allocation goes away.
+    GGML_ASSERT(ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, nullptr));
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(!ggml_backend_sched_set_input_source(sched.get(), input, backends[0], source, &reason));
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -672,5 +784,10 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_input_source_routing_and_lifetime", []() { test_scheduler_input_source(false, false, false); });
+    run("test_input_source_cpu_consumer", []() { test_scheduler_input_source(true, false, false); });
+    run("test_input_source_alias", []() { test_scheduler_input_source(false, true, false); });
+    run("test_input_source_pipeline", []() { test_scheduler_input_source(false, false, true); });
+    run("test_input_source_mixed_backend", []() { test_scheduler_input_source(false, false, false, true); });
     return 0;
 }

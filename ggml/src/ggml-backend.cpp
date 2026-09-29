@@ -826,6 +826,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    struct ggml_tensor * input_source_logical;
+    const struct ggml_tensor * input_source_tensor;
+    ggml_backend_t input_source_backend;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1681,7 +1685,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (input == sched->input_source_logical) {
+                    ggml_backend_tensor_copy_async(sched->input_source_backend, split_backend,
+                        sched->input_source_tensor, input_cpy);
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1948,6 +1957,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    sched->input_source_logical = nullptr;
+    sched->input_source_tensor = nullptr;
+    sched->input_source_backend = nullptr;
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2016,6 +2028,17 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    struct clear_input_source {
+        ggml_backend_sched_t sched;
+        ~clear_input_source() {
+            sched->input_source_logical = nullptr;
+            sched->input_source_tensor = nullptr;
+            sched->input_source_backend = nullptr;
+        }
+    } clear{sched};
+    if (sched->input_source_logical && sched->callback_eval) {
+        return GGML_STATUS_FAILED;
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -2027,6 +2050,90 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
+}
+
+bool ggml_backend_sched_set_input_source(ggml_backend_sched_t sched, ggml_tensor * logical_input,
+        ggml_backend_t source_backend, const ggml_tensor * source, const char ** rejection_reason) {
+    GGML_ASSERT(sched);
+    sched->input_source_logical = nullptr;
+    sched->input_source_tensor = nullptr;
+    sched->input_source_backend = nullptr;
+    if (rejection_reason) *rejection_reason = nullptr;
+    auto reject = [&](const char * reason) {
+        if (rejection_reason) *rejection_reason = reason;
+        return false;
+    };
+    if (!sched->is_alloc || sched->n_copies != 1 || sched->callback_eval) {
+        return reject("graph not allocated, pipeline copies or evaluation callback");
+    }
+    if (!logical_input || !source || !source_backend || logical_input == source ||
+            !(logical_input->flags & GGML_TENSOR_FLAG_INPUT) || logical_input->op != GGML_OP_NONE ||
+            logical_input->view_src || source->view_src || !source->buffer || !source->data ||
+            logical_input->type != GGML_TYPE_F32 || logical_input->ne[1] != 1 ||
+            logical_input->ne[2] != 1 || logical_input->ne[3] != 1 ||
+            !ggml_is_contiguous(logical_input) || !ggml_is_contiguous(source) ||
+            !ggml_are_same_layout(logical_input, source)) {
+        return reject("requires distinct contiguous F32 input/source rows without views");
+    }
+    const int source_id = ggml_backend_sched_backend_id(sched, source_backend);
+    if (source_id < 0 || source_id == sched->n_backends - 1 ||
+            ggml_backend_sched_get_tensor_backend(sched, logical_input) != sched->backends[sched->n_backends - 1] ||
+            !ggml_backend_supports_buft(source_backend, ggml_backend_buffer_get_type(source->buffer))) {
+        return reject("requires ordinary CPU input and a supported other source backend");
+    }
+    // The source must live outside graph allocation, including allocator-only dependencies.
+    for (int i = 0; i < sched->graph.n_nodes; ++i) {
+        if (sched->graph.nodes[i]->buffer == source->buffer) return reject("source uses graph allocation");
+    }
+    for (int i = 0; i < sched->graph.n_leafs; ++i) {
+        if (sched->graph.leafs[i]->buffer == source->buffer) return reject("source uses graph allocation");
+    }
+    std::vector<ggml_tensor *> copies;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        auto & split = sched->splits[i];
+        for (int j = 0; j < split.n_inputs; ++j) {
+            if (split.inputs[j] != logical_input) continue;
+            if (split.backend_id != source_id) return reject("input copy required on another backend");
+            auto * copy = tensor_copy(logical_input, split.backend_id, 0);
+            if (!copy || copy->view_src || !copy->buffer || !ggml_are_same_layout(copy, source)) {
+                return reject("missing or incompatible existing input copy");
+            }
+            copies.push_back(copy);
+        }
+    }
+    // Inspect executable split graphs, not the allocator's synthetic input dependencies.
+    auto is_copy = [&](const ggml_tensor * tensor) {
+        return std::find(copies.begin(), copies.end(), tensor) != copies.end();
+    };
+    auto aliases_input = [&](const ggml_tensor * tensor) {
+        for (auto * view = tensor ? tensor->view_src : nullptr; view; view = view->view_src) {
+            if (view == logical_input || is_copy(view)) return true;
+        }
+        return false;
+    };
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto & split = sched->splits[i];
+        for (int j = 0; j < split.n_inputs; ++j) {
+            if (is_copy(split.inputs[j]) && split.backend_id != source_id) {
+                return reject("input copy consumed on another backend");
+            }
+            if (aliases_input(split.inputs[j])) return reject("input alias requires ordinary copy");
+        }
+        for (int j = 0; j < split.graph.n_nodes; ++j) {
+            const auto * node = split.graph.nodes[j];
+            if (aliases_input(node)) return reject("input alias in executable graph");
+            for (const auto * src : node->src) {
+                if (src == logical_input) return reject("direct CPU input consumer");
+                if (aliases_input(src)) return reject("input alias consumer");
+                if (is_copy(src) && split.backend_id != source_id) return reject("input consumer on another backend");
+            }
+        }
+    }
+    if (copies.empty()) return reject("no existing input copy destination");
+    sched->input_source_logical = logical_input;
+    sched->input_source_tensor = source;
+    sched->input_source_backend = source_backend;
+    return true;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

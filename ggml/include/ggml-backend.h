@@ -345,6 +345,18 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // Supply one external contiguous F32 row to an already allocated graph's existing
+    // input copies, without changing placement or graph edges. All consumers must use
+    // copies on source_backend; direct consumers, aliases, callbacks and pipeline copies
+    // are rejected. The source allocation must not alias graph storage and must remain
+    // valid until queued work completes. Changing a callback after registration fails compute.
+    // Registration is cleared on reset and after the next compute, including failure.
+    // A rejection clears registration and optionally returns a static reason string.
+    GGML_API bool ggml_backend_sched_set_input_source(
+        ggml_backend_sched_t sched, struct ggml_tensor * logical_input,
+        ggml_backend_t source_backend, const struct ggml_tensor * source,
+        const char ** rejection_reason);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
