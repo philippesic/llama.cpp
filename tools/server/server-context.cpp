@@ -71,9 +71,11 @@ struct draft_graph_capture_state {
     std::ofstream node_probe;
     uint64_t max_executions = 4096;
     uint64_t max_bytes = 512ull * 1024 * 1024;
+    std::string scope = "all";
     uint64_t bytes_reserved = 0;
     uint64_t bytes_written = 0;
     uint64_t tensor_rows_written = 0;
+    uint64_t result_output_markers = 0;
     uint64_t next_execution_ordinal = 0;
     uint64_t next_group_order = 0;
     uint64_t decoder_execution = 0;
@@ -97,7 +99,17 @@ struct draft_graph_capture_state {
     void note_node(const char * name, bool evaluated);
 };
 
-static bool draft_graph_tensor_name(const char * name) {
+static bool draft_graph_tensor_name(const char * name, const std::string & scope) {
+    if (scope == "cache") {
+        static const std::array<const char *, 8> cache_names = {
+            "fc_out", "inp_embd", "embd_norm-0", "Kcur_rope-0", "Vcur-0",
+            "eagle3_prenorm-0", "result_norm", "result_output",
+        };
+        for (const char * expected : cache_names) {
+            if (std::strcmp(name, expected) == 0) return true;
+        }
+        return false;
+    }
     static const std::array<const char *, 21> names = {
         "fc_out", "inp_embd", "embd_norm-0", "g_norm-0", "concat_embd-0",
         "Qcur-0", "Kcur-0", "Vcur-0", "Qcur_rope-0", "Kcur_rope-0",
@@ -281,6 +293,7 @@ void draft_graph_capture_state::finish() noexcept {
         const bool incomplete = pending_input || decoder_active;
         index << json{
             {"schema", "eagle_draft_graph_v1"}, {"event", "capture_end"},
+            {"scope", scope}, {"result_output_markers", result_output_markers},
             {"status", incomplete ? "incomplete" : "complete"},
             {"decoder_groups", decoder_execution}, {"encoder_groups", encoder_execution},
             {"execution_count", next_execution_ordinal}, {"tensor_rows", tensor_rows_written},
@@ -318,13 +331,23 @@ bool draft_graph_capture_state::callback(struct ggml_tensor * tensor, bool ask, 
     auto & state = *static_cast<draft_graph_capture_state *>(user_data);
     if (ask) {
         if (state.node_probe.is_open()) state.note_node(tensor->name, false);
-        return draft_graph_tensor_name(tensor->name);
+        return draft_graph_tensor_name(tensor->name, state.scope);
     }
 
     if (state.finished) throw std::runtime_error("EAGLE draft graph callback invoked after capture finalization");
     if (state.node_probe.is_open()) state.note_node(tensor->name, true);
     const bool is_head_norm = std::strcmp(tensor->name, "result_norm") == 0;
     const bool is_head_output = std::strcmp(tensor->name, "result_output") == 0;
+    if (state.scope == "cache" && is_head_output) {
+        if (!state.decoder_active || !state.pending_result_norm) {
+            throw std::runtime_error("EAGLE result_output marker appeared without a pending result_norm");
+        }
+        state.flush_prenorm(false);
+        state.flush_result_norm(true);
+        state.decoder_active = false;
+        state.result_output_markers++;
+        return true;
+    }
     state.flush_prenorm(!(is_head_norm || is_head_output));
     state.flush_result_norm(!is_head_output);
 
@@ -423,7 +446,10 @@ bool draft_graph_capture_state::callback(struct ggml_tensor * tensor, bool ask, 
     }
     entry.group_end = entry.tensor_name == "result_output";
     draft_graph_write_entry(entry, state);
-    if (entry.tensor_name == "result_output") state.decoder_active = false;
+    if (entry.tensor_name == "result_output") {
+        state.decoder_active = false;
+        state.result_output_markers++;
+    }
     return true;
 }
 
@@ -2040,6 +2066,13 @@ private:
                         throw std::runtime_error("EAGLE_CAPTURE_DRAFT_GRAPH requires EAGLE_CAPTURE_PREFIX");
                     }
                     draft_graph_capture.reset(new draft_graph_capture_state());
+                    const char * capture_scope = std::getenv("EAGLE_CAPTURE_DRAFT_GRAPH_SCOPE");
+                    if (capture_scope != nullptr) {
+                        if (std::strcmp(capture_scope, "all") != 0 && std::strcmp(capture_scope, "cache") != 0) {
+                            throw std::runtime_error("EAGLE_CAPTURE_DRAFT_GRAPH_SCOPE must be all or cache");
+                        }
+                        draft_graph_capture->scope = capture_scope;
+                    }
                     draft_graph_capture->max_executions = draft_graph_env_limit(
                             "EAGLE_CAPTURE_DRAFT_GRAPH_MAX_EXECUTIONS", draft_graph_capture->max_executions);
                     draft_graph_capture->max_bytes = draft_graph_env_limit(
@@ -2064,7 +2097,8 @@ private:
                     }
                     params_dft.cb_eval = draft_graph_capture_state::callback;
                     params_dft.cb_eval_user_data = draft_graph_capture.get();
-                    SRV_INF("capturing bounded host/CUDA EAGLE draft graph values to %s.draft_graph.*\n", prefix);
+                    SRV_INF("capturing bounded host/CUDA EAGLE draft graph scope=%s to %s.draft_graph.*\n",
+                            draft_graph_capture->scope.c_str(), prefix);
                 }
 
                 // progress callback
