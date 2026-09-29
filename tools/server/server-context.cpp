@@ -70,7 +70,7 @@ struct draft_graph_capture_state {
     std::ofstream data;
     std::ofstream node_probe;
     uint64_t max_executions = 4096;
-    uint64_t max_bytes = 256ull * 1024 * 1024;
+    uint64_t max_bytes = 512ull * 1024 * 1024;
     uint64_t bytes_reserved = 0;
     uint64_t bytes_written = 0;
     uint64_t tensor_rows_written = 0;
@@ -125,8 +125,13 @@ static uint64_t draft_graph_env_limit(const char * name, uint64_t fallback) {
 
 static draft_graph_capture_entry draft_graph_copy_tensor(struct ggml_tensor * tensor,
         draft_graph_capture_state & state) {
-    if (tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer)) {
-        throw std::runtime_error("draft graph capture requires host-resident CPU tensors");
+    ggml_backend_buffer_t buffer = tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
+    const bool device_tensor = buffer != nullptr && !ggml_backend_buffer_is_host(buffer);
+    if (device_tensor) {
+        const char * buffer_type = ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer));
+        if (buffer_type == nullptr || std::strncmp(buffer_type, "CUDA", 4) != 0) {
+            throw std::runtime_error("draft graph capture supports host or CUDA tensors only");
+        }
     }
     draft_graph_capture_entry entry;
     entry.tensor_name = tensor->name;
@@ -146,8 +151,51 @@ static draft_graph_capture_entry draft_graph_copy_tensor(struct ggml_tensor * te
     }
     state.bytes_reserved += bytes;
     entry.values.reserve(entry.count);
+    if (!device_tensor) {
+        for (uint64_t i = 0; i < entry.count; ++i) {
+            entry.values.push_back(ggml_get_f32_1d(tensor, (int) i));
+        }
+        return entry;
+    }
+
+    if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) {
+        throw std::runtime_error("CUDA draft graph capture supports F32 and F16 tensors only");
+    }
+    const size_t physical_bytes = ggml_nbytes(tensor);
+    if (physical_bytes == 0 || physical_bytes > state.max_bytes) {
+        throw std::runtime_error("CUDA draft graph tensor exceeds the bounded readback size");
+    }
+    const size_t element_bytes = tensor->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
+    std::vector<uint8_t> raw(physical_bytes);
+    // ggml_backend_tensor_get is a blocking readback for CUDA buffers: the
+    // backend synchronizes its copy stream before returning to this callback.
+    ggml_backend_tensor_get(tensor, raw.data(), 0, physical_bytes);
     for (uint64_t i = 0; i < entry.count; ++i) {
-        entry.values.push_back(ggml_get_f32_1d(tensor, (int) i));
+        uint64_t remainder = i;
+        size_t offset = 0;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0) {
+                throw std::runtime_error("CUDA draft graph tensor has an invalid dimension");
+            }
+            const uint64_t coordinate = remainder % (uint64_t) tensor->ne[d];
+            remainder /= (uint64_t) tensor->ne[d];
+            if (tensor->nb[d] != 0 && coordinate > (physical_bytes - offset) / tensor->nb[d]) {
+                throw std::runtime_error("CUDA draft graph tensor stride exceeds its readback buffer");
+            }
+            offset += coordinate * tensor->nb[d];
+        }
+        if (offset > physical_bytes || element_bytes > physical_bytes - offset) {
+            throw std::runtime_error("CUDA draft graph tensor element exceeds its readback buffer");
+        }
+        if (tensor->type == GGML_TYPE_F32) {
+            float value;
+            std::memcpy(&value, raw.data() + offset, sizeof(value));
+            entry.values.push_back(value);
+        } else {
+            ggml_fp16_t value;
+            std::memcpy(&value, raw.data() + offset, sizeof(value));
+            entry.values.push_back(ggml_fp16_to_fp32(value));
+        }
     }
     return entry;
 }
@@ -2016,7 +2064,7 @@ private:
                     }
                     params_dft.cb_eval = draft_graph_capture_state::callback;
                     params_dft.cb_eval_user_data = draft_graph_capture.get();
-                    SRV_INF("capturing bounded CPU EAGLE draft graph values to %s.draft_graph.*\n", prefix);
+                    SRV_INF("capturing bounded host/CUDA EAGLE draft graph values to %s.draft_graph.*\n", prefix);
                 }
 
                 // progress callback
