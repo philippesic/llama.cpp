@@ -295,6 +295,27 @@ static void w1ax_capture_activations(
     GGML_ASSERT(fclose(sidecar) == 0);
 }
 
+void ggml_cuda_w1ax_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * acts = dst->src[0];
+    const int bits = ggml_get_op_params_i32(dst, 0);
+    const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
+    uint32_t * data = (uint32_t *) dst->data;
+    float * scales = (float *) (data + layout.scale_offset);
+    GGML_ASSERT(bits == 1 || bits == 4 || bits == 8);
+    GGML_ASSERT(n <= INT_MAX);
+    cudaStream_t stream = ctx.stream();
+    if (bits == 1) {
+        w1a1_pack_activations<<<dim3((unsigned) n), 256, 0, stream>>>(
+                (const float *) acts->data, k, words, n, data, scales);
+    } else {
+        if (layout.codes_words*4 > k*n) CUDA_CHECK(cudaMemsetAsync((int8_t *) data + k*n, 0, layout.codes_words*4 - k*n, stream));
+        w1ax_quantize<<<dim3((unsigned) n), 256, 0, stream>>>(
+                (const float *) acts->data, k, words, bits, (int8_t *) data, data + layout.codes_words, scales);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * weights = dst->src[0];
     const ggml_tensor * scales  = dst->src[1];
@@ -350,37 +371,47 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    ggml_cuda_pool_alloc<float> act_scales(ctx.pool(), n);
+    const ggml_tensor * shared = dst->src[3];
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
+    ggml_cuda_pool_alloc<float> act_scales(ctx.pool());
+    const float * scale_ptr = shared ? (const float *) ((const uint32_t *) shared->data + layout.scale_offset) : act_scales.alloc(n);
     if (bits == 4 || bits == 8) {
         static const bool check_integer_dots = getenv("GGML_W1AX_ASSERT_INT_DOT") &&
             strcmp(getenv("GGML_W1AX_ASSERT_INT_DOT"), "0") != 0;
-        ggml_cuda_pool_alloc<int8_t> codes(ctx.pool(), (size_t) n*k);
-        ggml_cuda_pool_alloc<uint32_t> planes(ctx.pool(), bits == 4 ? (size_t) n*words*4 : 1);
+        ggml_cuda_pool_alloc<int8_t> codes(ctx.pool());
+        ggml_cuda_pool_alloc<uint32_t> planes(ctx.pool());
+        const int8_t * code_ptr = shared ? (const int8_t *) shared->data : codes.alloc((size_t) n*k);
+        const uint32_t * plane_ptr = shared ? (const uint32_t *) shared->data + layout.codes_words : planes.alloc(bits == 4 ? (size_t) n*words*4 : 1);
         ggml_cuda_pool_alloc<int32_t> raw_dots(ctx.pool(), check_integer_dots ? (size_t) n*m : 1);
-        w1ax_quantize<<<dim3(token_blocks), 256, 0, stream>>>(
-                (const float *) acts->data, k, words, bits, codes.ptr, planes.ptr, act_scales.ptr);
-        CUDA_CHECK(cudaGetLastError());
+        if (!shared) {
+            w1ax_quantize<<<dim3(token_blocks), 256, 0, stream>>>(
+                    (const float *) acts->data, k, words, bits, codes.ptr, planes.ptr, act_scales.ptr);
+            CUDA_CHECK(cudaGetLastError());
+        }
         w1ax_integer_dot<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
-                codes.ptr, planes.ptr, act_scales.ptr, m, k, words, bits, bitserial, (float *) dst->data,
+                code_ptr, plane_ptr, scale_ptr, m, k, words, bits, bitserial, (float *) dst->data,
                 check_integer_dots ? raw_dots.ptr : nullptr);
         CUDA_CHECK(cudaGetLastError());
         if (check_integer_dots) {
             w1ax_validate_integer_dots<<<dim3((unsigned) ((m*n + 127)/128)), 128, 0, stream>>>(
-                    (const uint32_t *) weights->data, codes.ptr, raw_dots.ptr, m, n, k, words);
+                    (const uint32_t *) weights->data, code_ptr, raw_dots.ptr, m, n, k, words);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         return;
     }
     GGML_ASSERT(bits == 1);
-    ggml_cuda_pool_alloc<uint32_t> packed(ctx.pool(), (size_t) n*words);
-    w1a1_pack_activations<<<dim3(token_blocks), 256, 0, stream>>>(
-            (const float *) acts->data, k, words, n, packed.ptr, act_scales.ptr);
-    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_pool_alloc<uint32_t> packed(ctx.pool());
+    const uint32_t * packed_ptr = shared ? (const uint32_t *) shared->data : packed.alloc((size_t) n*words);
+    if (!shared) {
+        w1a1_pack_activations<<<dim3(token_blocks), 256, 0, stream>>>(
+                (const float *) acts->data, k, words, n, packed.ptr, act_scales.ptr);
+        CUDA_CHECK(cudaGetLastError());
+    }
     w1a1_xor_popc<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
             (const uint32_t *) weights->data, (const float *) scales->data,
-            packed.ptr, act_scales.ptr, m, n, k, words, (float *) dst->data);
+            packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
 }
 

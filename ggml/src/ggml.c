@@ -1100,9 +1100,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "W1A1_MUL_MAT",
+    "W1AX_PACK",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,9 +1217,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "w1a1(X,s,Y)",
+    "w1ax_pack(Y)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3400,6 +3402,31 @@ struct ggml_tensor * ggml_w1ax_mul_mat(
     result->src[2] = activations;
     ggml_set_op_params(result, &logical_k, sizeof(logical_k));
     ggml_set_op_params_i32(result, 2, activation_bits);
+    return result;
+}
+
+struct ggml_tensor * ggml_w1ax_pack(struct ggml_context * ctx, struct ggml_tensor * activations, int32_t bits) {
+    GGML_ASSERT(bits == 1 || bits == 4 || bits == 8);
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 && activations->ne[0] > 0 && activations->ne[1] > 0);
+    GGML_ASSERT(activations->ne[2] == 1 && activations->ne[3] == 1);
+    if (!ggml_is_contiguous(activations)) activations = ggml_cont(ctx, activations);
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(activations->ne[0], activations->ne[1], bits);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.total_words);
+    result->op = GGML_OP_W1AX_PACK;
+    result->src[0] = activations;
+    ggml_set_op_params_i32(result, 0, bits);
+    return result;
+}
+
+struct ggml_tensor * ggml_w1ax_mul_mat_shared(
+        struct ggml_context * ctx, struct ggml_tensor * weights, struct ggml_tensor * scales,
+        struct ggml_tensor * packed, int64_t k, int32_t bits) {
+    GGML_ASSERT(packed->op == GGML_OP_W1AX_PACK && packed->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_get_op_params_i32(packed, 0) == bits && packed->src[0]->ne[0] == k);
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, packed->src[0]->ne[1], bits);
+    GGML_ASSERT(packed->ne[0] == layout.total_words && packed->ne[1] == 1 && ggml_is_contiguous(packed));
+    struct ggml_tensor * result = ggml_w1ax_mul_mat(ctx, weights, scales, packed->src[0], k, bits);
+    result->src[3] = packed;
     return result;
 }
 
@@ -7270,6 +7297,7 @@ static void ggml_compute_backward(
         case GGML_OP_NONE: {
             // noop
         } break;
+        case GGML_OP_W1AX_PACK:
         case GGML_OP_W1A1_MUL_MAT: {
             GGML_ABORT("backward pass for W1A1_MUL_MAT is unsupported");
         }

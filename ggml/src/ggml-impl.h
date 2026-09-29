@@ -28,6 +28,23 @@
 extern "C" {
 #endif
 
+struct ggml_w1ax_pack_layout {
+    int64_t codes_words;
+    int64_t planes_words;
+    int64_t scale_offset;
+    int64_t total_words;
+};
+
+static inline struct ggml_w1ax_pack_layout ggml_w1ax_pack_layout(int64_t k, int64_t n, int bits) {
+    const int64_t words = (k + 31)/32;
+    struct ggml_w1ax_pack_layout layout;
+    layout.codes_words = bits == 1 ? 0 : (k*n + 3)/4;
+    layout.planes_words = bits == 1 ? words*n : bits == 4 ? words*n*4 : 0;
+    layout.scale_offset = layout.codes_words + layout.planes_words;
+    layout.total_words = layout.scale_offset + n;
+    return layout;
+}
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);

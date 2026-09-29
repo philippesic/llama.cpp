@@ -2313,6 +2313,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
+        case GGML_OP_W1AX_PACK:
+            ggml_cuda_w1ax_pack(ctx, dst);
+            break;
         case GGML_OP_W1A1_MUL_MAT:
             ggml_cuda_w1a1_mul_mat(ctx, dst);
             break;
@@ -5336,6 +5339,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
+        case GGML_OP_W1AX_PACK:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_W1A1_MUL_MAT:
             return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&

@@ -602,6 +602,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_W1A1_MUL_MAT,
+        GGML_OP_W1AX_PACK,
 
         GGML_OP_COUNT,
     };
@@ -1500,6 +1501,12 @@ extern "C" {
     // A16 casts each input to FP16; A8/A4 use signed per-token absmax codes.
     // A16 also accepts group-128 F32 scales [ceil(K/128), M]. It sums signed
     // FP16 inputs in F32 per group, then separately multiplies and sums in F32.
+    // Shared A1/A4/A8 token packing. A16 keeps its inside-kernel cast.
+    GGML_API struct ggml_tensor * ggml_w1ax_pack(struct ggml_context * ctx, struct ggml_tensor * activations, int32_t activation_bits);
+    GGML_API struct ggml_tensor * ggml_w1ax_mul_mat_shared(
+            struct ggml_context * ctx, struct ggml_tensor * packed_weights, struct ggml_tensor * weight_scales,
+            struct ggml_tensor * packed_activations, int64_t logical_k, int32_t activation_bits);
+
     GGML_API struct ggml_tensor * ggml_w1ax_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * packed_weights,

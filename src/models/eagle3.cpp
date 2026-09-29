@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <set>
+#include <unordered_map>
 
 static int eagle3_w1ax_activation_bits() {
     const char * value = std::getenv("GGML_W1AX_ACT_BITS");
@@ -415,6 +416,9 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
+    const char * shared_pack_env = std::getenv("GGML_EAGLE_SHARED_PACK");
+    const bool shared_pack = activation_bits != 16 && shared_pack_env && std::string(shared_pack_env) == "1";
+    std::unordered_map<ggml_tensor *, ggml_tensor *> activation_packs;
     auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
         if (!packed) {
             const char * a16 = std::getenv("GGML_EAGLE_DENSE_A16");
@@ -429,7 +433,16 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
             return build_lora_mm(dense, input);
         }
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
+        auto * identity = input;
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+        if (shared_pack) {
+            auto & pack = activation_packs[identity];
+            if (!pack) {
+                pack = ggml_w1ax_pack(ctx0, input, activation_bits);
+                ggml_format_name(pack, "w1ax_pack_for_%s", packed->name);
+            }
+            return ggml_w1ax_mul_mat_shared(ctx0, packed, scales, pack, logical_k, activation_bits);
+        }
         return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
     };
 

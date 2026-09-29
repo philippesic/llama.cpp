@@ -5051,12 +5051,14 @@ struct test_w1a1_mul_mat : public test_case {
     static constexpr int64_t m = 7;
     const int64_t n_tokens;
     const bool grouped;
+    const bool shared;
+    const bool fanout;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false)
-        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false)
+        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout) {}
 
-    std::string vars() override { return VARS_TO_STR5(k, strided, bits, n_tokens, grouped); }
+    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5089,6 +5091,16 @@ struct test_w1a1_mul_mat : public test_case {
         ggml_set_name(w, "w1a1_weights");
         ggml_set_name(s, "w1a1_scales");
         ggml_set_name(a, "w1a1_activations");
+        if (shared) {
+            auto * pack = ggml_w1ax_pack(ctx, a, bits);
+            auto * out = ggml_w1ax_mul_mat_shared(ctx, w, s, pack, k, bits);
+            if (fanout) {
+                auto * second = ggml_w1ax_mul_mat_shared(ctx, w, s, pack, k, bits);
+                auto * third = ggml_w1ax_mul_mat_shared(ctx, w, s, pack, k, bits);
+                out = ggml_add(ctx, ggml_add(ctx, out, second), third);
+            }
+            return out;
+        }
         return ggml_w1ax_mul_mat(ctx, w, s, a, k, bits);
     }
 
@@ -5184,7 +5196,7 @@ struct test_w1a1_mul_mat : public test_case {
     }
 
     double err(const float * lhs, const float * rhs, size_t count) override {
-        if (count != expected.size()) return test_case::err(lhs, rhs, count);
+        if (fanout || count != expected.size()) return test_case::err(lhs, rhs, count);
         double worst = 0.0;
         for (size_t i = 0; i < count; ++i) {
             const double denom = 1.0 + std::abs(double(expected[i]));
@@ -10073,6 +10085,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 3));
         }
         test_cases.emplace_back(new test_w1a1_mul_mat(33, true, bits));
+        if (bits != 16) {
+            for (int64_t k : {1, 33, 2560}) {
+                for (int64_t n : {1, 3}) test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, n, false, true));
+            }
+            test_cases.emplace_back(new test_w1a1_mul_mat(33, true, bits, 3, false, true));
+            test_cases.emplace_back(new test_w1a1_mul_mat(33, false, bits, 3, false, true, true));
+        }
     }
 
     for (ggml_type type_a : all_types) {

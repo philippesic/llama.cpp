@@ -440,6 +440,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_W1AX_PACK:
+            return src0 && src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 && ggml_is_contiguous(src0) && ggml_is_contiguous(op);
         case GGML_OP_W1A1_MUL_MAT: {
             const ggml_tensor * scales = op->src[1];
             const ggml_tensor * acts   = op->src[2];

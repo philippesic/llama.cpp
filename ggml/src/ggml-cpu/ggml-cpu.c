@@ -1478,6 +1478,45 @@ static int ggml_w1a1_popcount32(uint32_t x) {
     return count;
 }
 
+static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * acts = dst->src[0];
+    const int bits = ggml_get_op_params_i32(dst, 0);
+    const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
+    uint32_t * data = (uint32_t *) dst->data;
+    int8_t * codes = (int8_t *) data;
+    uint32_t * planes = data + layout.codes_words;
+    float * scales = (float *) (data + layout.scale_offset);
+    if (params->ith == 0 && bits != 1) memset(codes + k*n, 0, layout.codes_words*4 - k*n);
+    for (int64_t token = params->ith; token < n; token += params->nth) {
+        const float * row = (const float *) acts->data + token*k;
+        if (bits == 1) {
+            double sum = 0.0;
+            memset(planes + token*words, 0, words*sizeof(uint32_t));
+            for (int64_t i = 0; i < k; ++i) {
+                GGML_ASSERT(isfinite(row[i]));
+                sum += (double) fabsf(row[i]);
+                if (row[i] >= 0.0f) planes[token*words + i/32] |= UINT32_C(1) << (i%32);
+            }
+            scales[token] = (float) (sum/(double) k);
+        } else {
+            const int qmax = bits == 8 ? 127 : 7;
+            float absmax = 0.0f;
+            for (int64_t i = 0; i < k; ++i) { GGML_ASSERT(isfinite(row[i])); absmax = fmaxf(absmax, fabsf(row[i])); }
+            scales[token] = absmax/(float) qmax;
+            const float inv = absmax == 0.0f ? 0.0f : (float) qmax/absmax;
+            for (int64_t i = 0; i < k; ++i) codes[token*k + i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(row[i]*inv)));
+            if (bits == 4) {
+                memset(planes + token*words*4, 0, words*4*sizeof(uint32_t));
+                for (int64_t i = 0; i < k; ++i) {
+                    const uint32_t code = (uint8_t) codes[token*k + i] & 15u;
+                    for (int bit = 0; bit < 4; ++bit) planes[(token*words + i/32)*4 + bit] |= ((code >> bit)&1u) << (i%32);
+                }
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_w1a1_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1499,6 +1538,9 @@ static void ggml_compute_forward_w1a1_mul_mat(
     GGML_ASSERT(ggml_is_contiguous(weights) && ggml_is_contiguous(scales));
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
 
+    const struct ggml_tensor * shared = dst->src[3];
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, activation_bits);
+    const float * shared_scales = shared ? (const float *) ((const uint32_t *) shared->data + layout.scale_offset) : NULL;
     uint32_t * signs = (uint32_t *) params->wdata + params->ith * words;
     const int64_t row_begin = m * params->ith / params->nth;
     const int64_t row_end   = m * (params->ith + 1) / params->nth;
@@ -1510,9 +1552,10 @@ static void ggml_compute_forward_w1a1_mul_mat(
     const float * const act_data   = (const float *) acts->data;
     const uint32_t * const weight_data = (const uint32_t *) weights->data;
     float * const output = (float *) dst->data;
-    int8_t * codes = (activation_bits == 4 || activation_bits == 8) ? (int8_t *) malloc((size_t) k) : NULL;
+    int8_t * owned_codes = !shared && (activation_bits == 4 || activation_bits == 8) ? (int8_t *) malloc((size_t) k) : NULL;
+    const int8_t * codes = owned_codes;
     float * half_values = activation_bits == 16 ? (float *) malloc((size_t) k * sizeof(float)) : NULL;
-    GGML_ASSERT((activation_bits != 4 && activation_bits != 8) || codes != NULL);
+    GGML_ASSERT((activation_bits != 4 && activation_bits != 8) || shared || codes != NULL);
     GGML_ASSERT(activation_bits != 16 || half_values != NULL);
 
     for (int64_t token = 0; token < n; ++token) {
@@ -1525,6 +1568,9 @@ static void ggml_compute_forward_w1a1_mul_mat(
                     GGML_ASSERT(isfinite(act[i]));
                     half_values[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(act[i]));
                 }
+            } else if (shared) {
+                act_scale = shared_scales[token];
+                codes = (const int8_t *) shared->data + token*k;
             } else {
                 GGML_ASSERT(activation_bits == 4 || activation_bits == 8);
                 float absmax = 0.0f;
@@ -1535,7 +1581,7 @@ static void ggml_compute_forward_w1a1_mul_mat(
                 act_scale = absmax / (float) qmax;
                 for (int64_t i = 0; i < k; ++i) {
                     const float normalized = absmax == 0.0f ? 0.0f : act[i] * ((float) qmax / absmax);
-                    codes[i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(normalized)));
+                    owned_codes[i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(normalized)));
                 }
             }
             for (int64_t row = row_begin; row < row_end; ++row) {
@@ -1570,16 +1616,18 @@ static void ggml_compute_forward_w1a1_mul_mat(
             continue;
         }
         double abs_sum = 0.0;
-        memset(signs, 0, words * sizeof(uint32_t));
-        for (int64_t i = 0; i < k; ++i) {
-            const float value = act[i];
-            GGML_ASSERT(isfinite(value));
-            abs_sum += (double) fabsf(value);
-            if (value >= 0.0f) {
-                signs[i / 32] |= UINT32_C(1) << (i % 32);
+        if (shared) {
+            signs = (uint32_t *) shared->data + token*words;
+        } else {
+            memset(signs, 0, words * sizeof(uint32_t));
+            for (int64_t i = 0; i < k; ++i) {
+                const float value = act[i];
+                GGML_ASSERT(isfinite(value));
+                abs_sum += (double) fabsf(value);
+                if (value >= 0.0f) signs[i / 32] |= UINT32_C(1) << (i % 32);
             }
         }
-        const float act_scale = (float) (abs_sum / (double) k);
+        const float act_scale = shared ? shared_scales[token] : (float) (abs_sum / (double) k);
         for (int64_t row = row_begin; row < row_end; ++row) {
             const uint32_t * packed = weight_data + row * words;
             int64_t mismatches = 0;
@@ -1593,7 +1641,7 @@ static void ggml_compute_forward_w1a1_mul_mat(
             output[token * m + row] = weighted * act_scale;
         }
     }
-    free(codes);
+    free(owned_codes);
     free(half_values);
 }
 
@@ -1999,6 +2047,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_W1AX_PACK:
+            {
+                ggml_compute_forward_w1ax_pack(params, tensor);
             } break;
         case GGML_OP_W1A1_MUL_MAT:
             {
@@ -2497,6 +2549,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_W1A1_MUL_MAT:
+        case GGML_OP_W1AX_PACK:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
             {
