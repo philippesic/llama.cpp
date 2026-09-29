@@ -2937,6 +2937,12 @@ ggml_status llama_context::graph_compute(
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
+    // Diagnostic control: retain resident capture/recurrence but use the
+    // scheduler's ordinary input placement and its synchronized host fallback.
+    static const bool eagle3_device_host_input = [] {
+        const char * value = getenv("GGML_EAGLE_DEVICE_HOST_INPUT");
+        return value && strcmp(value, "1") == 0;
+    }();
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
@@ -2947,7 +2953,8 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
-        if (cparams.eagle3_device_state && model.arch == LLM_ARCH_EAGLE3 && strcmp(name, "inp_g_embeddings") == 0) {
+        if (cparams.eagle3_device_state && !eagle3_device_host_input &&
+                model.arch == LLM_ARCH_EAGLE3 && strcmp(name, "inp_g_embeddings") == 0) {
             for (const auto & backend : backends) {
                 if (ggml_backend_get_device(backend.get()) == model.dev_layer(0)) {
                     ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
