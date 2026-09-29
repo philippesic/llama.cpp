@@ -872,6 +872,7 @@ struct llm_graph_params {
         }
 
         return
+            cparams.eagle3_compact_logits   == other.cparams.eagle3_compact_logits   &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&

@@ -1,5 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
+#include "../src/llama-model.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -335,10 +337,77 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+
+static void test_eagle_compact() {
+    struct test_model : llama_model {
+        test_model() : llama_model(llama_model_default_params()) {}
+        void load_stats(llama_model_loader &) override {}
+        void load_hparams(llama_model_loader &) override {}
+        void load_vocab(llama_model_loader &) override {}
+        bool load_tensors(llama_model_loader &) override { return true; }
+        void load_arch_hparams(llama_model_loader &) override {}
+        void load_arch_tensors(llama_model_loader &) override {}
+        std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override { return nullptr; }
+    } model;
+    common_params_sampling params;
+    params.seed = 4242;
+    params.top_k = 10;
+    params.samplers = {COMMON_SAMPLER_TYPE_TOP_K};
+    // Bias uses absolute target IDs, including one outside the mapped vocabulary.
+    params.logit_bias = {{84, -INFINITY}, {90, 0.25f}, {111, 7.0f}};
+    common_sampler * compact = common_sampler_init(&model, params);
+    llama_sampler * expanded = llama_sampler_clone(common_sampler_get(compact));
+    std::vector<llama_token> ids;
+    std::vector<float> logits;
+    for (int j = 0; j < 32; ++j) {
+        ids.push_back((31 - j)*3);
+        logits.push_back(j*0.125f - 2.0f);
+    }
+    for (int trial = 0; trial < 8; ++trial) {
+        std::vector<llama_token_data> full(128);
+        for (int j = 0; j < 128; ++j) full[j] = {j, -INFINITY, 0.0f};
+        for (size_t j = 0; j < ids.size(); ++j) full[ids[j]].logit = logits[j];
+        llama_token_data_array full_p = {full.data(), full.size(), -1, false};
+        llama_sampler_apply(expanded, &full_p);
+        GGML_ASSERT(common_sampler_sample_eagle_compact(compact, logits.data(), ids.data(), ids.size()));
+        const auto * short_p = common_sampler_get_candidates(compact, true);
+        GGML_ASSERT(short_p->size == full_p.size);
+        GGML_ASSERT(short_p->selected == full_p.selected);
+        for (size_t j = 0; j < full_p.size; ++j) {
+            GGML_ASSERT(short_p->data[j].id == full_p.data[j].id);
+            GGML_ASSERT(short_p->data[j].p == full_p.data[j].p);
+            GGML_ASSERT(short_p->data[j].logit == full_p.data[j].logit);
+            GGML_ASSERT((short_p->data[j].p < 0.2f) == (full_p.data[j].p < 0.2f));
+        }
+    }
+    llama_sampler * rng_before = llama_sampler_clone(common_sampler_get(compact));
+    auto tied = logits;
+    tied[31] = tied[30];
+    GGML_ASSERT(!common_sampler_sample_eagle_compact(compact, tied.data(), ids.data(), ids.size()));
+    tied[31] = NAN;
+    GGML_ASSERT(!common_sampler_sample_eagle_compact(compact, tied.data(), ids.data(), ids.size()));
+    tied[31] = INFINITY;
+    GGML_ASSERT(!common_sampler_sample_eagle_compact(compact, tied.data(), ids.data(), ids.size()));
+    GGML_ASSERT(!common_sampler_sample_eagle_compact(compact, logits.data(), ids.data(), 10));
+    // Failed compact attempts must not consume the sampling RNG.
+    std::vector<llama_token_data> a, b;
+    for (size_t j = 0; j < ids.size(); ++j) a.push_back({ids[j], logits[j], 0.0f});
+    b = a;
+    llama_token_data_array ap = {a.data(), a.size(), -1, false};
+    llama_token_data_array bp = {b.data(), b.size(), -1, false};
+    llama_sampler_apply(common_sampler_get(compact), &ap);
+    llama_sampler_apply(rng_before, &bp);
+    GGML_ASSERT(ap.selected == bp.selected);
+    common_sampler_free(compact);
+    llama_sampler_free(expanded);
+    llama_sampler_free(rng_before);
+}
+
 int main(void) {
     ggml_time_init();
 
     test_dist_singleton_rng();
+    test_eagle_compact();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

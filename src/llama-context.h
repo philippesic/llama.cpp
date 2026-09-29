@@ -79,6 +79,10 @@ struct llama_context {
 
     enum llama_pooling_type pooling_type() const;
 
+    bool set_eagle3_compact_logits(bool value);
+    const float * get_eagle3_compact_logits_ith(int32_t i, const llama_token ** ids, size_t * count);
+    void expand_eagle3_logits(int64_t row);
+
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
@@ -292,6 +296,8 @@ private:
     llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
+    std::vector<llama_token> eagle3_draft_ids;
+    std::vector<bool> eagle3_logits_expanded;
     buffer_view<float> logits = {nullptr, 0};
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])

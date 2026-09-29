@@ -1048,6 +1048,12 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Opt-in EAGLE3 mapped logits. Full-logit getters still expand on demand.
+    // Enabling requires a unique valid d2t map and no backend samplers.
+    LLAMA_API bool llama_set_eagle3_compact_logits(struct llama_context * ctx, bool value);
+    LLAMA_API const float * llama_get_eagle3_compact_logits_ith(
+            struct llama_context * ctx, int32_t i, const llama_token ** ids, size_t * count);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

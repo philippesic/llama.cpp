@@ -622,7 +622,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cur = eagle_linear(output, nullptr, nullptr, cur, hparams.n_embd);
     }
 
-    if (model.d2t) {
+    if (model.d2t && !cparams.eagle3_compact_logits) {
         const int64_t n_draft_vocab = cur->ne[0];
         const int64_t n_outputs     = cur->ne[1];
         const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();

@@ -591,6 +591,42 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+bool common_sampler_sample_eagle_compact(struct common_sampler * gsmpl,
+        const float * logits, const llama_token * ids, size_t count) {
+    if (gsmpl->grmr || gsmpl->rbudget || gsmpl->params.mirostat != 0 || gsmpl->params.top_k != 10 ||
+            gsmpl->params.samplers != std::vector<common_sampler_type>{COMMON_SAMPLER_TYPE_TOP_K} || count < 11) return false;
+    for (const auto & bias : gsmpl->params.logit_bias) {
+        if (std::isnan(bias.bias) || bias.bias == INFINITY) return false;
+    }
+    const auto tm = gsmpl->tm();
+    gsmpl->cur.resize(count);
+    for (size_t j = 0; j < count; ++j) {
+        if (!std::isfinite(logits[j])) return false;
+        gsmpl->cur[j] = {ids[j], logits[j], 0.0f};
+    }
+    // Tied top candidates use expanded fallback; unique top-k is independent of input order.
+    auto & cur_p = gsmpl->cur_p;
+    cur_p = {gsmpl->cur.data(), gsmpl->cur.size(), -1, false};
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    for (int j = 0; j < n; ++j) {
+        auto * sampler = llama_sampler_chain_get(gsmpl->chain, j);
+        const std::string name = llama_sampler_name(sampler);
+        if (name == "top-k") {
+            std::vector<float> top;
+            top.reserve(count);
+            for (const auto & token : gsmpl->cur) {
+                if (std::isnan(token.logit) || token.logit == INFINITY) return false;
+                top.push_back(token.logit);
+            }
+            std::partial_sort(top.begin(), top.begin() + 11, top.end(), std::greater<float>());
+            if (!std::isfinite(top[10])) return false;
+            for (size_t k = 1; k < 11; ++k) if (top[k] == top[k - 1]) return false;
+        }
+        llama_sampler_apply(sampler, &cur_p);
+    }
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 

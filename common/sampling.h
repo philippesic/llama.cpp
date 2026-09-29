@@ -67,6 +67,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// EAGLE top-k-only chain: false requests expanded-logit fallback before RNG use.
+bool common_sampler_sample_eagle_compact(struct common_sampler * gsmpl,
+        const float * logits, const llama_token * ids, size_t count);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

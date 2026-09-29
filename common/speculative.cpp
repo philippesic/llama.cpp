@@ -526,6 +526,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     common_params_speculative_draft params;
     llama_batch batch;
+    bool compact_logits_enabled = false;
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -610,6 +611,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
         }
 
+        const char * compact = std::getenv("GGML_EAGLE_COMPACT_LOGITS");
+        if (compact && std::string(compact) == "1") {
+            compact_logits_enabled = !this->params.backend_sampling && llama_set_eagle3_compact_logits(ctx_dft, true);
+            SPC_WRN("EAGLE3 compact mapped logits: %s (CPU top-k path)\n", compact_logits_enabled ? "enabled" : "fallback");
+        }
+
         // turn on extraction of the target layers' hidden states
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             if (target_layer_ids[k] < n_layer_tgt) {
@@ -638,6 +645,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     ~common_speculative_impl_draft_eagle3() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (compact_logits_enabled && ctx_dft) llama_set_eagle3_compact_logits(ctx_dft, false);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -952,7 +960,13 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 stage.next("output_sampling", i);
                 if (stage.enabled()) ++stage.sampling_calls;
                 const int64_t t_sample = process_trace_enabled ? ggml_time_us() : 0;
-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                const llama_token * compact_ids = nullptr;
+                size_t compact_count = 0;
+                const float * compact_logits = compact_logits_enabled
+                    ? llama_get_eagle3_compact_logits_ith(ctx_dft, i_batch, &compact_ids, &compact_count) : nullptr;
+                if (!compact_logits || !common_sampler_sample_eagle_compact(smpl, compact_logits, compact_ids, compact_count)) {
+                    common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                }
                 if (process_trace_enabled) {
                     if (draft_trace.sampler_us.size() <= (size_t) i) draft_trace.sampler_us.resize(i + 1, 0);
                     draft_trace.sampler_us[i] += ggml_time_us() - t_sample;

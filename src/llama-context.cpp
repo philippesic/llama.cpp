@@ -1051,9 +1051,65 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+bool llama_context::set_eagle3_compact_logits(bool value) {
+    synchronize();
+    if (value == cparams.eagle3_compact_logits) return true;
+    if (value) {
+        if (model.arch != LLM_ARCH_EAGLE3 || !model.d2t || !sampling.samplers.empty()) return false;
+        std::vector<int64_t> mapping(model.d2t->ne[0]);
+        ggml_backend_tensor_get(model.d2t, mapping.data(), 0, mapping.size()*sizeof(int64_t));
+        std::vector<bool> seen(model.vocab.n_tokens(), false);
+        eagle3_draft_ids.clear();
+        for (const int64_t id : mapping) {
+            if (id < 0 || id >= model.vocab.n_tokens() || seen[id]) {
+                eagle3_draft_ids.clear();
+                return false;
+            }
+            seen[id] = true;
+            eagle3_draft_ids.push_back((llama_token) id);
+        }
+    } else {
+        for (int64_t row = 0; row < n_outputs; ++row) expand_eagle3_logits(row);
+    }
+    if (value) eagle3_logits_expanded.assign(n_outputs, true);
+    cparams.eagle3_compact_logits = value;
+    sched_need_reserve = true;
+    return true;
+}
+
+const float * llama_context::get_eagle3_compact_logits_ith(int32_t i, const llama_token ** ids, size_t * count) {
+    if (!ids || !count) return nullptr;
+    *ids = nullptr;
+    *count = 0;
+    if (!cparams.eagle3_compact_logits || !logits.data) return nullptr;
+    output_reorder();
+    try {
+        const int64_t row = output_resolve_row(i);
+        if (eagle3_logits_expanded.at(row)) return nullptr;
+        *ids = eagle3_draft_ids.data();
+        *count = eagle3_draft_ids.size();
+        return logits.data + row*model.vocab.n_tokens();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid compact logits id %d, reason: %s\n", __func__, i, err.what());
+        return nullptr;
+    }
+}
+
+void llama_context::expand_eagle3_logits(int64_t row) {
+    if (!cparams.eagle3_compact_logits || eagle3_logits_expanded.at(row)) return;
+    float * out = logits.data + row*model.vocab.n_tokens();
+    std::vector<float> compact(out, out + eagle3_draft_ids.size());
+    std::fill(out, out + model.vocab.n_tokens(), -INFINITY);
+    for (size_t j = 0; j < compact.size(); ++j) out[eagle3_draft_ids[j]] = compact[j];
+    eagle3_logits_expanded[row] = true;
+}
+
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (cparams.eagle3_compact_logits) {
+        for (int64_t row = 0; row < n_outputs; ++row) expand_eagle3_logits(row);
+    }
     return logits.data;
 }
 
@@ -1095,6 +1151,7 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        expand_eagle3_logits(j);
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1418,6 +1475,7 @@ void llama_context::set_warmup(bool value) {
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+    if (sampler && cparams.eagle3_compact_logits) return false;
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
@@ -2091,7 +2149,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (cparams.eagle3_compact_logits) {
+                    const size_t width = eagle3_draft_ids.size();
+                    GGML_ASSERT(t_logits->ne[0] == (int64_t) width);
+                    for (int64_t row = 0; row < n_outputs; ++row) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + row*n_vocab,
+                            row*width*sizeof(float), width*sizeof(float));
+                    }
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -2192,6 +2259,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+    if (cparams.eagle3_compact_logits) eagle3_logits_expanded.assign(n_outputs, false);
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2449,6 +2517,11 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
+        if (cparams.eagle3_compact_logits && !eagle3_logits_expanded.empty()) {
+            const bool expanded = eagle3_logits_expanded.at(i0);
+            eagle3_logits_expanded[i0] = eagle3_logits_expanded.at(i1);
+            eagle3_logits_expanded[i1] = expanded;
+        }
         if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
@@ -4077,6 +4150,15 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+bool llama_set_eagle3_compact_logits(llama_context * ctx, bool value) {
+    return ctx->set_eagle3_compact_logits(value);
+}
+
+const float * llama_get_eagle3_compact_logits_ith(llama_context * ctx, int32_t i, const llama_token ** ids, size_t * count) {
+    ctx->synchronize();
+    return ctx->get_eagle3_compact_logits_ith(i, ids, count);
 }
 
 float * llama_get_logits(llama_context * ctx) {
