@@ -1,0 +1,113 @@
+// Tiny CPU loader/encoder fixtures for the versioned learned scalar contract.
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+#include "llama.h"
+#include "../src/llama-ext.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+static gguf_context * fixture(int bits, float delta, float clip, const std::string & invalid = "") {
+    auto * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", "eagle3");
+    gguf_set_val_str(g, "tokenizer.ggml.model", "none");
+    for (auto kv : std::vector<std::pair<const char *, uint32_t>>{
+            {"vocab_size",16}, {"context_length",32}, {"embedding_length",64},
+            {"block_count",1}, {"feed_forward_length",128}, {"attention.head_count",2},
+            {"attention.head_count_kv",1}, {"rope.dimension_count",32}, {"target_hidden_size",64}})
+        gguf_set_val_u32(g, (std::string("eagle3.")+kv.first).c_str(), kv.second);
+    gguf_set_val_f32(g, "eagle3.attention.layer_norm_rms_epsilon", 1e-5f);
+    uint32_t layers[] = {0,1,2};
+    gguf_set_arr_data(g, "eagle3.target_layers", GGUF_TYPE_UINT32, layers, 3);
+    const char * groups[] = {"fusion", "attention", "ffn", "head"};
+    gguf_set_arr_str(g, "eagle3.w1a1.groups", groups, 4);
+    const char * bases[] = {"fc", "blk.0.attn_q", "blk.0.attn_k", "blk.0.attn_v", "blk.0.attn_output", "blk.0.ffn_gate", "blk.0.ffn_up", "blk.0.ffn_down", "output"};
+    const int64_t widths[] = {192,128,128,128,64,64,64,128,64};
+    const int64_t rows[] = {64,64,32,32,64,128,128,64,16};
+    std::vector<std::string> names; std::vector<const char *> ptrs;
+    for (auto base : bases) names.push_back(std::string(base)+".weight");
+    for (auto & name : names) ptrs.push_back(name.c_str());
+    gguf_set_arr_str(g, "eagle3.w1a1.tensors", ptrs.data(), ptrs.size());
+    gguf_set_val_u32(g, "eagle3.w1a1.version", 2);
+    gguf_set_val_u32(g, "eagle3.w1a1.scale_group_size", 0);
+    gguf_set_val_u32(g, "eagle3.w1a1.activation_bits", bits);
+    gguf_set_val_str(g, "eagle3.w1a1.bit_order", "little");
+    gguf_set_val_str(g, "eagle3.w1a1.sign_rule", "nonnegative_is_one");
+    gguf_set_val_str(g, "eagle3.w1a1.scale_rule", "f32_learned_nonnegative");
+    gguf_set_val_str(g, "eagle3.w1a1.arithmetic", "f32");
+    ggml_init_params ip = {1024*1024, nullptr, false}; auto * ctx = ggml_init(ip);
+    auto tensor = [&](const std::string & name, ggml_type type, int64_t k, int64_t m = 1) {
+        auto * t = ggml_new_tensor_2d(ctx, type, k, m); ggml_set_name(t, name.c_str());
+        if (type == GGML_TYPE_I32) std::fill_n((int32_t *) t->data, k*m, -1);
+        else std::fill_n((float *) t->data, k*m, name.find("scale") != std::string::npos ? .125f : 1.f);
+        gguf_add_tensor(g, t);
+    };
+    for (int i = 0; i < 9; ++i) {
+        std::string key = names[i]; std::replace(key.begin(), key.end(), '.', '_');
+        key = "eagle3.w1a1.tensor."+key;
+        const std::string packed = std::string(bases[i])+".w1a1_packed", scale = std::string(bases[i])+".w1a1_scale";
+        gguf_set_val_u32(g, (key+".logical_k").c_str(), widths[i]);
+        gguf_set_val_str(g, (key+".packed").c_str(), packed.c_str()); gguf_set_val_str(g, (key+".scale").c_str(), scale.c_str());
+        tensor(packed, GGML_TYPE_I32, (widths[i]+31)/32, rows[i]); tensor(scale, GGML_TYPE_F32, rows[i]);
+    }
+    tensor("token_embd.weight", GGML_TYPE_F32, 64, 16);
+    tensor("output_norm.weight", GGML_TYPE_F32, 64);
+    tensor("blk.0.attn_norm.weight", GGML_TYPE_F32, 64);
+    tensor("blk.0.attn_norm_2.weight", GGML_TYPE_F32, 64);
+    tensor("blk.0.ffn_norm.weight", GGML_TYPE_F32, 64);
+    if (invalid != "legacy") {
+        const char * boundaries[] = {"fc", "qkv", "attn_output", "gate_up", "down", "head"};
+        gguf_set_val_u32(g, "eagle3.w1a1.activation_quantizer.version", invalid == "version" ? 2 : 1);
+        gguf_set_arr_str(g, "eagle3.w1a1.activation_quantizer.boundaries", boundaries, 6);
+        for (auto boundary : boundaries) {
+            const std::string prefix = std::string("eagle3.w1a1.activation_quantizer.")+boundary+".";
+            gguf_set_val_f32(g, (prefix+"threshold_delta").c_str(), invalid == "nonfinite" ? std::numeric_limits<float>::infinity() : delta);
+            if (!(invalid == "missing" && std::string(boundary) == "head")) gguf_set_val_f32(g, (prefix+"clip_ratio").c_str(), clip);
+        }
+        if (invalid == "extra") gguf_set_val_f32(g, "eagle3.w1a1.activation_quantizer.extra", 1);
+    }
+    const std::string path = "/tmp/eagle3-learned-"+std::to_string(getpid())+".gguf";
+    if (!gguf_write_to_file(g, path.c_str(), false)) return nullptr;
+    ggml_free(ctx);
+    return g;
+}
+
+int main() {
+    llama_backend_init();
+    llama_log_set([](ggml_log_level level, const char * text, void *){ if (level == GGML_LOG_LEVEL_ERROR) fputs(text, stderr); }, nullptr);
+    for (int bits : {1,4,8}) {
+        const std::string value = std::to_string(bits); setenv("GGML_W1AX_ACT_BITS", value.c_str(), 1);
+        for (const std::string mode : {"legacy", "default", "learned", "version", "nonfinite", "missing", "extra", "incompatible"}) {
+            const float delta = mode == "incompatible" ? .5f : bits == 1 && mode == "learned" ? .75f : 0;
+            const float clip = bits != 1 && mode == "learned" ? .625f : 1;
+            auto * g = fixture(bits, delta, clip, mode);
+            llama_model_params mp = llama_model_default_params(); mp.n_gpu_layers = 0;
+            const std::string path = "/tmp/eagle3-learned-"+std::to_string(getpid())+".gguf";
+            auto * model = llama_model_load_from_file(path.c_str(), mp); gguf_free(g); std::remove(path.c_str());
+            const bool valid = mode == "legacy" || mode == "default" || mode == "learned" || (mode == "incompatible" && bits == 1);
+            if ((model != nullptr) != valid) { fprintf(stderr, "loader mismatch bits=%d mode=%s\n", bits, mode.c_str()); return 1; }
+            if (!model) continue;
+            llama_context_params cp = llama_context_default_params(); cp.n_ctx = 32; cp.n_threads = 2; cp.n_threads_batch = 2; cp.embeddings = true; cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+            auto * ctx = llama_init_from_model(model, cp);
+            if (!ctx) { fprintf(stderr, "context failure\n"); return 1; }
+            auto batch = llama_batch_init(1, 192, 1); batch.n_tokens = 1; batch.pos[0] = 0; batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0; batch.logits[0] = 1;
+            double abs_sum = 0; float absmax = 0;
+            for (int i = 0; i < 192; ++i) { batch.embd[i] = i%3 == 0 ? -2.f : i%3 == 1 ? .25f : 1.f; abs_sum += std::abs(batch.embd[i]); absmax = std::max(absmax, std::abs(batch.embd[i])); }
+            const float beta = float(abs_sum/192), limit = absmax*clip, qmax = bits == 8 ? 127 : 7; int dot = 0;
+            for (int i = 0; i < 192; ++i) dot += bits == 1 ? (batch.embd[i] - delta*beta >= 0 ? 1 : -1) : std::max(-int(qmax), std::min(int(qmax), int(std::nearbyint(batch.embd[i]*(qmax/limit)))));
+            const float ref = float(dot)*.125f*(bits == 1 ? beta : limit/qmax);
+            if (llama_encode(ctx, batch)) { fprintf(stderr, "encode failure\n"); return 1; }
+            auto * output = llama_get_embeddings(ctx);
+            if (!output) { fprintf(stderr, "missing output\n"); return 1; }
+            for (int i = 0; i < 64; ++i) if (std::abs(output[i]-ref) > 1e-5) { fprintf(stderr, "numeric mismatch %g vs %g\n", output[i], ref); return 1; }
+            llama_batch_free(batch); llama_free(ctx); llama_model_free(model);
+        }
+    }
+    puts("EAGLE3 learned loader/encoder fixtures passed"); llama_backend_free();
+}

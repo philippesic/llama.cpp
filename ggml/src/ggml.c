@@ -3368,13 +3368,28 @@ struct ggml_tensor * ggml_w1a1_mul_mat(
     return ggml_w1ax_mul_mat(ctx, packed_weights, weight_scales, activations, logical_k, 1);
 }
 
+static void ggml_w1ax_check_params(int bits, float delta, float clip) {
+    GGML_ASSERT(isfinite(delta) && isfinite(clip) && clip > 0.0f && clip <= 1.0f);
+    GGML_ASSERT(bits == 1 ? clip == 1.0f : delta == 0.0f);
+    GGML_ASSERT(bits != 16 || clip == 1.0f);
+}
+
 struct ggml_tensor * ggml_w1ax_mul_mat(
+        struct ggml_context * ctx, struct ggml_tensor * weights, struct ggml_tensor * scales,
+        struct ggml_tensor * acts, int64_t k, int32_t bits) {
+    struct ggml_tensor * out = ggml_w1ax_mul_mat_learned(ctx, weights, scales, acts, k, bits, 0.0f, 1.0f);
+    ggml_set_op_params_i32(out, 5, 0);
+    return out;
+}
+
+struct ggml_tensor * ggml_w1ax_mul_mat_learned(
         struct ggml_context * ctx,
         struct ggml_tensor  * packed_weights,
         struct ggml_tensor  * weight_scales,
         struct ggml_tensor  * activations,
         int64_t               logical_k,
-        int32_t               activation_bits) {
+        int32_t               activation_bits, float delta, float clip) {
+    ggml_w1ax_check_params(activation_bits, delta, clip);
     GGML_ASSERT(activation_bits == 1 || activation_bits == 4 || activation_bits == 8 || activation_bits == 16);
     GGML_ASSERT(logical_k > 0);
     GGML_ASSERT(packed_weights->type == GGML_TYPE_I32);
@@ -3402,10 +3417,20 @@ struct ggml_tensor * ggml_w1ax_mul_mat(
     result->src[2] = activations;
     ggml_set_op_params(result, &logical_k, sizeof(logical_k));
     ggml_set_op_params_i32(result, 2, activation_bits);
+    ggml_set_op_params_f32(result, 3, delta);
+    ggml_set_op_params_f32(result, 4, clip);
+    ggml_set_op_params_i32(result, 5, 1);
     return result;
 }
 
 struct ggml_tensor * ggml_w1ax_pack(struct ggml_context * ctx, struct ggml_tensor * activations, int32_t bits) {
+    struct ggml_tensor * out = ggml_w1ax_pack_learned(ctx, activations, bits, 0.0f, 1.0f);
+    ggml_set_op_params_i32(out, 3, 0);
+    return out;
+}
+
+struct ggml_tensor * ggml_w1ax_pack_learned(struct ggml_context * ctx, struct ggml_tensor * activations, int32_t bits, float delta, float clip) {
+    ggml_w1ax_check_params(bits, delta, clip);
     GGML_ASSERT(bits == 1 || bits == 4 || bits == 8);
     GGML_ASSERT(activations->type == GGML_TYPE_F32 && activations->ne[0] > 0 && activations->ne[1] > 0);
     GGML_ASSERT(activations->ne[2] == 1 && activations->ne[3] == 1);
@@ -3415,6 +3440,9 @@ struct ggml_tensor * ggml_w1ax_pack(struct ggml_context * ctx, struct ggml_tenso
     result->op = GGML_OP_W1AX_PACK;
     result->src[0] = activations;
     ggml_set_op_params_i32(result, 0, bits);
+    ggml_set_op_params_f32(result, 1, delta);
+    ggml_set_op_params_f32(result, 2, clip);
+    ggml_set_op_params_i32(result, 3, 1);
     return result;
 }
 
@@ -3425,7 +3453,9 @@ struct ggml_tensor * ggml_w1ax_mul_mat_shared(
     GGML_ASSERT(ggml_get_op_params_i32(packed, 0) == bits && packed->src[0]->ne[0] == k);
     const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, packed->src[0]->ne[1], bits);
     GGML_ASSERT(packed->ne[0] == layout.total_words && packed->ne[1] == 1 && ggml_is_contiguous(packed));
-    struct ggml_tensor * result = ggml_w1ax_mul_mat(ctx, weights, scales, packed->src[0], k, bits);
+    struct ggml_tensor * result = ggml_w1ax_mul_mat_learned(ctx, weights, scales, packed->src[0], k, bits,
+            ggml_get_op_params_f32(packed, 1), ggml_get_op_params_f32(packed, 2));
+    ggml_set_op_params_i32(result, 5, ggml_get_op_params_i32(packed, 3));
     result->src[3] = packed;
     return result;
 }

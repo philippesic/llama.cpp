@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <set>
 #include <unordered_map>
+#include <tuple>
+#include <cmath>
 
 static int eagle3_w1ax_activation_bits() {
     const char * value = std::getenv("GGML_W1AX_ACT_BITS");
@@ -15,6 +17,17 @@ static int eagle3_w1ax_activation_bits() {
     if (std::string(value) == "8") return 8;
     if (std::string(value) == "16") return 16;
     throw std::runtime_error("GGML_W1AX_ACT_BITS must be 1, 4, 8, or 16");
+}
+
+static int eagle3_quantizer_boundary(const ggml_tensor * packed) {
+    const std::string name = packed->name;
+    if (name == "fc.w1a1_packed") return 0;
+    if (name == "blk.0.attn_q.w1a1_packed" || name == "blk.0.attn_k.w1a1_packed" || name == "blk.0.attn_v.w1a1_packed") return 1;
+    if (name == "blk.0.attn_output.w1a1_packed") return 2;
+    if (name == "blk.0.ffn_gate.w1a1_packed" || name == "blk.0.ffn_up.w1a1_packed") return 3;
+    if (name == "blk.0.ffn_down.w1a1_packed") return 4;
+    if (name == "output.w1a1_packed") return 5;
+    throw std::runtime_error("unknown EAGLE3 learned activation boundary");
 }
 
 static bool eagle3_dense_diagnostics() {
@@ -162,6 +175,37 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         std::string coverage;
         for (const auto & group : w1a1_groups) coverage += (coverage.empty() ? "" : ",") + group;
         LLAMA_LOG_INFO("%s: EAGLE3 W1A1 active groups: %s (%zu tensors)\n", __func__, coverage.c_str(), declared.size());
+    }
+
+    // Versioned learned contract is strict and covers six shared input boundaries.
+    const std::string quant_prefix = "eagle3.w1a1.activation_quantizer.";
+    const std::vector<std::string> boundaries = {"fc", "qkv", "attn_output", "gate_up", "down", "head"};
+    std::set<std::string> quant_keys;
+    for (int64_t i = 0; i < gguf_get_n_kv(ml->metadata); ++i) {
+        const std::string key = gguf_get_key(ml->metadata, i);
+        if (key.compare(0, quant_prefix.size(), quant_prefix) == 0) quant_keys.insert(key);
+    }
+    if (!quant_keys.empty()) {
+        uint32_t version = 0, bits = 0;
+        std::vector<std::string> declared;
+        ml->get_key(quant_prefix + "version", version);
+        ml->get_arr(quant_prefix + "boundaries", declared);
+        ml->get_key("eagle3.w1a1.activation_bits", bits);
+        std::set<std::string> expected_keys = {quant_prefix + "version", quant_prefix + "boundaries"};
+        if (!has_full_w1a1 || full_w1a1_version != 2 || scale_group_size != 0 ||
+                version != 1 || declared != boundaries || (bits != 1 && bits != 4 && bits != 8) ||
+                w1a1_tensors.size() != 9) throw std::runtime_error("invalid EAGLE3 learned activation contract");
+        for (size_t i = 0; i < boundaries.size(); ++i) {
+            const std::string prefix = quant_prefix + boundaries[i] + ".";
+            expected_keys.insert(prefix + "threshold_delta"); expected_keys.insert(prefix + "clip_ratio");
+            ml->get_key(prefix + "threshold_delta", eagle_w1ax_delta[i]);
+            ml->get_key(prefix + "clip_ratio", eagle_w1ax_clip[i]);
+            const float d = eagle_w1ax_delta[i], c = eagle_w1ax_clip[i];
+            if (!std::isfinite(d) || !std::isfinite(c) || c <= 0 || c > 1 ||
+                    (bits == 1 ? c != 1 : d != 0)) throw std::runtime_error("invalid EAGLE3 learned activation scalar");
+        }
+        if (quant_keys != expected_keys) throw std::runtime_error("unknown EAGLE3 learned activation metadata");
+        eagle_w1ax_learned = true;
     }
 
     auto load_w1a1_linear = [&](llm_tensor tensor, int bid, const std::string & base_name,
@@ -373,7 +417,10 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
         }
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
-        return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
+        if (!model.eagle_w1ax_learned) return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
+        const int boundary = eagle3_quantizer_boundary(packed);
+        return ggml_w1ax_mul_mat_learned(ctx0, packed, scales, input, logical_k, activation_bits,
+                model.eagle_w1ax_delta[boundary], model.eagle_w1ax_clip[boundary]);
     };
 
     cur = build_inp_embd_enc();
@@ -418,7 +465,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inpL;
     const char * shared_pack_env = std::getenv("GGML_EAGLE_SHARED_PACK");
     const bool shared_pack = activation_bits != 16 && shared_pack_env && std::string(shared_pack_env) == "1";
-    std::unordered_map<ggml_tensor *, ggml_tensor *> activation_packs;
+    std::map<std::tuple<ggml_tensor *, int, float, float>, ggml_tensor *> activation_packs;
     auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
         if (!packed) {
             const char * a16 = std::getenv("GGML_EAGLE_DENSE_A16");
@@ -435,15 +482,19 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         auto * identity = input;
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+        const int boundary = eagle3_quantizer_boundary(packed);
+        const float delta = model.eagle_w1ax_delta[boundary], clip = model.eagle_w1ax_clip[boundary];
         if (shared_pack) {
-            auto & pack = activation_packs[identity];
+            auto & pack = activation_packs[std::make_tuple(identity, activation_bits, delta, clip)];
             if (!pack) {
-                pack = ggml_w1ax_pack(ctx0, input, activation_bits);
+                pack = model.eagle_w1ax_learned ? ggml_w1ax_pack_learned(ctx0, input, activation_bits, delta, clip) : ggml_w1ax_pack(ctx0, input, activation_bits);
                 ggml_format_name(pack, "w1ax_pack_for_%s", packed->name);
             }
             return ggml_w1ax_mul_mat_shared(ctx0, packed, scales, pack, logical_k, activation_bits);
         }
-        return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
+        if (!model.eagle_w1ax_learned) return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
+        return ggml_w1ax_mul_mat_learned(ctx0, packed, scales, input, logical_k, activation_bits,
+                model.eagle_w1ax_delta[boundary], model.eagle_w1ax_clip[boundary]);
     };
 
     // eagle3 Decoder receives:
@@ -642,7 +693,8 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (cur->type != GGML_TYPE_F32) {
             cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
         }
-        cur = ggml_w1ax_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd, activation_bits);
+        cur = model.eagle_w1ax_learned ? ggml_w1ax_mul_mat_learned(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd, activation_bits,
+                model.eagle_w1ax_delta[5], model.eagle_w1ax_clip[5]) : ggml_w1ax_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd, activation_bits);
     } else {
         auto * output = model.output;
         if (output == nullptr) {

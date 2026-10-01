@@ -1515,6 +1515,17 @@ extern "C" {
             int64_t               logical_k,
             int32_t               activation_bits);
 
+    // Learned scalar boundaries preserve the original token amplitude for A1.
+    // A1: raw sign(x - delta*meanabs); A4/A8: absmax*clip, RNE symmetric codes.
+    // delta must be zero outside A1; clip must be one for A1/A16, otherwise (0,1].
+    GGML_API struct ggml_tensor * ggml_w1ax_pack_learned(
+            struct ggml_context * ctx, struct ggml_tensor * activations,
+            int32_t activation_bits, float threshold_delta, float clip_ratio);
+    GGML_API struct ggml_tensor * ggml_w1ax_mul_mat_learned(
+            struct ggml_context * ctx, struct ggml_tensor * weights, struct ggml_tensor * scales,
+            struct ggml_tensor * activations, int64_t logical_k, int32_t activation_bits,
+            float threshold_delta, float clip_ratio);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(

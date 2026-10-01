@@ -1481,6 +1481,8 @@ static int ggml_w1a1_popcount32(uint32_t x) {
 static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * acts = dst->src[0];
     const int bits = ggml_get_op_params_i32(dst, 0);
+    const float delta = ggml_get_op_params_f32(dst, 1), clip = ggml_get_op_params_f32(dst, 2);
+    const bool learned = ggml_get_op_params_i32(dst, 3);
     const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
     const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
     uint32_t * data = (uint32_t *) dst->data;
@@ -1496,16 +1498,22 @@ static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * pa
             for (int64_t i = 0; i < k; ++i) {
                 GGML_ASSERT(isfinite(row[i]));
                 sum += (double) fabsf(row[i]);
-                if (row[i] >= 0.0f) planes[token*words + i/32] |= UINT32_C(1) << (i%32);
+
             }
             scales[token] = (float) (sum/(double) k);
+            volatile float threshold = delta*scales[token];
+            for (int64_t i = 0; i < k; ++i) {
+                volatile float shifted = delta == 0.0f ? row[i] : row[i] - threshold;
+                if (shifted >= 0.0f) planes[token*words + i/32] |= UINT32_C(1) << (i%32);
+            }
         } else {
             const int qmax = bits == 8 ? 127 : 7;
             float absmax = 0.0f;
             for (int64_t i = 0; i < k; ++i) { GGML_ASSERT(isfinite(row[i])); absmax = fmaxf(absmax, fabsf(row[i])); }
+            absmax *= clip;
             scales[token] = absmax/(float) qmax;
             const float inv = absmax == 0.0f ? 0.0f : (float) qmax/absmax;
-            for (int64_t i = 0; i < k; ++i) codes[token*k + i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(row[i]*inv)));
+            for (int64_t i = 0; i < k; ++i) codes[token*k + i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(absmax == 0.0f ? 0.0f : (!learned || isfinite(inv)) ? row[i]*inv : (float) ((double) row[i]/absmax*qmax))));
             if (bits == 4) {
                 memset(planes + token*words*4, 0, words*4*sizeof(uint32_t));
                 for (int64_t i = 0; i < k; ++i) {
@@ -1526,6 +1534,8 @@ static void ggml_compute_forward_w1a1_mul_mat(
     int64_t k;
     memcpy(&k, dst->op_params, sizeof(k));
     const int32_t activation_bits = ggml_get_op_params_i32(dst, 2);
+    const float delta = ggml_get_op_params_f32(dst, 3), clip = ggml_get_op_params_f32(dst, 4);
+    const bool learned = ggml_get_op_params_i32(dst, 5);
     const int64_t words = (k - 1)/32 + 1;
     const int64_t m = weights->ne[1];
     const int64_t n = acts->ne[1];
@@ -1578,9 +1588,11 @@ static void ggml_compute_forward_w1a1_mul_mat(
                     GGML_ASSERT(isfinite(act[i]));
                     absmax = fmaxf(absmax, fabsf(act[i]));
                 }
+                absmax *= clip;
                 act_scale = absmax / (float) qmax;
+                const float inv = absmax == 0.0f ? 0.0f : (float) qmax / absmax;
                 for (int64_t i = 0; i < k; ++i) {
-                    const float normalized = absmax == 0.0f ? 0.0f : act[i] * ((float) qmax / absmax);
+                    const float normalized = absmax == 0.0f ? 0.0f : (!learned || isfinite(inv)) ? act[i]*inv : (float) ((double) act[i]/absmax*qmax);
                     owned_codes[i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(normalized)));
                 }
             }
@@ -1624,10 +1636,17 @@ static void ggml_compute_forward_w1a1_mul_mat(
                 const float value = act[i];
                 GGML_ASSERT(isfinite(value));
                 abs_sum += (double) fabsf(value);
-                if (value >= 0.0f) signs[i / 32] |= UINT32_C(1) << (i % 32);
+
             }
         }
         const float act_scale = shared ? shared_scales[token] : (float) (abs_sum / (double) k);
+        if (!shared) {
+            volatile float threshold = delta*act_scale;
+            for (int64_t i = 0; i < k; ++i) {
+                volatile float shifted = delta == 0.0f ? act[i] : act[i] - threshold;
+                if (shifted >= 0.0f) signs[i/32] |= UINT32_C(1) << (i%32);
+            }
+        }
         for (int64_t row = row_begin; row < row_end; ++row) {
             const uint32_t * packed = weight_data + row * words;
             int64_t mismatches = 0;

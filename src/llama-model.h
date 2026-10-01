@@ -652,6 +652,9 @@ struct llama_model {
     struct ggml_tensor * output_w1a1_scale  = nullptr;
     struct ggml_tensor * fc_w1a1_packed = nullptr; // EAGLE-3 full-drafter feature fusion
     struct ggml_tensor * fc_w1a1_scale  = nullptr;
+    bool eagle_w1ax_learned = false;
+    float eagle_w1ax_delta[6] = {};
+    float eagle_w1ax_clip[6] = {1, 1, 1, 1, 1, 1};
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 

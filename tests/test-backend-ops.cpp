@@ -5053,12 +5053,15 @@ struct test_w1a1_mul_mat : public test_case {
     const bool grouped;
     const bool shared;
     const bool fanout;
+    const bool learned;
+    const float delta, clip;
+    const bool tiny;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false)
-        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false, bool learned = false, float delta = 0, float clip = 1, bool tiny = false)
+        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout), learned(learned), delta(delta), clip(clip), tiny(tiny) {}
 
-    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout); }
+    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout) + ",learned=" + std::to_string(learned) + ",delta=" + std::to_string(delta) + ",clip=" + std::to_string(clip) + ",tiny=" + std::to_string(tiny); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5092,7 +5095,7 @@ struct test_w1a1_mul_mat : public test_case {
         ggml_set_name(s, "w1a1_scales");
         ggml_set_name(a, "w1a1_activations");
         if (shared) {
-            auto * pack = ggml_w1ax_pack(ctx, a, bits);
+            auto * pack = learned ? ggml_w1ax_pack_learned(ctx, a, bits, delta, clip) : ggml_w1ax_pack(ctx, a, bits);
             auto * out = ggml_w1ax_mul_mat_shared(ctx, w, s, pack, k, bits);
             if (fanout) {
                 auto * second = ggml_w1ax_mul_mat_shared(ctx, w, s, pack, k, bits);
@@ -5101,7 +5104,7 @@ struct test_w1a1_mul_mat : public test_case {
             }
             return out;
         }
-        return ggml_w1ax_mul_mat(ctx, w, s, a, k, bits);
+        return learned ? ggml_w1ax_mul_mat_learned(ctx, w, s, a, k, bits, delta, clip) : ggml_w1ax_mul_mat(ctx, w, s, a, k, bits);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -5129,7 +5132,7 @@ struct test_w1a1_mul_mat : public test_case {
         }
         for (int64_t token = 0; token < n_tokens; ++token) {
             for (int64_t i = 0; i < k; ++i) {
-                const float x = activation_value(token, i);
+                const float x = tiny ? (token == 1 ? (i%2 ? -0.0f : +0.0f) : (i%3 == 0 ? -std::numeric_limits<float>::denorm_min() : i%3 == 1 ? std::numeric_limits<float>::denorm_min() : 0.0f)) : activation_value(token, i);
                 // Non-FP16-exact values exercise source rounding as well as signs.
                 acts[token*k + i] = grouped ? x * 1.0002345f + (token == 1 ? 0.0f : float(i%13)*0.00012345f) : x;
             }
@@ -5142,6 +5145,7 @@ struct test_w1a1_mul_mat : public test_case {
             const float act_scale = float(abs_sum / double(k));
             float absmax = 0.0f;
             for (int64_t i = 0; i < k; ++i) absmax = std::max(absmax, std::abs(acts[token * k + i]));
+            absmax *= clip;
             const int qmax = bits == 8 ? 127 : 7;
             const float quant_scale = absmax / float(qmax);
             for (int64_t row = 0; row < m; ++row) {
@@ -5165,12 +5169,15 @@ struct test_w1a1_mul_mat : public test_case {
                 for (int64_t i = 0; i < k; ++i) {
                     const int sign = weight_value(row, i) >= 0.0f ? 1 : -1;
                     const float x = acts[token * k + i];
-                    matches += sign * (x >= 0.0f ? 1 : -1);
+                    volatile float threshold = delta*act_scale;
+                    volatile float shifted = delta == 0 ? x : x - threshold;
+                    matches += sign * (shifted >= 0.0f ? 1 : -1);
                     if (bits == 16) {
                         const float h = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
                         half_dot += sign > 0 ? h : -h;
                     } else if (bits == 4 || bits == 8) {
-                        const float normalized = absmax == 0.0f ? 0.0f : x * (float(qmax) / absmax);
+                        const float inv = absmax == 0.0f ? 0.0f : float(qmax)/absmax;
+                        const float normalized = absmax == 0.0f ? 0.0f : std::isfinite(inv) ? x*inv : float(double(x)/double(absmax)*qmax);
                         const int q = std::max(-qmax, std::min(qmax, int(std::nearbyint(normalized))));
                         int_dot += sign * q;
                     }
@@ -10091,6 +10098,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_w1a1_mul_mat(33, true, bits, 3, false, true));
             test_cases.emplace_back(new test_w1a1_mul_mat(33, false, bits, 3, false, true, true));
+        }
+    }
+
+    // Learned scalars: direct/shared, zero defaults, sign-changing thresholds,
+    // clipped RNE codes, zero tokens, signed zeros and reciprocal overflow.
+    for (int bits : {1, 4, 8}) {
+        for (bool shared : {false, true}) {
+            for (int64_t k : {1, 33, 2560}) {
+                test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 3, false, shared, false, true));
+                test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 3, false, shared, false, true, bits == 1 ? .75f : 0, bits == 1 ? 1 : .625f));
+                test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 3, false, shared, false, true, 0, 1, true));
+            }
         }
     }
 
