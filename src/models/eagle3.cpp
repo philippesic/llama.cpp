@@ -276,6 +276,40 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
     }
 
+    const std::string correction_prefix = "eagle3.fusion_correction.";
+    std::set<std::string> correction_keys;
+    for (int64_t i = 0; i < gguf_get_n_kv(ml->metadata); ++i) {
+        const std::string key = gguf_get_key(ml->metadata, i);
+        if (key.compare(0, correction_prefix.size(), correction_prefix) == 0) correction_keys.insert(key);
+    }
+    const char * u_tensor = "fc.correction_u.weight", * v_tensor = "fc.correction_v.weight", * b_tensor = "fc.correction_bias";
+    const bool correction_tensors = ml->get_tensor_meta(u_tensor) || ml->get_tensor_meta(v_tensor) || ml->get_tensor_meta(b_tensor);
+    if (!correction_keys.empty() || correction_tensors) {
+        const std::set<std::string> expected_keys = {correction_prefix+"version", correction_prefix+"rank", correction_prefix+"u_name", correction_prefix+"v_name", correction_prefix+"bias_name", correction_prefix+"bias_bound", correction_prefix+"arithmetic"};
+        uint32_t version = 0, rank = 0; float bias_bound = 0;
+        std::string u_name, v_name, bias_name, arithmetic;
+        ml->get_key(correction_prefix+"version", version); ml->get_key(correction_prefix+"rank", rank);
+        ml->get_key(correction_prefix+"u_name", u_name); ml->get_key(correction_prefix+"v_name", v_name);
+        ml->get_key(correction_prefix+"bias_name", bias_name); ml->get_key(correction_prefix+"bias_bound", bias_bound);
+        ml->get_key(correction_prefix+"arithmetic", arithmetic);
+        const auto * u = ml->get_tensor_meta(u_tensor), * v = ml->get_tensor_meta(v_tensor), * b = ml->get_tensor_meta(b_tensor);
+        if (correction_keys != expected_keys || !has_full_w1a1 || full_w1a1_version != 2 || scale_group_size != 0 || !fc_w1a1_packed || version != 1 ||
+                (rank != 1 && rank != 4) || u_name != u_tensor || v_name != v_tensor ||
+                arithmetic != "raw_f32_v_f16_dot_f32_u_f16_dot_f32_add_base_f32_bias_f32" || !u || !v ||
+                u->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || u->ne[0] != rank || u->ne[1] != n_embd ||
+                v->ne[0] != n_embd_inp || v->ne[1] != rank || u->ne[2] != 1 || u->ne[3] != 1 || v->ne[2] != 1 || v->ne[3] != 1 ||
+                !std::isfinite(bias_bound) || (bias_name.empty() ? (b != nullptr || bias_bound != 0) :
+                    (bias_name != b_tensor || !b || b->type != GGML_TYPE_F32 || b->ne[0] != n_embd || b->ne[1] != 1 || b->ne[2] != 1 || b->ne[3] != 1 || bias_bound <= 0))) {
+            throw std::runtime_error("invalid EAGLE3 fusion correction contract");
+        }
+        // Validate finite source data too; enabling correction never bypasses a numeric load gate.
+        ml->check_tensors = true;
+        fc_correction_u = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, LLM_TENSOR_FC, "correction_u.weight", -1, -1), {rank, n_embd}, 0);
+        fc_correction_v = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, LLM_TENSOR_FC, "correction_v.weight", -1, -1), {n_embd_inp, rank}, 0);
+        fc_correction_bias_bound = bias_bound;
+        if (b) fc_correction_bias = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, LLM_TENSOR_FC, "correction_bias", -1, -1), {n_embd}, 0);
+    }
+
     // The packed head is opt-in through a versioned GGUF contract. Do not
     // retain a dense shadow copy and never substitute the target head for a
     // malformed packed draft head.
@@ -432,8 +466,20 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     }
 
     // Feature fusion layer
+    ggml_tensor * raw_fc_input = cur;
     cur = eagle_linear(model.fc, model.fc_w1a1_packed, model.fc_w1a1_scale,
             cur, hparams.n_embd_inp_enc());
+    if (model.fc_correction_u) {
+        if (raw_fc_input->type != GGML_TYPE_F32) raw_fc_input = ggml_cast(ctx0, raw_fc_input, GGML_TYPE_F32);
+        // CPU F16 MUL_MAT rounds its RHS to F16. Promote stored F16 factors so
+        // the raw input and the rank-sized intermediate remain F32 on every backend.
+        auto * v = ggml_cast(ctx0, model.fc_correction_v, GGML_TYPE_F32);
+        auto * u = ggml_cast(ctx0, model.fc_correction_u, GGML_TYPE_F32);
+        auto * latent = ggml_mul_mat(ctx0, v, raw_fc_input); ggml_mul_mat_set_prec(latent, GGML_PREC_F32);
+        auto * delta = ggml_mul_mat(ctx0, u, latent); ggml_mul_mat_set_prec(delta, GGML_PREC_F32);
+        cur = ggml_add(ctx0, cur, delta);
+        if (model.fc_correction_bias) cur = ggml_add(ctx0, cur, model.fc_correction_bias);
+    }
     cb(cur, "fc_out", -1);
 
     // Output: g_embeddings e.g. [4096, n_tokens]

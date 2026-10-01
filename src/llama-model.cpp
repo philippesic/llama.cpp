@@ -1873,6 +1873,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (fc_correction_bias) {
+        std::vector<float> values(ggml_nelements(fc_correction_bias));
+        ggml_backend_tensor_get(fc_correction_bias, values.data(), 0, values.size()*sizeof(float));
+        for (float value : values) {
+            if (!std::isfinite(value) || std::abs(value) > fc_correction_bias_bound) {
+                throw std::runtime_error("EAGLE3 fusion correction bias exceeds its declared bound");
+            }
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
