@@ -21,7 +21,7 @@ static __global__ void w1a1_pack_activations(
         double sum = 0.0;
         const float * row = activations + token*k;
         for (int64_t word = threadIdx.x; word < words; word += blockDim.x) {
-            for (int bit = 0; bit < 32 && word*32 + bit < k; ++bit) sum += (double) fabsf(row[word*32 + bit]);
+            for (int bit = 0; bit < 32 && word*32 + bit < k; ++bit) sum += (double) __uint_as_float(__float_as_uint(row[word*32 + bit]) & 0x7fffffffu);
         }
         sums[threadIdx.x] = sum;
         __syncthreads();
@@ -100,11 +100,17 @@ static __global__ void w1ax_quantize(
     const int64_t token = blockIdx.x;
     const float * row = activations + token*k;
     float local_max = 0.0f;
-    for (int64_t i = threadIdx.x; i < k; i += blockDim.x) local_max = fmaxf(local_max, fabsf(row[i]));
+    for (int64_t i = threadIdx.x; i < k; i += blockDim.x) {
+        // ggml-cuda uses -use_fast_math: float min/max may flush subnormals.
+        // Nonnegative finite IEEE bits have the same order as their magnitudes.
+        local_max = learned ? __uint_as_float(max(__float_as_uint(local_max), __float_as_uint(row[i]) & 0x7fffffffu)) : fmaxf(local_max, fabsf(row[i]));
+    }
     maxima[threadIdx.x] = local_max;
     __syncthreads();
     for (int stride = blockDim.x/2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+        if (threadIdx.x < stride) {
+            maxima[threadIdx.x] = learned ? __uint_as_float(max(__float_as_uint(maxima[threadIdx.x]), __float_as_uint(maxima[threadIdx.x + stride]))) : fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+        }
         __syncthreads();
     }
     if (threadIdx.x == 0) {
