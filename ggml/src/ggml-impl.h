@@ -45,6 +45,14 @@ static inline struct ggml_w1ax_pack_layout ggml_w1ax_pack_layout(int64_t k, int6
     return layout;
 }
 
+// Affine-only extension: one F32 code sum per token follows the legacy scale.
+static inline struct ggml_w1ax_pack_layout ggml_w1ax_affine_layout(int64_t k, int64_t n, int bits) {
+    struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
+    if (bits == 16) { layout.codes_words = 0; layout.planes_words = 0; layout.scale_offset = 0; layout.total_words = n; }
+    layout.total_words += n;
+    return layout;
+}
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);

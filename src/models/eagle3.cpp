@@ -208,6 +208,36 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         eagle_w1ax_learned = true;
     }
 
+    const std::string affine_prefix = "eagle3.affine_weights.";
+    std::set<std::string> affine_keys, actual_midpoints;
+    for (int64_t i = 0; i < gguf_get_n_kv(ml->metadata); ++i) {
+        const std::string key = gguf_get_key(ml->metadata,i);
+        if (key.compare(0,affine_prefix.size(),affine_prefix) == 0) affine_keys.insert(key);
+    }
+    for (int64_t i = 0; i < gguf_get_n_tensors(ml->metadata); ++i) {
+        const std::string name = gguf_get_tensor_name(ml->metadata,i);
+        if (name.find(".w1ax_midpoint") != std::string::npos) actual_midpoints.insert(name);
+    }
+    std::map<std::string,std::string> affine_tensors;
+    if (!affine_keys.empty() || !actual_midpoints.empty()) {
+        uint32_t version = 0; std::string coverage, arithmetic;
+        std::vector<std::string> bases, names;
+        ml->get_key(affine_prefix+"version",version); ml->get_key(affine_prefix+"coverage",coverage);
+        ml->get_key(affine_prefix+"arithmetic",arithmetic); ml->get_arr(affine_prefix+"bases",bases); ml->get_arr(affine_prefix+"midpoint_tensors",names);
+        const std::set<std::string> expected_keys = {affine_prefix+"version",affine_prefix+"coverage",affine_prefix+"arithmetic",affine_prefix+"bases",affine_prefix+"midpoint_tensors"};
+        std::set<std::string> expected_bases = {"fc"};
+        if (coverage == "all") for (const auto & name : w1a1_tensors) expected_bases.insert(name.substr(0,name.size()-7));
+        if (affine_keys != expected_keys || !has_full_w1a1 || full_w1a1_version != 2 || scale_group_size != 0 || version != 1 ||
+                (coverage != "fusion" && coverage != "all") || arithmetic != "integer_dot_alpha_beta_plus_integer_sum_midpoint_beta_before_bias_f32" ||
+                bases.size() != expected_bases.size() || std::set<std::string>(bases.begin(),bases.end()) != expected_bases || names.size() != bases.size() ||
+                std::set<std::string>(names.begin(),names.end()) != actual_midpoints || (coverage == "all" && w1a1_tensors.size() != 9)) throw std::runtime_error("invalid EAGLE3 affine weight contract");
+        for (size_t i = 0; i < bases.size(); ++i) {
+            if (names[i] != bases[i]+".w1ax_midpoint") throw std::runtime_error("invalid EAGLE3 affine midpoint name");
+            affine_tensors.emplace(bases[i],names[i]);
+        }
+        ml->check_tensors = true;
+    }
+
     auto load_w1a1_linear = [&](llm_tensor tensor, int bid, const std::string & base_name,
             int64_t logical_k, int64_t rows, ggml_tensor *& dense,
             ggml_tensor *& packed, ggml_tensor *& scales, int flags) {
@@ -259,6 +289,13 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
         scales = scale_group_size ?
             create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_scale", bid, -1), {(logical_k + 127)/128, rows}, 0) :
             create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3, tensor, "w1a1_scale", bid, -1), {rows}, 0);
+        const std::string base = base_name.substr(0,base_name.size()-7);
+        const auto affine = affine_tensors.find(base);
+        if (affine != affine_tensors.end()) {
+            const auto * midpoint = ml->get_tensor_meta(affine->second.c_str());
+            if (!midpoint || midpoint->type != GGML_TYPE_F32 || midpoint->ne[0] != rows || midpoint->ne[1] != 1 || midpoint->ne[2] != 1 || midpoint->ne[3] != 1) throw std::runtime_error("invalid EAGLE3 affine midpoint shape/type");
+            eagle_w1ax_midpoints[packed_name] = create_tensor(LLM_TN_IMPL(LLM_ARCH_EAGLE3,tensor,"w1ax_midpoint",bid,-1),{rows},0);
+        }
         dense = nullptr;
         LLAMA_LOG_INFO("%s: EAGLE3 W1A1 loaded %s (K=%lld, rows=%lld)\n", __func__, base_name.c_str(),
                 (long long) logical_k, (long long) rows);
@@ -451,6 +488,12 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
         }
         if (!loras->empty()) throw std::runtime_error("EAGLE3 packed W1A1 projections do not support draft LoRA adapters");
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
+        const auto affine = model.eagle_w1ax_midpoints.find(packed->name);
+        if (affine != model.eagle_w1ax_midpoints.end()) {
+            const int b = eagle3_quantizer_boundary(packed);
+            auto * pack = ggml_w1ax_pack_affine(ctx0,input,activation_bits,model.eagle_w1ax_delta[b],model.eagle_w1ax_clip[b],model.eagle_w1ax_learned);
+            return ggml_w1ax_mul_mat_affine(ctx0,packed,scales,affine->second,pack,logical_k,activation_bits);
+        }
         if (!model.eagle_w1ax_learned) return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
         const int boundary = eagle3_quantizer_boundary(packed);
         return ggml_w1ax_mul_mat_learned(ctx0, packed, scales, input, logical_k, activation_bits,
@@ -511,7 +554,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inpL;
     const char * shared_pack_env = std::getenv("GGML_EAGLE_SHARED_PACK");
     const bool shared_pack = activation_bits != 16 && shared_pack_env && std::string(shared_pack_env) == "1";
-    std::map<std::tuple<ggml_tensor *, int, float, float>, ggml_tensor *> activation_packs;
+    std::map<std::tuple<ggml_tensor *, int, float, float, bool>, ggml_tensor *> activation_packs;
     auto eagle_linear = [&](ggml_tensor * dense, ggml_tensor * packed, ggml_tensor * scales, ggml_tensor * input, int64_t logical_k) {
         if (!packed) {
             const char * a16 = std::getenv("GGML_EAGLE_DENSE_A16");
@@ -530,13 +573,15 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (input->type != GGML_TYPE_F32) input = ggml_cast(ctx0, input, GGML_TYPE_F32);
         const int boundary = eagle3_quantizer_boundary(packed);
         const float delta = model.eagle_w1ax_delta[boundary], clip = model.eagle_w1ax_clip[boundary];
-        if (shared_pack) {
-            auto & pack = activation_packs[std::make_tuple(identity, activation_bits, delta, clip)];
+        const auto affine = model.eagle_w1ax_midpoints.find(packed->name);
+        const bool is_affine = affine != model.eagle_w1ax_midpoints.end();
+        if (shared_pack || is_affine) {
+            auto & pack = activation_packs[std::make_tuple(identity, activation_bits, delta, clip, is_affine)];
             if (!pack) {
-                pack = model.eagle_w1ax_learned ? ggml_w1ax_pack_learned(ctx0, input, activation_bits, delta, clip) : ggml_w1ax_pack(ctx0, input, activation_bits);
+                pack = is_affine ? ggml_w1ax_pack_affine(ctx0,input,activation_bits,delta,clip,model.eagle_w1ax_learned) : model.eagle_w1ax_learned ? ggml_w1ax_pack_learned(ctx0, input, activation_bits, delta, clip) : ggml_w1ax_pack(ctx0, input, activation_bits);
                 ggml_format_name(pack, "w1ax_pack_for_%s", packed->name);
             }
-            return ggml_w1ax_mul_mat_shared(ctx0, packed, scales, pack, logical_k, activation_bits);
+            return is_affine ? ggml_w1ax_mul_mat_affine(ctx0,packed,scales,affine->second,pack,logical_k,activation_bits) : ggml_w1ax_mul_mat_shared(ctx0, packed, scales, pack, logical_k, activation_bits);
         }
         if (!model.eagle_w1ax_learned) return ggml_w1ax_mul_mat(ctx0, packed, scales, input, logical_k, activation_bits);
         return ggml_w1ax_mul_mat_learned(ctx0, packed, scales, input, logical_k, activation_bits,
@@ -739,8 +784,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         if (cur->type != GGML_TYPE_F32) {
             cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
         }
-        cur = model.eagle_w1ax_learned ? ggml_w1ax_mul_mat_learned(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd, activation_bits,
-                model.eagle_w1ax_delta[5], model.eagle_w1ax_clip[5]) : ggml_w1ax_mul_mat(ctx0, model.output_w1a1_packed, model.output_w1a1_scale, cur, hparams.n_embd, activation_bits);
+        cur = eagle_linear(nullptr,model.output_w1a1_packed,model.output_w1a1_scale,cur,hparams.n_embd);
     } else {
         auto * output = model.output;
         if (output == nullptr) {

@@ -5056,12 +5056,13 @@ struct test_w1a1_mul_mat : public test_case {
     const bool learned;
     const float delta, clip;
     const bool tiny;
+    const bool affine;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false, bool learned = false, float delta = 0, float clip = 1, bool tiny = false)
-        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout), learned(learned), delta(delta), clip(clip), tiny(tiny) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false, bool learned = false, float delta = 0, float clip = 1, bool tiny = false, bool affine = false)
+        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout), learned(learned), delta(delta), clip(clip), tiny(tiny), affine(affine) {}
 
-    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout) + ",learned=" + std::to_string(learned) + ",delta=" + std::to_string(delta) + ",clip=" + std::to_string(clip) + ",tiny=" + std::to_string(tiny); }
+    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout) + ",learned=" + std::to_string(learned) + ",delta=" + std::to_string(delta) + ",clip=" + std::to_string(clip) + ",tiny=" + std::to_string(tiny) + ",affine=" + std::to_string(affine); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5094,6 +5095,11 @@ struct test_w1a1_mul_mat : public test_case {
         ggml_set_name(w, "w1a1_weights");
         ggml_set_name(s, "w1a1_scales");
         ggml_set_name(a, "w1a1_activations");
+        if (affine) {
+            auto * mu = ggml_new_tensor_1d(ctx,GGML_TYPE_F32,m); ggml_set_name(mu,"w1ax_midpoints");
+            auto * pack = ggml_w1ax_pack_affine(ctx,a,bits,delta,clip,learned);
+            return ggml_w1ax_mul_mat_affine(ctx,w,s,mu,pack,k,bits);
+        }
         if (shared) {
             auto * pack = learned ? ggml_w1ax_pack_learned(ctx, a, bits, delta, clip) : ggml_w1ax_pack(ctx, a, bits);
             auto * out = ggml_w1ax_mul_mat_shared(ctx, w, s, pack, k, bits);
@@ -5111,6 +5117,8 @@ struct test_w1a1_mul_mat : public test_case {
         ggml_tensor * w = ggml_get_tensor(ctx, "w1a1_weights");
         ggml_tensor * s = ggml_get_tensor(ctx, "w1a1_scales");
         ggml_tensor * a = ggml_get_tensor(ctx, "w1a1_activations");
+        const float midpoints[m] = {0,.125f,-.5f,.25f,0,-.125f,std::numeric_limits<float>::denorm_min()};
+        if (affine) ggml_backend_tensor_set(ggml_get_tensor(ctx,"w1ax_midpoints"),midpoints,0,sizeof(midpoints));
         const int64_t words = (k - 1)/32 + 1;
         std::vector<uint32_t> packed(words * m);
         std::vector<float> acts(k * n_tokens);
@@ -5166,24 +5174,33 @@ struct test_w1a1_mul_mat : public test_case {
                 int64_t matches = 0;
                 int32_t int_dot = 0;
                 float half_dot = 0.0f;
+                float code_sum = 0;
                 for (int64_t i = 0; i < k; ++i) {
                     const int sign = weight_value(row, i) >= 0.0f ? 1 : -1;
                     const float x = acts[token * k + i];
                     volatile float threshold = delta*act_scale;
                     volatile float shifted = delta == 0 ? x : x - threshold;
                     matches += sign * (shifted >= 0.0f ? 1 : -1);
+                    if (bits == 1) code_sum += shifted >= 0.0f ? 1 : -1;
                     if (bits == 16) {
                         const float h = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
                         half_dot += sign > 0 ? h : -h;
+                        code_sum += h;
                     } else if (bits == 4 || bits == 8) {
                         const float inv = absmax == 0.0f ? 0.0f : float(qmax)/absmax;
                         const float normalized = absmax == 0.0f ? 0.0f : std::isfinite(inv) ? x*inv : float(double(x)/double(absmax)*qmax);
                         const int q = std::max(-qmax, std::min(qmax, int(std::nearbyint(normalized))));
                         int_dot += sign * q;
+                        code_sum += q;
                     }
                 }
                 const float weighted = (bits == 1 ? float(matches) : bits == 16 ? half_dot : float(int_dot)) * scales[row];
                 expected[token * m + row] = bits == 1 ? weighted * act_scale : bits == 16 ? weighted : weighted * quant_scale;
+                if (affine) {
+                    volatile float correction = code_sum*midpoints[row];
+                    volatile float scaled = bits == 16 ? correction : correction*(bits == 1 ? act_scale : quant_scale);
+                    expected[token*m+row] += scaled;
+                }
             }
         }
 
@@ -5204,6 +5221,10 @@ struct test_w1a1_mul_mat : public test_case {
 
     double err(const float * lhs, const float * rhs, size_t count) override {
         if (fanout || count != expected.size()) return test_case::err(lhs, rhs, count);
+        if (affine && tiny) {
+            for (size_t i = 0; i < count; ++i) if (lhs[i] != expected[i] || rhs[i] != expected[i]) return 1;
+            return 0;
+        }
         double worst = 0.0;
         for (size_t i = 0; i < count; ++i) {
             const double denom = 1.0 + std::abs(double(expected[i]));
@@ -10111,6 +10132,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 3, false, shared, false, true, 0, 1, true));
             }
         }
+    }
+
+    for (int bits : {1,4,8,16}) for (int64_t k : {1,33,2560}) {
+        test_cases.emplace_back(new test_w1a1_mul_mat(k,false,bits,3,false,true,false,false,0,1,false,true));
+        if (bits != 16) test_cases.emplace_back(new test_w1a1_mul_mat(k,false,bits,3,false,true,false,true,bits == 1 ? .75f : 0,bits == 1 ? 1 : .625f,false,true));
+        test_cases.emplace_back(new test_w1a1_mul_mat(k,false,bits,3,false,true,false,true,0,1,true,true));
     }
 
     for (ggml_type type_a : all_types) {

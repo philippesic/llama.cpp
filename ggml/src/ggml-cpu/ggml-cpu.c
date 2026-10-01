@@ -1484,14 +1484,23 @@ static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * pa
     const float delta = ggml_get_op_params_f32(dst, 1), clip = ggml_get_op_params_f32(dst, 2);
     const bool learned = ggml_get_op_params_i32(dst, 3);
     const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
-    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
+    const bool affine = ggml_get_op_params_i32(dst, 4);
+    const struct ggml_w1ax_pack_layout layout = affine ? ggml_w1ax_affine_layout(k, n, bits) : ggml_w1ax_pack_layout(k, n, bits);
     uint32_t * data = (uint32_t *) dst->data;
     int8_t * codes = (int8_t *) data;
     uint32_t * planes = data + layout.codes_words;
     float * scales = (float *) (data + layout.scale_offset);
-    if (params->ith == 0 && bits != 1) memset(codes + k*n, 0, layout.codes_words*4 - k*n);
+    if (params->ith == 0 && bits != 1 && bits != 16) memset(codes + k*n, 0, layout.codes_words*4 - k*n);
     for (int64_t token = params->ith; token < n; token += params->nth) {
         const float * row = (const float *) acts->data + token*k;
+        if (bits == 16) {
+            GGML_ASSERT(affine);
+            float sum = 0;
+            for (int64_t i = 0; i < k; ++i) { GGML_ASSERT(isfinite(row[i])); sum += ggml_fp16_to_fp32(ggml_fp32_to_fp16(row[i])); }
+            scales[token] = 1;
+            ((float *) (data + layout.scale_offset + n))[token] = sum;
+            continue;
+        }
         if (bits == 1) {
             double sum = 0.0;
             memset(planes + token*words, 0, words*sizeof(uint32_t));
@@ -1522,6 +1531,11 @@ static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * pa
                 }
             }
         }
+        if (affine) {
+            int32_t sum = 0;
+            for (int64_t i = 0; i < k; ++i) sum += bits == 1 ? ((planes[token*words+i/32] >> (i%32)) & 1u ? 1 : -1) : codes[token*k+i];
+            ((float *) (data + layout.scale_offset + n))[token] = (float) sum;
+        }
     }
 }
 
@@ -1549,7 +1563,10 @@ static void ggml_compute_forward_w1a1_mul_mat(
     GGML_ASSERT(ggml_is_contiguous(acts) && ggml_is_contiguous(dst));
 
     const struct ggml_tensor * shared = dst->src[3];
-    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, activation_bits);
+    const bool affine = dst->src[4] != NULL;
+    const struct ggml_w1ax_pack_layout layout = affine ? ggml_w1ax_affine_layout(k, n, activation_bits) : ggml_w1ax_pack_layout(k, n, activation_bits);
+    const float * midpoints = affine ? (const float *) dst->src[4]->data : NULL;
+    const float * code_sums = affine ? (const float *) ((const uint32_t *) shared->data + layout.scale_offset + n) : NULL;
     const float * shared_scales = shared ? (const float *) ((const uint32_t *) shared->data + layout.scale_offset) : NULL;
     uint32_t * signs = (uint32_t *) params->wdata + params->ith * words;
     const int64_t row_begin = m * params->ith / params->nth;
@@ -1624,6 +1641,12 @@ static void ggml_compute_forward_w1a1_mul_mat(
                 GGML_ASSERT(isfinite(scale_data[row]));
                 const float weighted = (activation_bits == 16 ? sum_fp : (float) sum_int) * scale_data[row];
                 output[token * m + row] = activation_bits == 16 ? weighted : weighted * act_scale;
+                if (affine) {
+                    GGML_ASSERT(isfinite(midpoints[row]));
+                    volatile float correction = code_sums[token]*midpoints[row];
+                    volatile float scaled = activation_bits == 16 ? correction : correction*act_scale;
+                    output[token*m+row] += scaled;
+                }
             }
             continue;
         }
@@ -1658,6 +1681,12 @@ static void ggml_compute_forward_w1a1_mul_mat(
             const float dot = (float) (k - 2 * mismatches);
             const float weighted = dot * scale_data[row];
             output[token * m + row] = weighted * act_scale;
+            if (affine) {
+                GGML_ASSERT(isfinite(midpoints[row]));
+                volatile float correction = code_sums[token]*midpoints[row];
+                volatile float scaled = correction*act_scale;
+                output[token*m+row] += scaled;
+            }
         }
     }
     free(owned_codes);

@@ -3451,13 +3451,40 @@ struct ggml_tensor * ggml_w1ax_mul_mat_shared(
         struct ggml_tensor * packed, int64_t k, int32_t bits) {
     GGML_ASSERT(packed->op == GGML_OP_W1AX_PACK && packed->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_get_op_params_i32(packed, 0) == bits && packed->src[0]->ne[0] == k);
-    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, packed->src[0]->ne[1], bits);
+    const struct ggml_w1ax_pack_layout layout = ggml_get_op_params_i32(packed, 4) ? ggml_w1ax_affine_layout(k, packed->src[0]->ne[1], bits) : ggml_w1ax_pack_layout(k, packed->src[0]->ne[1], bits);
     GGML_ASSERT(packed->ne[0] == layout.total_words && packed->ne[1] == 1 && ggml_is_contiguous(packed));
     struct ggml_tensor * result = ggml_w1ax_mul_mat_learned(ctx, weights, scales, packed->src[0], k, bits,
             ggml_get_op_params_f32(packed, 1), ggml_get_op_params_f32(packed, 2));
     ggml_set_op_params_i32(result, 5, ggml_get_op_params_i32(packed, 3));
     result->src[3] = packed;
     return result;
+}
+
+struct ggml_tensor * ggml_w1ax_pack_affine(
+        struct ggml_context * ctx, struct ggml_tensor * acts, int32_t bits,
+        float delta, float clip, bool learned) {
+    ggml_w1ax_check_params(bits, delta, clip);
+    GGML_ASSERT(bits == 1 || bits == 4 || bits == 8 || bits == 16);
+    GGML_ASSERT(acts->type == GGML_TYPE_F32 && acts->ne[0] > 0 && acts->ne[1] > 0 && acts->ne[2] == 1 && acts->ne[3] == 1);
+    if (!ggml_is_contiguous(acts)) acts = ggml_cont(ctx, acts);
+    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_affine_layout(acts->ne[0], acts->ne[1], bits);
+    struct ggml_tensor * pack = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.total_words);
+    pack->op = GGML_OP_W1AX_PACK; pack->src[0] = acts;
+    ggml_set_op_params_i32(pack, 0, bits); ggml_set_op_params_f32(pack, 1, delta);
+    ggml_set_op_params_f32(pack, 2, clip); ggml_set_op_params_i32(pack, 3, learned);
+    ggml_set_op_params_i32(pack, 4, 1);
+    return pack;
+}
+
+struct ggml_tensor * ggml_w1ax_mul_mat_affine(
+        struct ggml_context * ctx, struct ggml_tensor * weights, struct ggml_tensor * scales,
+        struct ggml_tensor * midpoints, struct ggml_tensor * packed, int64_t k, int32_t bits) {
+    GGML_ASSERT(ggml_get_op_params_i32(packed, 4) == 1);
+    GGML_ASSERT(scales->ne[0] == weights->ne[1] && scales->ne[1] == 1);
+    GGML_ASSERT(midpoints->type == GGML_TYPE_F32 && midpoints->ne[0] == weights->ne[1] && midpoints->ne[1] == 1 && midpoints->ne[2] == 1 && midpoints->ne[3] == 1);
+    struct ggml_tensor * out = ggml_w1ax_mul_mat_shared(ctx, weights, scales, packed, k, bits);
+    out->src[4] = ggml_is_contiguous(midpoints) ? midpoints : ggml_cont(ctx, midpoints);
+    return out;
 }
 
 void ggml_mul_mat_set_prec(

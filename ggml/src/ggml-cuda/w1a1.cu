@@ -51,7 +51,7 @@ static __global__ void w1a1_pack_activations(
 static __global__ void w1a1_xor_popc(
         const uint32_t * weights, const float * weight_scales,
         const uint32_t * activations, const float * activation_scales,
-        int64_t m, int64_t n, int64_t k, int64_t words, float * output, bool warp_reduce) {
+        int64_t m, int64_t n, int64_t k, int64_t words, float * output, bool warp_reduce, const float * midpoints, const float * code_sums) {
     __shared__ int counts[4][32];
     const int64_t row = (int64_t) blockIdx.x*4 + threadIdx.y;
     const bool valid_row = row < m;
@@ -83,7 +83,7 @@ static __global__ void w1a1_xor_popc(
         if (valid_row && lane == 0) {
             const float dot = (float) (k - 2*(int64_t) total);
             const float weighted = dot*weight_scales[row];
-            output[token*m + row] = weighted*activation_scales[token];
+            output[token*m + row] = midpoints ? __fadd_rn(__fmul_rn(__fmul_rn(dot, weight_scales[row]), activation_scales[token]), __fmul_rn(__fmul_rn(code_sums[token], midpoints[row]), activation_scales[token])) : weighted*activation_scales[token];
         }
         if (!warp_reduce) __syncthreads();
     }
@@ -151,7 +151,7 @@ static __global__ void w1ax_quantize(
 static __global__ void w1ax_integer_dot(
         const uint32_t * weights, const float * weight_scales,
         const int8_t * codes, const uint32_t * planes, const float * act_scales,
-        int64_t m, int64_t k, int64_t words, int bits, bool bitserial, float * output, int32_t * raw_dots, bool warp_reduce) {
+        int64_t m, int64_t k, int64_t words, int bits, bool bitserial, float * output, int32_t * raw_dots, bool warp_reduce, const float * midpoints, const float * code_sums) {
     __shared__ int sums[4][32];
     const int64_t row = (int64_t) blockIdx.x*4 + threadIdx.y;
     const int64_t token = blockIdx.y;
@@ -191,7 +191,7 @@ static __global__ void w1ax_integer_dot(
     if (row < m && lane == 0) {
         if (raw_dots) raw_dots[token*m + row] = sum;
         const float weighted = (float) sum * weight_scales[row];
-        output[token*m + row] = weighted * act_scales[token];
+        output[token*m + row] = midpoints ? __fadd_rn(__fmul_rn(__fmul_rn((float) sum, weight_scales[row]), act_scales[token]), __fmul_rn(__fmul_rn(code_sums[token], midpoints[row]), act_scales[token])) : weighted * act_scales[token];
     }
 }
 
@@ -216,16 +216,17 @@ static __global__ void w1ax_validate_integer_dots(
 // values in F32 reduction order, then apply the F32 binary-weight row scale.
 static __global__ void w1a16_signadd(
         const uint32_t * weights, const float * weight_scales, const float * activations,
-        int64_t m, int64_t k, int64_t words, float * output) {
+        int64_t m, int64_t k, int64_t words, float * output, const float * midpoints, const float * code_sums) {
     const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     const int64_t token = blockIdx.y;
     if (row >= m) return;
     float sum = 0.0f;
     for (int64_t i = 0; i < k; ++i) {
         const float value = __half2float(__float2half_rn(activations[token*k + i]));
-        sum += (weights[row*words + i/32] & (1u << (i%32))) ? value : -value;
+        const float signed_value = (weights[row*words + i/32] & (1u << (i%32))) ? value : -value;
+        sum = midpoints ? __fadd_rn(sum, signed_value) : sum + signed_value;
     }
-    output[token*m + row] = sum * weight_scales[row];
+    output[token*m + row] = midpoints ? __fadd_rn(__fmul_rn(sum, weight_scales[row]), __fmul_rn(code_sums[token], midpoints[row])) : sum * weight_scales[row];
 }
 
 // Quality reference: separate F32 group products and sums, never FMA.
@@ -322,6 +323,24 @@ static void w1ax_capture_activations(
     GGML_ASSERT(fclose(sidecar) == 0);
 }
 
+// One shared S per token, derived from the exact emitted codes. A16 uses the
+// same F16 boundary values as signadd, accumulated in sequential F32 order.
+static __global__ void w1ax_code_sum(const float * acts, const uint32_t * packed,
+        int64_t k, int64_t n, int bits, float * sums, float * scales) {
+    const int64_t token = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (token >= n) return;
+    if (bits == 16) {
+        float sum = 0;
+        for (int64_t i = 0; i < k; ++i) sum = __fadd_rn(sum, __half2float(__float2half_rn(acts[token*k+i])));
+        sums[token] = sum; scales[token] = 1;
+    } else {
+        int32_t sum = 0;
+        const int64_t words = (k+31)/32;
+        for (int64_t i = 0; i < k; ++i) sum += bits == 1 ? ((packed[token*words+i/32] >> (i%32)) & 1u ? 1 : -1) : ((const int8_t *) packed)[token*k+i];
+        sums[token] = (float) sum;
+    }
+}
+
 void ggml_cuda_w1ax_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_eagle_scope eagle_pack_scope(ctx, "activation_pack_scales", dst);
     const ggml_tensor * acts = dst->src[0];
@@ -329,20 +348,22 @@ void ggml_cuda_w1ax_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float delta = ggml_get_op_params_f32(dst, 1), clip = ggml_get_op_params_f32(dst, 2);
     const bool learned = ggml_get_op_params_i32(dst, 3);
     const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
-    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
+    const bool affine = ggml_get_op_params_i32(dst, 4);
+    const struct ggml_w1ax_pack_layout layout = affine ? ggml_w1ax_affine_layout(k, n, bits) : ggml_w1ax_pack_layout(k, n, bits);
     uint32_t * data = (uint32_t *) dst->data;
     float * scales = (float *) (data + layout.scale_offset);
-    GGML_ASSERT(bits == 1 || bits == 4 || bits == 8);
+    GGML_ASSERT(bits == 1 || bits == 4 || bits == 8 || (bits == 16 && affine));
     GGML_ASSERT(n <= INT_MAX);
     cudaStream_t stream = ctx.stream();
     if (bits == 1) {
         w1a1_pack_activations<<<dim3((unsigned) n), 256, 0, stream>>>(
                 (const float *) acts->data, k, words, n, data, scales, delta);
-    } else {
+    } else if (bits != 16) {
         if (layout.codes_words*4 > k*n) CUDA_CHECK(cudaMemsetAsync((int8_t *) data + k*n, 0, layout.codes_words*4 - k*n, stream));
         w1ax_quantize<<<dim3((unsigned) n), 256, 0, stream>>>(
                 (const float *) acts->data, k, words, bits, (int8_t *) data, data + layout.codes_words, scales, clip, learned);
     }
+    if (affine) w1ax_code_sum<<<dim3((unsigned) ((n+127)/128)),128,0,stream>>>((const float *) acts->data, data, k,n,bits,(float *) (data+layout.scale_offset+n),scales);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -396,6 +417,10 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const unsigned token_blocks = (unsigned) (n < 65535 ? n : 65535);
     GGML_ASSERT(n <= 65535);
     w1ax_capture_activations(stream, weights, acts, k, m, n, bits);
+    const ggml_tensor * shared = dst->src[3];
+    const float * midpoints = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
+    const struct ggml_w1ax_pack_layout layout = midpoints ? ggml_w1ax_affine_layout(k,n,bits) : ggml_w1ax_pack_layout(k,n,bits);
+    const float * code_sums = midpoints ? (const float *) ((const uint32_t *) shared->data + layout.scale_offset+n) : nullptr;
     if (bits == 16 && grouped) {
         ggml_cuda_matmul_audit(ctx, weights, acts, "custom_A16_group128", "F16", "F32_signadd_and_scales", "inside_kernel_F16_round_no_separate_pack");
         ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output_A16_inside_cast", dst);
@@ -410,12 +435,10 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output_A16_inside_cast", dst);
         w1a16_signadd<<<dim3((unsigned) ((m + 127)/128), token_blocks), 128, 0, stream>>>(
                 (const uint32_t *) weights->data, (const float *) scales->data,
-                (const float *) acts->data, m, k, words, (float *) dst->data);
+                (const float *) acts->data, m, k, words, (float *) dst->data, midpoints, code_sums);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const ggml_tensor * shared = dst->src[3];
-    const struct ggml_w1ax_pack_layout layout = ggml_w1ax_pack_layout(k, n, bits);
     ggml_cuda_pool_alloc<float> act_scales(ctx.pool());
     const float * scale_ptr = shared ? (const float *) ((const uint32_t *) shared->data + layout.scale_offset) : act_scales.alloc(n);
     if (bits == 4 || bits == 8) {
@@ -437,7 +460,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             w1ax_integer_dot<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
                     (const uint32_t *) weights->data, (const float *) scales->data,
                     code_ptr, plane_ptr, scale_ptr, m, k, words, bits, bitserial, (float *) dst->data,
-                    check_integer_dots ? raw_dots.ptr : nullptr, warp_reduce);
+                    check_integer_dots ? raw_dots.ptr : nullptr, warp_reduce, midpoints, code_sums);
             CUDA_CHECK(cudaGetLastError());
         }
         if (check_integer_dots) {
@@ -460,7 +483,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_eagle_scope eagle_dot_scope(ctx, "dot_output", dst);
     w1a1_xor_popc<<<dim3((unsigned) ((m - 1)/4 + 1), token_blocks), dim3(32, 4), 0, stream>>>(
             (const uint32_t *) weights->data, (const float *) scales->data,
-            packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data, warp_reduce);
+            packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data, warp_reduce, midpoints, code_sums);
     CUDA_CHECK(cudaGetLastError());
 }
 

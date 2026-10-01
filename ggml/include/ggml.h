@@ -1526,6 +1526,15 @@ extern "C" {
             struct ggml_tensor * activations, int64_t logical_k, int32_t activation_bits,
             float threshold_delta, float clip_ratio);
 
+    // Affine binary weights mu + alpha*sign(z), using one shared code sum.
+    GGML_API struct ggml_tensor * ggml_w1ax_pack_affine(
+            struct ggml_context * ctx, struct ggml_tensor * activations, int32_t bits,
+            float threshold_delta, float clip_ratio, bool learned);
+    GGML_API struct ggml_tensor * ggml_w1ax_mul_mat_affine(
+            struct ggml_context * ctx, struct ggml_tensor * weights, struct ggml_tensor * scales,
+            struct ggml_tensor * midpoints, struct ggml_tensor * packed_activations,
+            int64_t logical_k, int32_t bits);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
