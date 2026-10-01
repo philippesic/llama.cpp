@@ -454,6 +454,6 @@ int main(int argc, char ** argv) {
     }
     printf("EAGLE3 fixtures passed backend=%s exact_pack_cases=%d loader_cases=%d actual_graph_cases=%d arithmetic_nodes=%d\n",selected.requested,pack_cases,loader_cases,graph_cases,graph_nodes);
     measurements["counters"] = {{"pack_cases",pack_cases},{"loader_cases",loader_cases},{"graph_cases",graph_cases},{"arithmetic_nodes",graph_nodes},{"projection_cases",measurements["projection_cases"].size()}};
-    measurements["status"] = "passed"; measurements.erase("failure_reason"); checkpoint_report();
     ggml_backend_free(selected.backend); llama_backend_free();
+    measurements["status"] = "passed"; measurements.erase("failure_reason"); checkpoint_report();
 }
