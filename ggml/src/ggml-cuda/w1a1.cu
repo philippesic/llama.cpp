@@ -29,13 +29,13 @@ static __global__ void w1a1_pack_activations(
             if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
             __syncthreads();
         }
-        if (threadIdx.x == 0) scales[token] = (float) (sums[0] / (double) k);
+        if (threadIdx.x == 0) scales[token] = __double2float_rn(sums[0] / (double) k);
         __syncthreads();
         const float threshold = __fmul_rn(delta, scales[token]);
         for (int64_t word = threadIdx.x; word < words; word += blockDim.x) {
             uint32_t bits = 0;
             for (int bit = 0; bit < 32 && word*32 + bit < k; ++bit) {
-                const float value = delta == 0.0f ? row[word*32 + bit] : __fsub_rn(row[word*32 + bit], threshold);
+                const float value = (__float_as_uint(delta) & 0x7fffffffu) == 0 ? row[word*32 + bit] : __fsub_rn(row[word*32 + bit], threshold);
                 const uint32_t raw = __float_as_uint(value);
                 const bool positive = (raw & 0x80000000u) == 0 || (raw & 0x7fffffffu) == 0;
                 bits |= (uint32_t) positive << bit;
@@ -120,9 +120,11 @@ static __global__ void w1ax_quantize(
     }
     __syncthreads();
     const int qmax = bits == 8 ? 127 : 7;
-    const float inv = maxima[0] == 0.0f ? 0.0f : __fdiv_rn((float) qmax, maxima[0]);
+    const bool zero_limit = learned ? (__float_as_uint(maxima[0]) & 0x7fffffffu) == 0 : maxima[0] == 0.0f;
+    const float inv = zero_limit ? 0.0f : __fdiv_rn((float) qmax, maxima[0]);
     for (int64_t i = threadIdx.x; i < k; i += blockDim.x) {
-        const float normalized = maxima[0] == 0.0f ? 0.0f : (!learned || isfinite(inv)) ? __fmul_rn(row[i], inv) : (float) ((double) row[i]/(double) maxima[0]*qmax);
+        const bool finite_inv = (__float_as_uint(inv) & 0x7f800000u) != 0x7f800000u;
+        const float normalized = zero_limit ? 0.0f : (!learned || finite_inv) ? __fmul_rn(row[i], inv) : __double2float_rn((double) row[i]/(double) maxima[0]*qmax);
         const int q = __float2int_rn(learned ? fmaxf(-qmax, fminf(qmax, normalized)) : normalized);
         codes[token*k + i] = (int8_t) max(-qmax, min(qmax, q));
     }
