@@ -518,8 +518,8 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
         // the raw input and the rank-sized intermediate remain F32 on every backend.
         auto * v = ggml_cast(ctx0, model.fc_correction_v, GGML_TYPE_F32);
         auto * u = ggml_cast(ctx0, model.fc_correction_u, GGML_TYPE_F32);
-        auto * latent = ggml_mul_mat(ctx0, v, raw_fc_input); ggml_mul_mat_set_prec(latent, GGML_PREC_F32);
-        auto * delta = ggml_mul_mat(ctx0, u, latent); ggml_mul_mat_set_prec(delta, GGML_PREC_F32);
+        auto * latent = ggml_mul_mat(ctx0, v, raw_fc_input); ggml_set_name(latent,"fc_correction_latent"); ggml_mul_mat_set_prec(latent, GGML_PREC_F32);
+        auto * delta = ggml_mul_mat(ctx0, u, latent); ggml_set_name(delta,"fc_correction_delta"); ggml_mul_mat_set_prec(delta, GGML_PREC_F32);
         cur = ggml_add(ctx0, cur, delta);
         if (model.fc_correction_bias) cur = ggml_add(ctx0, cur, model.fc_correction_bias);
     }
