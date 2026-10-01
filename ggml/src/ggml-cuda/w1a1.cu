@@ -361,7 +361,7 @@ void ggml_cuda_w1ax_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else if (bits != 16) {
         if (layout.codes_words*4 > k*n) CUDA_CHECK(cudaMemsetAsync((int8_t *) data + k*n, 0, layout.codes_words*4 - k*n, stream));
         w1ax_quantize<<<dim3((unsigned) n), 256, 0, stream>>>(
-                (const float *) acts->data, k, words, bits, (int8_t *) data, data + layout.codes_words, scales, clip, learned);
+                (const float *) acts->data, k, words, bits, (int8_t *) data, data + layout.codes_words, scales, clip, learned || affine);
     }
     if (affine) w1ax_code_sum<<<dim3((unsigned) ((n+127)/128)),128,0,stream>>>((const float *) acts->data, data, k,n,bits,(float *) (data+layout.scale_offset+n),scales);
     CUDA_CHECK(cudaGetLastError());

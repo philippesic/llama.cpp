@@ -1482,7 +1482,7 @@ static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * pa
     const struct ggml_tensor * acts = dst->src[0];
     const int bits = ggml_get_op_params_i32(dst, 0);
     const float delta = ggml_get_op_params_f32(dst, 1), clip = ggml_get_op_params_f32(dst, 2);
-    const bool learned = ggml_get_op_params_i32(dst, 3);
+    const bool learned = ggml_get_op_params_i32(dst, 3) || ggml_get_op_params_i32(dst, 4);
     const int64_t k = acts->ne[0], n = acts->ne[1], words = (k + 31)/32;
     const bool affine = ggml_get_op_params_i32(dst, 4);
     const struct ggml_w1ax_pack_layout layout = affine ? ggml_w1ax_affine_layout(k, n, bits) : ggml_w1ax_pack_layout(k, n, bits);

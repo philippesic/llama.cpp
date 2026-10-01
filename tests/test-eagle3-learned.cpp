@@ -1,4 +1,4 @@
-// Tiny CPU loader/encoder fixtures for the versioned learned scalar contract.
+// Tiny selectable CPU/CUDA loader/encoder fixtures for the versioned learned scalar contract.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -7,6 +7,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -112,22 +113,53 @@ static gguf_context * fixture(int bits, float delta, float clip, const std::stri
     return g;
 }
 
-static bool check_packs() {
-    auto * backend = ggml_backend_cpu_init();
-    for (int bits : {1,4,8,16}) for (bool affine : {false,true}) for (int variant : {0,1,2}) {
+struct fixture_backend {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_dev_t device = nullptr;
+    const char * requested = "CPU";
+};
+
+struct execution_audit {
+    llama_context * ctx = nullptr;
+    ggml_backend_dev_t device = nullptr;
+    int arithmetic_nodes = 0;
+    bool correct = true;
+};
+
+static bool audit_node(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto & audit = *(execution_audit *) user_data;
+    const bool arithmetic = tensor->op == GGML_OP_W1AX_PACK || tensor->op == GGML_OP_W1A1_MUL_MAT ||
+        tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_CPY || tensor->op == GGML_OP_ADD;
+    if (ask) return arithmetic;
+    auto * backend = ggml_backend_sched_get_tensor_backend(audit.ctx->get_sched(), tensor);
+    if (!backend || ggml_backend_get_device(backend) != audit.device) {
+        fprintf(stderr,"requested device fallback at %s (%s)\n",tensor->name,ggml_op_name(tensor->op));
+        audit.correct = false;
+        return false;
+    }
+    ++audit.arithmetic_nodes;
+    return true;
+}
+
+static bool check_packs(const fixture_backend & selected, int & cases) {
+    auto * backend = selected.backend;
+    for (int bits : {1,4,8,16}) for (bool affine : {false,true}) for (bool learned : {false,true}) for (int variant : {0,1,2}) {
+        if (!affine && !learned) continue;
         if (bits == 16 && !affine) continue;
         const float delta = bits == 1 ? (variant == 0 ? 0.f : variant == 1 ? .75f : -1.f) : 0.f;
         const float clip = bits == 1 || bits == 16 || variant == 0 ? 1.f : .625f;
         ggml_init_params ip = {1024*1024, nullptr, true}; auto * ctx = ggml_init(ip);
-        const int k = 33, n = 3;
+        const int k = 33, n = 4;
         auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
-        auto * pack = affine ? ggml_w1ax_pack_affine(ctx,a,bits,delta,clip,true) : ggml_w1ax_pack_learned(ctx, a, bits, delta, clip);
+        auto * pack = affine ? ggml_w1ax_pack_affine(ctx,a,bits,delta,clip,learned) : ggml_w1ax_pack_learned(ctx, a, bits, delta, clip);
         auto * graph = ggml_new_graph(ctx); ggml_build_forward_expand(graph, pack);
+        if (!ggml_backend_supports_op(backend,pack)) { fprintf(stderr,"requested backend does not support pack\n"); return false; }
         auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buffer || (std::string(selected.requested) == "CUDA" && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)) != selected.device)) { fprintf(stderr,"pack buffer fallback\n"); return false; }
         std::vector<float> acts(k*n);
         for (int t = 0; t < n; ++t) for (int i = 0; i < k; ++i) {
             acts[t*k+i] = t == 0 ? (i%3 == 0 ? -2.f : i%3 == 1 ? .25f : 1.f) :
-                t == 1 ? (i%2 ? -0.f : 0.f) : (i%2 ? -std::numeric_limits<float>::denorm_min() : std::numeric_limits<float>::denorm_min());
+                t == 1 ? (i%2 ? -0.f : 0.f) : t == 2 ? (i%2 ? -std::numeric_limits<float>::denorm_min() : std::numeric_limits<float>::denorm_min()) : (i%3 == 0 ? 0.f : i%3 == 1 ? -std::numeric_limits<float>::denorm_min() : std::numeric_limits<float>::denorm_min());
         }
         ggml_backend_tensor_set(a, acts.data(), 0, acts.size()*sizeof(float));
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) return false;
@@ -169,14 +201,35 @@ static bool check_packs() {
             }
             if (bits == 1 && (actual[t*((k+31)/32)+(k+31)/32-1] & ~1u)) { fprintf(stderr,"packed tail mismatch\n"); return false; }
         }
+        ++cases;
         ggml_backend_buffer_free(buffer); ggml_free(ctx);
     }
-    ggml_backend_free(backend); return true;
+    return true;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    fixture_backend selected;
+    if (argc == 3 && std::string(argv[1]) == "--backend" && (std::string(argv[2]) == "CPU" || std::string(argv[2]) == "CUDA")) selected.requested = argv[2];
+    else if (argc != 1) { fprintf(stderr,"Usage: %s [--backend CPU|CUDA]\n",argv[0]); return 2; }
+    const bool cuda = std::string(selected.requested) == "CUDA";
+#ifndef GGML_USE_CUDA
+    if (cuda) { fprintf(stderr,"CUDA requested but this fixture was built without CUDA support; refusing fallback\n"); return 2; }
+#endif
     llama_backend_init();
-    if (!check_packs()) return 1;
+    if (cuda) {
+        auto * reg = ggml_backend_reg_by_name("CUDA");
+        if (!reg || ggml_backend_reg_dev_count(reg) == 0) { fprintf(stderr,"CUDA requested but no CUDA device is available; refusing fallback\n"); return 2; }
+        selected.device = ggml_backend_reg_dev_get(reg,0);
+        if (!selected.device || ggml_backend_dev_type(selected.device) != GGML_BACKEND_DEVICE_TYPE_GPU || std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(selected.device))) != "CUDA") return 2;
+        selected.backend = ggml_backend_dev_init(selected.device,nullptr);
+    } else {
+        selected.backend = ggml_backend_cpu_init();
+        selected.device = ggml_backend_get_device(selected.backend);
+    }
+    if (!selected.backend) { fprintf(stderr,"failed to initialize requested backend\n"); return 2; }
+    printf("fixture backend=%s device=%s hardware=%s\n",selected.requested,ggml_backend_dev_name(selected.device),ggml_backend_dev_description(selected.device));
+    int pack_cases = 0, loader_cases = 0, graph_cases = 0, graph_nodes = 0;
+    if (!check_packs(selected,pack_cases)) return 1;
     llama_log_set([](ggml_log_level level, const char * text, void *){ if (level == GGML_LOG_LEVEL_ERROR) fputs(text, stderr); }, nullptr);
     for (int bits : {1,4,8,16}) {
         const std::string value = std::to_string(bits); setenv("GGML_W1AX_ACT_BITS", value.c_str(), 1);
@@ -185,14 +238,24 @@ int main() {
             const float delta = mode == "incompatible" ? .5f : bits == 1 && (mode == "learned" || mode == "affine_all" || mode == "affine_correction") ? .75f : 0;
             const float clip = (bits == 4 || bits == 8) && (mode == "learned" || mode == "affine_all" || mode == "affine_correction") ? .625f : 1;
             auto * g = fixture(bits, delta, clip, mode);
-            llama_model_params mp = llama_model_default_params(); mp.n_gpu_layers = 0;
+            const bool valid = mode == "affine_fixed_fusion" || mode == "affine_fixed_all" || mode == "affine_fusion" || mode == "affine_all" || mode == "affine_correction" || mode == "affine_zero" || mode == "affine_zeroalpha" || mode == "correction_fixed" || mode == "correction_zero" || mode == "correction_rank1" || mode == "correction_rank4" || mode == "correction_bias" || mode == "legacy" || mode == "default" || mode == "learned" || (mode == "incompatible" && bits == 1);
+            llama_model_params mp = llama_model_default_params();
+            ggml_backend_dev_t devices[] = {selected.device,nullptr};
+            mp.n_gpu_layers = cuda && valid ? 1000 : 0;
+            // Invalid payloads remain CPU loader tests; valid graph devices are pinned.
+            ggml_backend_dev_t cpu_only[] = {nullptr};
+            mp.devices = cuda && valid ? devices : cpu_only;
             const std::string path = "/tmp/eagle3-learned-"+std::to_string(getpid())+".gguf";
             auto * model = llama_model_load_from_file(path.c_str(), mp); gguf_free(g); std::remove(path.c_str());
-            const bool valid = mode == "affine_fixed_fusion" || mode == "affine_fixed_all" || mode == "affine_fusion" || mode == "affine_all" || mode == "affine_correction" || mode == "affine_zero" || mode == "affine_zeroalpha" || mode == "correction_fixed" || mode == "correction_zero" || mode == "correction_rank1" || mode == "correction_rank4" || mode == "correction_bias" || mode == "legacy" || mode == "default" || mode == "learned" || (mode == "incompatible" && bits == 1);
+
+            ++loader_cases;
             if ((model != nullptr) != valid) { fprintf(stderr, "loader mismatch bits=%d mode=%s\n", bits, mode.c_str()); return 1; }
             if (!model) continue;
             llama_context_params cp = llama_context_default_params(); cp.n_ctx = 32; cp.n_threads = 2; cp.n_threads_batch = 2; cp.embeddings = true; cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+            execution_audit audit; audit.device = selected.device;
+            cp.cb_eval = audit_node; cp.cb_eval_user_data = &audit;
             auto * ctx = llama_init_from_model(model, cp);
+            audit.ctx = ctx;
             if (!ctx) { fprintf(stderr, "context failure\n"); return 1; }
             auto batch = llama_batch_init(1, 192, 1); batch.n_tokens = 1; batch.pos[0] = 0; batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0; batch.logits[0] = 1;
             double abs_sum = 0; float absmax = 0;
@@ -216,11 +279,14 @@ int main() {
                 ref += correction; if (mode == "correction_bias") ref += .125f;
             }
             if (llama_encode(ctx, batch)) { fprintf(stderr, "encode failure\n"); return 1; }
+            if (!audit.correct || audit.arithmetic_nodes == 0) { fprintf(stderr,"encoder device audit failed\n"); return 1; }
+            ++graph_cases; graph_nodes += audit.arithmetic_nodes;
             auto * output = llama_get_embeddings(ctx);
             if (!output) { fprintf(stderr, "missing output\n"); return 1; }
             for (int i = 0; i < 64; ++i) if (std::abs(output[i]-ref) > 1e-4) { fprintf(stderr, "numeric mismatch %g vs %g\n", output[i], ref); return 1; }
             llama_batch_free(batch); llama_free(ctx); llama_model_free(model);
         }
     }
-    puts("EAGLE3 learned/correction/affine loader/encoder fixtures passed"); llama_backend_free();
+    printf("EAGLE3 fixtures passed backend=%s exact_pack_cases=%d loader_cases=%d actual_graph_cases=%d arithmetic_nodes=%d\n",selected.requested,pack_cases,loader_cases,graph_cases,graph_nodes);
+    ggml_backend_free(selected.backend); llama_backend_free();
 }
