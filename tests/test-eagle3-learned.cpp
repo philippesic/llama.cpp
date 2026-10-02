@@ -212,7 +212,19 @@ static bool check_packs(const fixture_backend & selected, int & cases) {
             float expected_sum = 0;
             memcpy(expected_packed.data()+layout.scale_offset+t,&beta,sizeof(float));
             float actual_beta; memcpy(&actual_beta, actual.data()+layout.scale_offset+t, sizeof(float));
-            if (memcmp(&beta, &actual_beta, sizeof(float))) { fprintf(stderr,"pack beta mismatch\n"); return false; }
+            if (memcmp(&beta, &actual_beta, sizeof(float))) {
+                uint32_t expected_bits,actual_bits;
+                memcpy(&expected_bits,&beta,sizeof(expected_bits)); memcpy(&actual_bits,&actual_beta,sizeof(actual_bits));
+                fprintf(stderr,"pack beta mismatch bits=%d affine=%d learned=%d variant=%d delta=%a clip=%a k=%d n=%d token=%d expected_beta=%a actual_beta=%a expected_bits=0x%08x actual_bits=0x%08x sum_f64=%a absmax=%a limit=%a\n",
+                        bits,int(affine),int(learned),variant,double(delta),double(clip),k,n,t,double(beta),double(actual_beta),unsigned(expected_bits),unsigned(actual_bits),sum,double(maximum),double(limit));
+                measurements["failure_reason"] = "pack_beta_mismatch";
+                measurements["failed_pack_case"] = {{"bits",bits},{"affine",affine},{"learned",learned},{"variant",variant},{"threshold_delta",delta},{"clip_ratio",clip},{"k",k},{"n",n},{"token",t},
+                    {"expected_beta_f32_hex",hex_bytes(&beta,sizeof(float))},{"native_beta_f32_hex",hex_bytes(&actual_beta,sizeof(float))},{"expected_beta_u32",expected_bits},{"native_beta_u32",actual_bits},{"reference_sum_f64",sum},{"reference_absmax_f32",maximum},{"reference_limit_f32",limit},
+                    {"input_f32_hex",hex_bytes(acts.data(),acts.size()*sizeof(float))},{"native_packed_hex",hex_bytes(actual.data(),actual.size()*sizeof(uint32_t))},
+                    {"layout",{{"codes_words",layout.codes_words},{"planes_words",layout.planes_words},{"scale_offset",layout.scale_offset},{"sum_offset",affine ? json(layout.scale_offset+n) : json(nullptr)},{"total_words",layout.total_words}}}};
+                checkpoint_report();
+                return false;
+            }
             for (int i = 0; i < k; ++i) {
                 if (bits == 16) {
                     expected_sum += ggml_fp16_to_fp32(ggml_fp32_to_fp16(acts[t*k+i]));
