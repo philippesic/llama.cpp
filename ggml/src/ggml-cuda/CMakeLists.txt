@@ -253,6 +253,15 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+
+    # W1Ax packing promises IEEE token scales and learned thresholds, including
+    # subnormal F32 inputs. -use_fast_math enables FTZ even for the F32-to-F64
+    # conversion in the A1 mean: a token of +/- 2^-149 then gets beta=0.
+    # Override only FTZ for this translation unit, retaining its other CUDA
+    # optimizations and leaving unrelated kernels unchanged. Per-source options
+    # follow target options, so this overrides -use_fast_math's FTZ setting.
+    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/w1a1.cu"
+                 APPEND PROPERTY COMPILE_OPTIONS "--ftz=false")
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
