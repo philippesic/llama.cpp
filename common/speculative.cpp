@@ -1169,6 +1169,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
     const bool author_reference_layout = std::getenv("DSPARK_REQUIRE_AUTHOR_LAYOUT") != nullptr;
+    const bool sync_component_timings = std::getenv("DSPARK_SYNC_COMPONENT_TIMINGS") != nullptr;
 
     // Admission-only evidence. No tensor copies/hashes are performed without this env.
     std::ofstream admission;
@@ -1475,7 +1476,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int64_t t_decode = process_trace_enabled ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (t_decode) {
-                    llama_synchronize(ctx_dft);
+                    if (sync_component_timings) llama_synchronize(ctx_dft);
                     process_trace.draft_decode_us += ggml_time_us() - t_decode;
                     process_trace.n_draft_decode += n_chunk;
                 }
@@ -1561,7 +1562,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int64_t t_decode = process_trace_enabled ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
         if (t_decode) {
-            llama_synchronize(ctx_dft);
+            if (sync_component_timings) llama_synchronize(ctx_dft);
             draft_trace.seed_decode_us = ggml_time_us() - t_decode;
         }
         if (ret != 0) {

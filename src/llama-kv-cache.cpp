@@ -9,6 +9,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -1786,6 +1788,42 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    // Admission-only observation of the actual populated noise attention mask.
+    if (!causal_attn && ubatch->token) {
+        if (const char * path = std::getenv("DSPARK_ADMISSION_JSONL")) {
+            if (*path) {
+                std::ofstream trace(path, std::ios::out | std::ios::app);
+                GGML_ASSERT(trace.is_open());
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const auto seq = ubatch->seq_id[i][0];
+                    llama_pos anchor = ubatch->pos[i];
+                    for (uint32_t k = 0; k < n_tokens; ++k) {
+                        if (ubatch->seq_id[k][0] == seq) anchor = std::min(anchor, ubatch->pos[k]);
+                    }
+                    const auto & cells = v_cells.at(seq_to_stream[seq]);
+                    llama_pos max_clean = -1;
+                    std::vector<llama_pos> visible_noise;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const int64_t index = n_kv*i + j;
+                        const float value = dst->type == GGML_TYPE_F16 ?
+                            ggml_fp16_to_fp32(((const ggml_fp16_t *) dst->data)[index]) :
+                            ((const float *) dst->data)[index];
+                        if (!std::isfinite(value) || cells.is_empty(j) || !cells.seq_has(j, seq)) continue;
+                        const llama_pos pos = cells.pos_get(j);
+                        if (pos < anchor) max_clean = std::max(max_clean, pos);
+                        else visible_noise.push_back(pos);
+                    }
+                    std::sort(visible_noise.begin(), visible_noise.end());
+                    trace << "{\"schema\":\"dspark_admission_v1\",\"event\":\"mask\",\"seq_id\":" << seq
+                          << ",\"query_position\":" << ubatch->pos[i] << ",\"anchor_position\":" << anchor
+                          << ",\"max_visible_clean_position\":" << max_clean << ",\"visible_noise_positions\":[";
+                    for (size_t j = 0; j < visible_noise.size(); ++j) { if (j) trace << ','; trace << visible_noise[j]; }
+                    trace << "]}\n";
+                }
+            }
+        }
     }
 
     //const int64_t t_end = ggml_time_us();

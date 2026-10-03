@@ -1828,7 +1828,8 @@ private:
         json record = {
             {"schema", "w1ax_eagle_round_v1"},
             {"speculative_types", common_speculative_type_name_str(params_base.speculative.types)},
-            {"draft_detail_scope", "DSpark/DFlash: seed=whole noise block, process=draft feature injection; CPU wall synced"},
+            {"draft_detail_scope", "DSpark/DFlash: seed=whole block call, process=injection call; CPU wall, GPU completion may be in sampler"},
+            {"draft_component_explicit_sync", std::getenv("DSPARK_SYNC_COMPONENT_TIMINGS") != nullptr},
             {"clock", "ggml_time_us_cpu_wall"},
             {"task_id", tr.task_id},
             {"parent_task_id", tr.parent_task_id},
