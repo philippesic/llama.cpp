@@ -46,6 +46,41 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Separate synchronized graph diagnostic; enabling it splits graph execution and
+// invalidates serving-rate comparisons. No tensor values are transferred.
+struct dspark_graph_profile_state {
+    std::ofstream file;
+    int64_t previous_us = 0;
+    uint64_t execution = 0;
+    std::string previous = "graph_begin";
+    static bool boundary(const char * name) {
+        return std::strcmp(name, "inp_noise_embd") == 0 || std::strcmp(name, "inp_g_embeddings") == 0 ||
+               std::strcmp(name, "result_norm") == 0 || std::strcmp(name, "result_output") == 0 ||
+               std::strcmp(name, "dspark_markov_output") == 0 || std::strcmp(name, "dspark_injection_end") == 0;
+    }
+    static bool callback(ggml_tensor * tensor, bool ask, void * data) {
+        auto & state = *static_cast<dspark_graph_profile_state *>(data);
+        if (!boundary(tensor->name)) return ask ? false : true;
+        const bool starts = std::strcmp(tensor->name, "inp_noise_embd") == 0 ||
+                            std::strcmp(tensor->name, "inp_g_embeddings") == 0;
+        if (ask) {
+            if (starts) { state.previous_us = ggml_time_us(); state.previous = "graph_begin"; ++state.execution; }
+            return true;
+        }
+        const int64_t now = ggml_time_us();
+        if (state.previous_us) {
+            state.file << json({{"schema", "dspark_graph_stage_v1"}, {"execution", state.execution},
+                {"from", state.previous}, {"to", tensor->name}, {"start_us", state.previous_us},
+                {"end_us", now}, {"duration_us", now-state.previous_us},
+                {"n_tokens", tensor->ne[1]}, {"clock", "synchronized_scheduler_CPU_wall"},
+                {"scope", "separate diagnostic graph splits; not CUDA events or uninstrumented throughput"}}).dump() << '\n';
+            state.file.flush();
+        }
+        state.previous_us = now; state.previous = tensor->name;
+        return true;
+    }
+};
+
 struct draft_graph_capture_entry {
     std::string tensor_name;
     std::string group_kind;
@@ -582,6 +617,7 @@ struct server_round_trace {
     size_t n_accepted = 0;
     llama_tokens proposed;
     llama_tokens emitted;
+    llama_tokens verified;
     common_speculative_process_trace process_detail;
     common_speculative_draft_trace draft_detail;
 };
@@ -1399,6 +1435,7 @@ private:
 
     // Callback user data must outlive spec_init and the draft llama_context.
     std::unique_ptr<draft_graph_capture_state> draft_graph_capture;
+    std::unique_ptr<dspark_graph_profile_state> dspark_graph_profile;
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1790,6 +1827,8 @@ private:
         const int64_t named_us = draft_us + checkpoint_us + target_us + process_us + check_us + repair_us + accept_us;
         json record = {
             {"schema", "w1ax_eagle_round_v1"},
+            {"speculative_types", common_speculative_type_name_str(params_base.speculative.types)},
+            {"draft_detail_scope", "DSpark/DFlash: seed=whole noise block, process=draft feature injection; CPU wall synced"},
             {"clock", "ggml_time_us_cpu_wall"},
             {"task_id", tr.task_id},
             {"parent_task_id", tr.parent_task_id},
@@ -1826,6 +1865,9 @@ private:
             {"draft_sampler_us", tr.draft_detail.sampler_us},
             {"n_proposed", tr.proposed.size()},
             {"n_accepted", tr.n_accepted},
+            {"n_accepted_usable_prefix", std::min(tr.n_accepted, tr.emitted.size())},
+            {"n_accepted_verified", tr.n_accepted},
+            {"verified_token_ids", tr.verified},
             {"n_emitted", tr.emitted.size()},
             {"proposed_token_ids", tr.proposed},
             {"emitted_token_ids", tr.emitted},
@@ -2128,6 +2170,17 @@ private:
                     params_dft.cb_eval_user_data = draft_graph_capture.get();
                     SRV_INF("capturing bounded host/CUDA EAGLE draft graph scope=%s to %s.draft_graph.*\n",
                             draft_graph_capture->scope.c_str(), prefix);
+                }
+
+                if (const char * path = std::getenv("DSPARK_GRAPH_PROFILE_JSONL")) {
+                    if (*path) {
+                        if (draft_graph_capture) throw std::runtime_error("graph timing and tensor capture are separate diagnostics");
+                        dspark_graph_profile.reset(new dspark_graph_profile_state());
+                        dspark_graph_profile->file.open(path, std::ios::out | std::ios::app);
+                        if (!dspark_graph_profile->file.is_open()) throw std::runtime_error("cannot open DSpark graph profile");
+                        params_dft.cb_eval = dspark_graph_profile_state::callback;
+                        params_dft.cb_eval_user_data = dspark_graph_profile.get();
+                    }
                 }
 
                 // progress callback
@@ -5280,6 +5333,7 @@ private:
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                if (slot.spec_trace_round.active) slot.spec_trace_round.verified = accepted;
                 if (accepted.empty()) throw std::runtime_error("speculative verifier returned no token");
                 if (target_feature_json.is_open()) {
                     const size_t n_accepted = accepted.size() - 1;

@@ -853,7 +853,8 @@ class DSparkModel(DFlashModel):
             self._d2t = data_torch
             return
 
-        if self._n_vocab_draft == self.hparams["vocab_size"] and name.endswith("lm_head.weight"):
+        if (self._n_vocab_draft == self.hparams["vocab_size"] and name.endswith("lm_head.weight")
+                and not self.hparams.get("retain_lm_head", False)):
             return
 
         # interleaved-rope checkpoints (rope_is_neox_style = false) -> NeoX layout: per head, even dims first then odd

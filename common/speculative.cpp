@@ -10,6 +10,10 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-model.h"
+#include "ggml-backend.h"
+#include <fstream>
+
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1164,6 +1168,48 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // dspark speculators
     bool sample_from_anchor = true;
+    const bool author_reference_layout = std::getenv("DSPARK_REQUIRE_AUTHOR_LAYOUT") != nullptr;
+
+    // Admission-only evidence. No tensor copies/hashes are performed without this env.
+    std::ofstream admission;
+    const ggml_tensor * target_embedding = nullptr;
+    const ggml_tensor * target_head = nullptr;
+    uint64_t target_embedding_hash = 0, target_head_hash = 0;
+    uint64_t admission_round = 0;
+
+    static uint64_t tensor_hash(const ggml_tensor * tensor) {
+        GGML_ASSERT(tensor);
+        const size_t bytes = ggml_nbytes(tensor);
+        std::vector<unsigned char> chunk(std::min<size_t>(bytes, 4*1024*1024));
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (size_t offset = 0; offset < bytes; offset += chunk.size()) {
+            const size_t n = std::min(chunk.size(), bytes - offset);
+            ggml_backend_tensor_get(tensor, chunk.data(), offset, n);
+            for (size_t i = 0; i < n; ++i) hash = (hash ^ chunk[i]) * UINT64_C(1099511628211);
+        }
+        return hash;
+    }
+
+    void record_binding(const char * event) {
+        if (!admission.is_open()) return;
+        const auto * target = llama_get_model(params.ctx_tgt);
+        GGML_ASSERT(target->tok_embd == target_embedding && target->output == target_head);
+        const uint64_t embedding_hash = tensor_hash(target_embedding), head_hash = tensor_hash(target_head);
+        GGML_ASSERT(embedding_hash == target_embedding_hash && head_hash == target_head_hash);
+        const auto * draft = llama_get_model(params.ctx_dft);
+        admission << "{\"schema\":\"dspark_admission_v1\",\"event\":\"" << event
+                  << "\",\"target_embedding_identity\":\"" << target_embedding
+                  << "\",\"target_head_identity\":\"" << target_head
+                  << "\",\"embedding_hash_fnv1a64\":" << embedding_hash
+                  << ",\"head_hash_fnv1a64\":" << head_hash
+                  << ",\"target_embedding_bytes\":" << ggml_nbytes(target_embedding)
+                  << ",\"target_head_bytes\":" << ggml_nbytes(target_head)
+                  << ",\"target_embedding_dtype\":\"" << ggml_type_name(target_embedding->type)
+                  << "\",\"target_head_dtype\":\"" << ggml_type_name(target_head->type)
+                  << "\",\"borrows_embedding\":" << (draft->tok_embd ? "false" : "true")
+                  << ",\"borrows_head\":" << (draft->output ? "false" : "true") << "}\n";
+        admission.flush();
+    }
 
     // block-internal attention
     bool causal_attn = false;
@@ -1226,6 +1272,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
 
+        if (const char * path = std::getenv("DSPARK_ADMISSION_JSONL")) {
+            if (*path) {
+                admission.open(path, std::ios::out | std::ios::app);
+                if (!admission.is_open()) throw std::runtime_error("cannot open DSpark admission trace");
+                target_embedding = model_tgt->tok_embd;
+                target_head = model_tgt->output;
+                target_embedding_hash = tensor_hash(target_embedding);
+                target_head_hash = tensor_hash(target_head);
+                record_binding("binding_begin");
+            }
+        }
+        if (author_reference_layout) {
+            const int32_t taps[] = {2, 10, 18, 26, 34};
+            if (!is_dspark || !sample_from_anchor || causal_attn || block_size != 7 ||
+                    target_layer_ids_n != 5 || mask_token_id != 151669 || params.draft.p_min != 0.0f ||
+                    !std::equal(target_layer_ids, target_layer_ids + 5, taps) || model_dft->d2t) {
+                throw std::runtime_error("DSpark author-layout admission requires block7/anchor-first/taps2,10,18,26,34/full-vocab/p-min0/noncausal");
+            }
+        }
+
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
         const int32_t n_draft_max = is_dspark && sample_from_anchor ? block_size : block_size - 1;
@@ -1283,6 +1349,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        record_binding("binding_end");
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1318,6 +1385,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        process_trace = {};
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1333,6 +1401,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+        process_trace.n_tokens = n_tokens;
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
@@ -1370,6 +1439,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
+                const int64_t t_copy = process_trace_enabled ? ggml_time_us() : 0;
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 batch_inject.n_tokens = n_chunk;
@@ -1385,6 +1455,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                if (t_copy) process_trace.feature_copy_us += ggml_time_us() - t_copy;
+                const int64_t t_build = process_trace_enabled ? ggml_time_us() : 0;
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
                     batch_inject.pos[i] = p;
@@ -1397,7 +1469,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                if (t_build) process_trace.batch_build_us += ggml_time_us() - t_build;
+                const llama_pos kv_before = admission.is_open() ?
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) : -1;
+                const int64_t t_decode = process_trace_enabled ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                if (t_decode) {
+                    llama_synchronize(ctx_dft);
+                    process_trace.draft_decode_us += ggml_time_us() - t_decode;
+                    process_trace.n_draft_decode += n_chunk;
+                }
+                if (admission.is_open()) {
+                    llama_synchronize(ctx_dft);
+                    admission << "{\"schema\":\"dspark_admission_v1\",\"event\":\"inject\",\"seq_id\":" << seq_id
+                              << ",\"first_position\":" << batch_inject.pos[0]
+                              << ",\"last_position\":" << batch_inject.pos[n_chunk - 1]
+                              << ",\"n_tokens\":" << n_chunk << ",\"kv_max_before\":" << kv_before
+                              << ",\"kv_max_after\":" << llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id)
+                              << ",\"feature_hash_fnv1a64\":" << eagle_state_hash(batch_inject.embd, (size_t) n_chunk*n_embd_enc)
+                              << ",\"target_taps\":[2,10,18,26,34],\"rc\":" << rc << "}\n";
+                    admission.flush();
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1410,6 +1502,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        draft_trace = {};
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1431,7 +1524,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_draft = params.n_max;
 
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            if (admission.is_open()) {
+                const llama_pos kv_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+                GGML_ASSERT(kv_max < n && "draft cache retains stale noise/pending anchor before proposal");
+                admission << "{\"schema\":\"dspark_admission_v1\",\"event\":\"noise\",\"round\":" << admission_round++
+                          << ",\"seq_id\":" << seq_id << ",\"anchor_position\":" << n
+                          << ",\"anchor_token_id\":" << dp.id_last << ",\"kv_max_before\":" << kv_max
+                          << ",\"sample_from_anchor\":" << (sample_from_anchor ? "true" : "false")
+                          << ",\"first_read_slot\":" << (is_dspark && sample_from_anchor ? 0 : 1)
+                          << ",\"n_proposal_requested\":" << n_draft
+                          << ",\"n_noise_tokens\":" << (author_reference_layout ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1))
+                          << ",\"all_noise_rows_bidirectional\":" << (causal_attn ? "false" : "true")
+                          << ",\"mask_token_id\":" << mask_token_id
+                          << ",\"prefix_token_ids\":[";
+                for (size_t j = 0; dp.prompt && j < dp.prompt->size(); ++j) {
+                    if (j) admission << ',';
+                    admission << (*dp.prompt)[j];
+                }
+                admission << "]}\n";
+                admission.flush();
+            }
+            const int32_t n_block_tokens = author_reference_layout ? block_size :
+                n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1444,7 +1558,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const int64_t t_decode = process_trace_enabled ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
+        if (t_decode) {
+            llama_synchronize(ctx_dft);
+            draft_trace.seed_decode_us = ggml_time_us() - t_decode;
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1459,6 +1578,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
 
+            const int64_t t_sampler = process_trace_enabled ? ggml_time_us() : 0;
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
@@ -1490,6 +1610,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
+                if (t_sampler) draft_trace.sampler_us.push_back(ggml_time_us() - t_sampler);
                 continue;
             }
 
@@ -1498,7 +1619,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                const int32_t read_end = author_reference_layout ? std::min(n_block_tokens, i_draft_beg + params.n_max) : n_block_tokens;
+                for (int32_t i = i_draft_beg; i < read_end; ++i) {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -1549,6 +1671,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+            if (t_sampler) draft_trace.sampler_us.push_back(ggml_time_us() - t_sampler);
         }
     }
 
@@ -3049,7 +3172,9 @@ common_speculative_process_trace common_speculative_get_process_trace(const comm
         return result;
     }
     for (const auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
             return impl->process_trace;
         }
     }
@@ -3062,7 +3187,9 @@ common_speculative_draft_trace common_speculative_get_draft_trace(const common_s
         return result;
     }
     for (const auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
             return impl->draft_trace;
         }
     }

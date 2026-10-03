@@ -401,6 +401,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_build_forward_expand(g.gf, conf);
     }
 
+    g.cb(out, "dspark_markov_output", -1);
     res->t_logits = out;
     ggml_build_forward_expand(g.gf, out);
 }
@@ -666,7 +667,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
                 }
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
-                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+                ggml_tensor * injected_v = inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il);
+                if (il + 1 == n_layer) cb(injected_v, "dspark_injection_end", -1);
+                ggml_build_forward_expand(gf, injected_v);
             }
         }
 
