@@ -347,7 +347,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     //       token pick, not the Markov conditioning path
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
+        g.cb(w1_prev, "dspark_markov_lookup", (int) i);
         ggml_tensor * bias    = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        g.cb(bias, "dspark_markov_projection", (int) i);
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -361,6 +363,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         // position i of every block: strided view [n_vocab, n_blocks]
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+        g.cb(col, "dspark_markov_add", (int) i);
 
         cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
 
@@ -372,6 +375,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
                                                     (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
             ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
             ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+            g.cb(conf, "dspark_confidence_projection", (int) i);
             if (model.dspark_conf_proj_b) {
                 conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
             }
@@ -382,6 +386,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
         if (i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
+            g.cb(prev, "dspark_markov_argmax", (int) i);
         }
     }
 
@@ -620,6 +625,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        cb(inp_g, "dspark_feature_fusion", -1);
         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
 
