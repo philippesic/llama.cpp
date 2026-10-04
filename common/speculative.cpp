@@ -11,6 +11,7 @@
 #include "sampling.h"
 
 #include "../src/llama-model.h"
+#include "../src/llama-context.h"
 #include "ggml-backend.h"
 #include <fstream>
 
@@ -1208,7 +1209,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                   << ",\"target_embedding_dtype\":\"" << ggml_type_name(target_embedding->type)
                   << "\",\"target_head_dtype\":\"" << ggml_type_name(target_head->type)
                   << "\",\"borrows_embedding\":" << (draft->tok_embd ? "false" : "true")
-                  << ",\"borrows_head\":" << (draft->output ? "false" : "true") << "}\n";
+                  << ",\"borrows_head\":" << (draft->output ? "false" : "true")
+                  << ",\"draft_n_batch\":" << llama_n_batch(params.ctx_dft)
+                  << ",\"draft_n_ubatch\":" << llama_n_ubatch(params.ctx_dft)
+                  << ",\"draft_n_outputs_max\":" << params.ctx_dft->get_cparams().n_outputs_max
+                  << ",\"draft_n_outputs_max_per_seq\":" << params.ctx_dft->get_cparams().n_outputs_max_per_seq
+                  << ",\"draft_backend_sampling\":" << (params.backend_sampling ? "true" : "false") << "}\n";
         admission.flush();
     }
 
@@ -1285,6 +1291,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
         if (author_reference_layout) {
+            if (llama_n_batch(ctx_dft) < 7 || llama_n_ubatch(ctx_dft) < 7) {
+                throw std::runtime_error("DSpark author-layout admission needs batch and ubatch >=7 for the intact trained noise block");
+            }
+            const auto & capacity = ctx_dft->get_cparams();
+            if (capacity.n_outputs_max < 7 || (this->params.backend_sampling && capacity.n_outputs_max_per_seq < 7)) {
+                throw std::runtime_error("DSpark author-layout draft output capacity must cover all seven computed noise positions");
+            }
             const int32_t taps[] = {2, 10, 18, 26, 34};
             if (!is_dspark || !sample_from_anchor || causal_attn || block_size != 7 ||
                     target_layer_ids_n != 5 || mask_token_id != 151669 || params.draft.p_min != 0.0f ||
@@ -2864,7 +2877,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        // The admitted DeepSpec reference computes all seven trained noise
+        // positions even when only the first three are proposed. Reserve draft
+        // outputs for computation, independently of target verification length.
+        const bool author_block7 = std::getenv("DSPARK_REQUIRE_AUTHOR_LAYOUT") != nullptr;
+        const int32_t per_seq = std::max(author_block7 ? 7 : 1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
