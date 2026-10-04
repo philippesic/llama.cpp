@@ -2,6 +2,7 @@
 // teacher-forces exact caller token IDs. No drafter, sampling or optimizer.
 #include "llama.h"
 #include "llama-ext.h"
+#include "llama-model.h"
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
 #include <filesystem>
@@ -11,6 +12,17 @@
 #include <set>
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+struct placement {
+    std::set<std::string> result_buffers;
+    static bool callback(ggml_tensor * tensor, bool ask, void * data) {
+        if (std::string(tensor->name) != "result_output") return false;
+        if (!ask && tensor->buffer) {
+            auto & state = *static_cast<placement *>(data);
+            state.result_buffers.insert(ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer)));
+        }
+        return true;
+    }
+};
 int main(int argc, char ** argv) {
     try {
         if (argc != 5) throw std::runtime_error("usage: llama-block-teacher TARGET.gguf OUTPUT_ROOT MAX_TOKENS GPU_LAYERS (JSONL stdin)");
@@ -22,13 +34,22 @@ int main(int argc, char ** argv) {
         auto mp = llama_model_default_params(); mp.n_gpu_layers = gpu_layers;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(argv[1],mp),llama_model_free);
         if (!model) throw std::runtime_error("target load failed");
+        placement execution;
         auto cp = llama_context_default_params();
+        cp.cb_eval = placement::callback;cp.cb_eval_user_data = &execution;
         cp.n_ctx = max_tokens; cp.n_batch = 256; cp.n_ubatch = 256; cp.n_seq_max = 1;
         cp.type_k = GGML_TYPE_F16; cp.type_v = GGML_TYPE_F16;
         std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(),cp),llama_free);
         if (!ctx) throw std::runtime_error("target context failed");
         const int hidden = llama_model_n_embd(model.get());
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        json target_storage = json::object();
+        for (const auto & item : model->tensors_by_name) {
+            if (!item.second->buffer) throw std::runtime_error("unallocated target model tensor");
+            const auto name = ggml_backend_buft_name(ggml_backend_buffer_get_type(item.second->buffer));
+            const size_t count = target_storage.contains(name) ? target_storage[name].get<size_t>() : 0;
+            target_storage[name] = count + 1;
+        }
         json hardware=json::array();
         for (size_t i=0;i<ggml_backend_dev_count();++i) hardware.push_back(ggml_backend_dev_description(ggml_backend_dev_get(i)));
         std::string line;
@@ -52,6 +73,7 @@ int main(int argc, char ** argv) {
             std::ofstream features(directory/"features.f32",std::ios::binary), logits(directory/"logits.f32",std::ios::binary);
             if (!features || !logits) throw std::runtime_error("cannot open teacher outputs");
             llama_memory_clear(llama_get_memory(ctx.get()),true);
+            execution.result_buffers.clear();
             for (size_t off=0;off<tokens.size();off+=256) {
                 const int n=int(std::min(size_t(256),tokens.size()-off));
                 auto batch=llama_batch_init(n,0,1);
@@ -83,7 +105,8 @@ int main(int argc, char ** argv) {
             llama_memory_clear(llama_get_memory(ctx.get()),true);
             const json receipt={{"schema","block_native_teacher_request_v1"},{"id",id},{"tokens",tokens},{"tap_ids",ids},
                 {"features_shape",{tokens.size(),5,hidden}},{"logits_shape",{mode=="all"?tokens.size():size_t(1),size_t(vocab)}},
-                {"logits_mode",mode},{"hardware",hardware},{"gpu_layers",gpu_layers},{"kv_type","F16"},
+                {"logits_mode",mode},{"hardware",hardware},{"target_storage_buffers",target_storage},
+                {"executed_result_buffers",execution.result_buffers},{"gpu_layers",gpu_layers},{"kv_type","F16"},
                 {"prefix_contract","teacher_forced_exact_caller_token_ids"},{"optimizer_updates",0},{"complete",true}};
             std::ofstream meta(directory/"native-receipt.json");meta<<receipt.dump(2)<<'\n';meta.close();
             if(!meta) throw std::runtime_error("receipt write failed");

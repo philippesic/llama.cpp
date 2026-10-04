@@ -10106,6 +10106,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // 2560 is the audited EAGLE drafter head K width.
+    // Deployed EAGLE/block reduction widths, scalar oracle at one/full7 rows.
+    for (int64_t k : {2560, 4096, 7680, 9728, 12800}) for (int bits : {1, 8}) for (int64_t n : {1, 7}) {
+        test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, n));
+        test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, n, false, true));
+    }
     for (int bits : {1, 4, 8, 16}) {
         for (int64_t k : {1, 7, 31, 32, 33, 64, 2560}) {
             test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, 1));

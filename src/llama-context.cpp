@@ -287,6 +287,21 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // Private block embeddings/head deliberately do not share target storage.
+    // Validate the provided verifier before the own-storage path drops ctx_other.
+    if (model.dflash_w1ax_bits && params.ctx_other) {
+        const auto * target = llama_get_model(params.ctx_other);
+        if (llama_model_n_embd(target) != llama_model_n_embd(&model) ||
+                llama_vocab_n_tokens(llama_model_get_vocab(target)) != llama_vocab_n_tokens(llama_model_get_vocab(&model))) {
+            throw std::runtime_error("DFlash W1Ax target/draft feature or vocabulary width mismatch");
+        }
+        for (auto tap : model.target_layer_ids) {
+            if (tap < 0 || tap >= llama_model_n_layer(target)) {
+                throw std::runtime_error("DFlash W1Ax target tap outside paired verifier");
+            }
+        }
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
