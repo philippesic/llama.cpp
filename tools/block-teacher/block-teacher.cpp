@@ -72,11 +72,17 @@ int main(int argc, char ** argv) {
             std::string rendered, chat_template, template_mode;
             if (generate) {
                 const auto & prompt=request.at("prompt");
-                if (!prompt.is_object() || prompt.size()!=3 || !prompt.contains("template_mode") || !prompt.contains("max_new_tokens")) throw std::runtime_error("invalid native prompt fields");
+                if (!prompt.is_object() || (prompt.size()!=3 && prompt.size()!=4) || !prompt.contains("template_mode") || !prompt.contains("max_new_tokens")) throw std::runtime_error("invalid native prompt fields");
                 template_mode=prompt.at("template_mode").get<std::string>();
                 if (!prompt.at("max_new_tokens").is_number_integer()) throw std::runtime_error("generation bound must be integer");
                 max_new=prompt.at("max_new_tokens").get<int>();
                 if (max_new<0 || max_new>max_tokens) throw std::runtime_error("invalid generation bound");
+                int max_prompt=max_tokens-max_new;
+                if (prompt.contains("max_prompt_tokens")) {
+                    if (!prompt.at("max_prompt_tokens").is_number_integer()) throw std::runtime_error("prompt cap must be integer");
+                    max_prompt=prompt.at("max_prompt_tokens").get<int>();
+                }
+                if (max_prompt<=0 || max_prompt>max_tokens || max_new>max_tokens-max_prompt) throw std::runtime_error("invalid native prompt token cap");
                 if (template_mode=="raw_text" && prompt.contains("text")) {
                     rendered=prompt.at("text").get<std::string>();
                 } else if (template_mode=="native_chat" && prompt.contains("messages")) {
@@ -103,7 +109,7 @@ int main(int argc, char ** argv) {
                 if (rendered.empty() || rendered.size()>2*1024*1024) throw std::runtime_error("empty or excessive native prompt");
                 int n=llama_tokenize(vocabulary,rendered.data(),rendered.size(),nullptr,0,true,true);
                 if (n<0) n=-n;
-                if (n<=0 || n+max_new>max_tokens) throw std::runtime_error("native prompt plus continuation exceeds token cap");
+                if (n<=0 || n>max_prompt || n+max_new>max_tokens) throw std::runtime_error("native tokenized prompt or continuation exceeds token cap before decode");
                 tokens.resize(n);
                 const int observed=llama_tokenize(vocabulary,rendered.data(),rendered.size(),tokens.data(),tokens.size(),true,true);
                 if (observed!=n) throw std::runtime_error("native tokenization size changed");
