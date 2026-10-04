@@ -1,0 +1,6 @@
+set(TARGET llama-block-teacher)
+add_executable(${TARGET} block-teacher.cpp)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/vendor)
+target_link_libraries(${TARGET} PRIVATE llama ggml)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TARGET} RUNTIME)

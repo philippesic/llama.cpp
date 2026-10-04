@@ -388,3 +388,4 @@ llama_build_and_test(test-dspark-reservation.cpp)
 
 # External synthetic GGUF fixture is supplied by the preparation Python tests.
 llama_build(test-block-binary.cpp)
+target_include_directories(test-block-binary PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
