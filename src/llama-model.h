@@ -657,6 +657,7 @@ struct llama_model {
     struct ggml_tensor * fc_correction_bias = nullptr;
     float fc_correction_bias_bound = 0;
     std::map<std::string, struct ggml_tensor *> eagle_w1ax_midpoints;
+    int dflash_w1ax_bits = 0; // GGUF-pinned block FFN/fusion arithmetic; never an ambient flag
     bool eagle_w1ax_learned = false;
     float eagle_w1ax_delta[6] = {};
     float eagle_w1ax_clip[6] = {1, 1, 1, 1, 1, 1};

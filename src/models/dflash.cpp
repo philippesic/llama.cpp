@@ -4,6 +4,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <set>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
@@ -109,6 +111,71 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
+    uint32_t binary_version = 0;
+    const bool binary = ml->get_key("dflash.w1ax.version", binary_version, false);
+    std::set<std::string> declared;
+    if (binary) {
+        uint32_t bits = 0;
+        std::string profile, bit_order, sign_rule, scale_rule;
+        std::vector<std::string> names;
+        ml->get_key("dflash.w1ax.activation_bits", bits);
+        ml->get_key("dflash.w1ax.profile", profile);
+        ml->get_key("dflash.w1ax.bit_order", bit_order);
+        ml->get_key("dflash.w1ax.sign_rule", sign_rule);
+        ml->get_key("dflash.w1ax.scale_rule", scale_rule);
+        ml->get_arr("dflash.w1ax.tensors", names);
+        declared.insert(names.begin(), names.end());
+        std::set<std::string> expected;
+        for (int i = 0; i < 5; ++i) for (auto part : {"gate", "up", "down"}) {
+            expected.insert("blk." + std::to_string(i) + ".ffn_" + part + ".weight");
+        }
+        if (profile == "ffn15_fusion") expected.insert("fc.weight");
+        if (binary_version != 1 || (bits != 1 && bits != 8) ||
+                (profile != "ffn15" && profile != "ffn15_fusion") || n_layer != 5 ||
+                target_layer_ids.size() != 5 || hparams.dflash_block_size != 7 || hparams.dsv4_hc_mult ||
+                hparams.dflash_conv_kernel_size || hparams.llm_ffn_op != LLM_FFN_SILU ||
+                bit_order != "little" || sign_rule != "nonnegative_is_one" ||
+                scale_rule != "f32_learned_nonnegative" || declared != expected || names.size() != expected.size()) {
+            throw std::runtime_error("unsupported DFlash W1Ax contract/profile/coverage");
+        }
+        bool anchor_first = false;
+        ml->get_key("dflash.sample_from_anchor", anchor_first);
+        if (!anchor_first) throw std::runtime_error("DFlash W1Ax requires author anchor-first layout");
+        dflash_w1ax_bits = bits;
+        LLAMA_LOG_INFO("%s: DFlash W1A%u profile=%s (no dense shadows)\n", __func__, bits, profile.c_str());
+    }
+    // Packed tensors outside the declared profile are never silently ignored.
+    for (const auto & item : ml->weights_map) {
+        const std::string name = item.first;
+        for (auto suffix : {".w1a1_packed", ".w1a1_scale", ".w1ax_midpoint"}) {
+            const std::string end = suffix;
+            if (name.size() >= end.size() && name.compare(name.size()-end.size(), end.size(), end) == 0 &&
+                    (!binary || end == ".w1ax_midpoint" || !declared.count(name.substr(0,name.size()-end.size())+".weight"))) {
+                throw std::runtime_error("undeclared DFlash binary tensor: " + name);
+            }
+        }
+    }
+    auto load_linear = [&](llm_tensor tensor, int bid, int64_t k, int64_t rows,
+            ggml_tensor *& dense, ggml_tensor *& packed, ggml_tensor *& scales) {
+        const std::string name = tn(tensor, "weight", bid).str();
+        if (!declared.count(name)) {
+            dense = create_tensor(tn(tensor, "weight", bid), {k, rows}, 0);
+            return;
+        }
+        const std::string base = name.substr(0, name.size()-7);
+        const auto * pm = ml->get_tensor_meta((base+".w1a1_packed").c_str());
+        const auto * sm = ml->get_tensor_meta((base+".w1a1_scale").c_str());
+        if (ml->get_tensor_meta(name.c_str()) || !pm || !sm || pm->type != GGML_TYPE_I32 ||
+                sm->type != GGML_TYPE_F32 || pm->ne[0] != (k+31)/32 || pm->ne[1] != rows ||
+                pm->ne[2] != 1 || pm->ne[3] != 1 || sm->ne[0] != rows || sm->ne[1] != 1 ||
+                sm->ne[2] != 1 || sm->ne[3] != 1) {
+            throw std::runtime_error("DFlash binary pair type/shape/dense-shadow mismatch: " + name);
+        }
+        packed = create_tensor(LLM_TN_IMPL(LLM_ARCH_DFLASH, tensor, "w1a1_packed", bid, -1), {(k+31)/32, rows}, 0);
+        scales = create_tensor(LLM_TN_IMPL(LLM_ARCH_DFLASH, tensor, "w1a1_scale", bid, -1), {rows}, 0);
+        dense = nullptr;
+    };
+
     tok_embd        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,       "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // reduced draft vocab (optional): d2t maps draft rows to target token ids
@@ -158,7 +225,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
                 hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
     }
 
-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+    load_linear(LLM_TENSOR_FC, -1, n_embd_inp, n_embd, fc, fc_w1a1_packed, fc_w1a1_scale);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
@@ -166,6 +233,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
+    if (binary && (!output || !tok_embd || d2t)) {
+        throw std::runtime_error("DFlash W1Ax requires private full-vocabulary head and embeddings");
+    }
     if (output == nullptr && tok_embd != nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_draft }, TENSOR_DUPLICATED);
     }
@@ -242,9 +312,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), { n_head }, TENSOR_NOT_REQUIRED);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+        load_linear(LLM_TENSOR_FFN_GATE, i, n_embd, n_ff, layer.ffn_gate, layer.ffn_gate_w1a1_packed, layer.ffn_gate_w1a1_scale);
+        load_linear(LLM_TENSOR_FFN_DOWN, i, n_ff, n_embd, layer.ffn_down, layer.ffn_down_w1a1_packed, layer.ffn_down_w1a1_scale);
+        load_linear(LLM_TENSOR_FFN_UP, i, n_embd, n_ff, layer.ffn_up, layer.ffn_up_w1a1_packed, layer.ffn_up_w1a1_scale);
 
         if (selector_meta) {
             const int64_t kernel = hparams.dflash_conv_kernel_size;
@@ -277,9 +347,15 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 // DFlash Encoder: processes target model features through feature fusion layer
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    if (model.dflash_w1ax_bits && loras && !loras->empty()) throw std::runtime_error("DFlash W1Ax does not support LoRA");
     ggml_tensor * cur = build_inp_embd_enc();
 
-    cur = build_lora_mm(model.fc, cur, model.fc_s);
+    if (model.fc_w1a1_packed) {
+        cur = ggml_w1ax_mul_mat(ctx0, model.fc_w1a1_packed, model.fc_w1a1_scale, cur, hparams.n_embd_inp_enc(), model.dflash_w1ax_bits);
+        if (model.fc_s) cur = ggml_mul(ctx0, cur, model.fc_s);
+    } else {
+        cur = build_lora_mm(model.fc, cur, model.fc_s);
+    }
     cb(cur, "fc_out", -1);
 
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -322,6 +398,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
     const int64_t block_drafts = n_tok / n_blocks;
     if (block_drafts > block_size) {
+        if (model.dflash_w1ax_bits) throw std::runtime_error("DFlash W1Ax Markov block exceeds trained block size");
         return;
     }
 
@@ -577,6 +654,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    if (model.dflash_w1ax_bits && loras && !loras->empty()) throw std::runtime_error("DFlash W1Ax does not support LoRA");
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -624,7 +702,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        ggml_tensor * inp_g;
+        if (model.fc_w1a1_packed) {
+            inp_g = ggml_w1ax_mul_mat(ctx0, model.fc_w1a1_packed, model.fc_w1a1_scale, inp_target, n_embd_inp, model.dflash_w1ax_bits);
+            if (model.fc_s) inp_g = ggml_mul(ctx0, inp_g, model.fc_s);
+        } else {
+            inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        }
         cb(inp_g, "dspark_feature_fusion", -1);
         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
@@ -773,12 +857,21 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(cur, "ffn_conv_in", il);
         }
 
+        if (layer.ffn_up_w1a1_packed) {
+            // One shared pack for gate/up; down packs the actual SiLU(gate)*up row.
+            auto * pack = ggml_w1ax_pack(ctx0, cur, model.dflash_w1ax_bits);
+            auto * up = ggml_w1ax_mul_mat_shared(ctx0, layer.ffn_up_w1a1_packed, layer.ffn_up_w1a1_scale, pack, n_embd, model.dflash_w1ax_bits);
+            auto * gate = ggml_w1ax_mul_mat_shared(ctx0, layer.ffn_gate_w1a1_packed, layer.ffn_gate_w1a1_scale, pack, n_embd, model.dflash_w1ax_bits);
+            cur = ggml_mul(ctx0, ggml_silu(ctx0, gate), up);
+            cur = ggml_w1ax_mul_mat(ctx0, layer.ffn_down_w1a1_packed, layer.ffn_down_w1a1_scale, cur, hparams.n_ff(il), model.dflash_w1ax_bits);
+        } else {
         cur = build_ffn(cur,
                 layer.ffn_up,   NULL, layer.ffn_up_s,
                 layer.ffn_gate, NULL, layer.ffn_gate_s,
                 layer.ffn_down, NULL, layer.ffn_down_s,
                 NULL,
                 hparams.llm_ffn_op, LLM_FFN_PAR, il);
+        }
         cb(cur, "ffn_out", il);
 
         if (ffn_dynamic) {
@@ -888,7 +981,13 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        ggml_tensor * inp_g;
+        if (model.fc_w1a1_packed) {
+            inp_g = ggml_w1ax_mul_mat(ctx0, model.fc_w1a1_packed, model.fc_w1a1_scale, inp_target, n_embd_inp, model.dflash_w1ax_bits);
+            if (model.fc_s) inp_g = ggml_mul(ctx0, inp_g, model.fc_s);
+        } else {
+            inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        }
         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
 

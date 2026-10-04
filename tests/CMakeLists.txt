@@ -385,3 +385,6 @@ if (TARGET gguf-model-data)
 endif()
 
 llama_build_and_test(test-dspark-reservation.cpp)
+
+# External synthetic GGUF fixture is supplied by the preparation Python tests.
+llama_build(test-block-binary.cpp)
