@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -367,6 +368,35 @@ void ggml_cuda_w1ax_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Admission-only dispatch metadata. No tensor reads, synchronization or timing.
+// Each projection/precision/shape/device tuple is emitted at most once/process.
+static void w1ax_admission_trace(ggml_backend_cuda_context & ctx, const ggml_tensor * weights,
+        int bits, int64_t k, int64_t rows, int64_t tokens) {
+    static const bool enabled = getenv("GGML_W1AX_ADMISSION_TRACE") &&
+        strcmp(getenv("GGML_W1AX_ADMISSION_TRACE"), "1") == 0;
+    if (!enabled) return;
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    const std::string key = std::string(weights->name) + ":" + std::to_string(bits) + ":" +
+        std::to_string(k) + ":" + std::to_string(rows) + ":" + std::to_string(ctx.device);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (seen.count(key)) return;
+    GGML_ASSERT(seen.size() < 256);
+    seen.insert(key);
+    std::string escaped;
+    for (unsigned char ch : std::string(weights->name)) {
+        if (ch == '\"' || ch == '\\') escaped += '\\';
+        if (ch < 32) {
+            char code[7]; snprintf(code, sizeof(code), "\\u%04x", (unsigned) ch); escaped += code;
+        } else escaped += (char) ch;
+    }
+    GGML_LOG_INFO("W1AX_ADMISSION_TRACE {\"schema\":\"w1ax_cuda_dispatch_v1\",\"packed\":\"%s\","
+        "\"backend\":\"%s\",\"device\":%d,\"activation_bits\":%d,\"logical_k\":%lld,"
+        "\"rows\":%lld,\"tokens\":%lld,\"packed_type\":\"i32\",\"packed_words\":%lld}\n",
+        escaped.c_str(), GGML_CUDA_NAME, ctx.device, bits, (long long) k, (long long) rows,
+        (long long) tokens, (long long) weights->ne[0]);
+}
+
 void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * weights = dst->src[0];
     const ggml_tensor * scales  = dst->src[1];
@@ -463,6 +493,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     check_integer_dots ? raw_dots.ptr : nullptr, warp_reduce, midpoints, code_sums);
             CUDA_CHECK(cudaGetLastError());
         }
+        w1ax_admission_trace(ctx, weights, bits, k, m, n);
         if (check_integer_dots) {
             w1ax_validate_integer_dots<<<dim3((unsigned) ((m*n + 127)/128)), 128, 0, stream>>>(
                     (const uint32_t *) weights->data, code_ptr, raw_dots.ptr, m, n, k, words);
@@ -485,6 +516,7 @@ void ggml_cuda_w1a1_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const uint32_t *) weights->data, (const float *) scales->data,
             packed_ptr, scale_ptr, m, n, k, words, (float *) dst->data, warp_reduce, midpoints, code_sums);
     CUDA_CHECK(cudaGetLastError());
+    w1ax_admission_trace(ctx, weights, bits, k, m, n);
 }
 
 // Only EAGLE graph builders assign this marker; target linears remain untouched.
