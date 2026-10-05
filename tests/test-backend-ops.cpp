@@ -5057,12 +5057,13 @@ struct test_w1a1_mul_mat : public test_case {
     const float delta, clip;
     const bool tiny;
     const bool affine;
+    const bool reciprocal_overflow;
     std::vector<float> expected;
 
-    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false, bool learned = false, float delta = 0, float clip = 1, bool tiny = false, bool affine = false)
-        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout), learned(learned), delta(delta), clip(clip), tiny(tiny), affine(affine) {}
+    explicit test_w1a1_mul_mat(int64_t k, bool strided = false, int bits = 1, int64_t n_tokens = 3, bool grouped = false, bool shared = false, bool fanout = false, bool learned = false, float delta = 0, float clip = 1, bool tiny = false, bool affine = false, bool reciprocal_overflow = false)
+        : k(k), strided(strided), bits(bits), n_tokens(n_tokens), grouped(grouped), shared(shared), fanout(fanout), learned(learned), delta(delta), clip(clip), tiny(tiny), affine(affine), reciprocal_overflow(reciprocal_overflow) {}
 
-    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout) + ",learned=" + std::to_string(learned) + ",delta=" + std::to_string(delta) + ",clip=" + std::to_string(clip) + ",tiny=" + std::to_string(tiny) + ",affine=" + std::to_string(affine); }
+    std::string vars() override { return VARS_TO_STR6(k, strided, bits, n_tokens, grouped, shared) + ",fanout=" + std::to_string(fanout) + ",learned=" + std::to_string(learned) + ",delta=" + std::to_string(delta) + ",clip=" + std::to_string(clip) + ",tiny=" + std::to_string(tiny) + ",affine=" + std::to_string(affine) + ",reciprocal_overflow=" + std::to_string(reciprocal_overflow); }
     double max_nmse_err() override { return 1e-6; }
 
     static float weight_value(int64_t row, int64_t i) {
@@ -5122,7 +5123,9 @@ struct test_w1a1_mul_mat : public test_case {
         const int64_t words = (k - 1)/32 + 1;
         std::vector<uint32_t> packed(words * m);
         std::vector<float> acts(k * n_tokens);
-        const float scales[m] = { 0.5f, 1.25f, -0.75f, 0.0f, 0.3f, 1.0f, -0.125f };
+        float scales[m] = { 0.5f, 1.25f, -0.75f, 0.0f, 0.3f, 1.0f, -0.125f };
+        // Amplify tiny activation outputs so the scalar oracle cannot miss bad codes.
+        if (reciprocal_overflow) for (auto & scale : scales) scale = std::abs(scale)*1e30f;
         const int64_t groups = (k + 127)/128;
         std::vector<float> group_scales(m*groups);
         for (int64_t row = 0; row < m; ++row) {
@@ -5141,8 +5144,10 @@ struct test_w1a1_mul_mat : public test_case {
         for (int64_t token = 0; token < n_tokens; ++token) {
             for (int64_t i = 0; i < k; ++i) {
                 const float x = tiny ? (token == 1 ? (i%2 ? -0.0f : +0.0f) : (i%3 == 0 ? -std::numeric_limits<float>::denorm_min() : i%3 == 1 ? std::numeric_limits<float>::denorm_min() : 0.0f)) : activation_value(token, i);
+                const float finite_tiny = token == 1 ? (i%2 ? -0.0f : +0.0f) :
+                    (i%3 == 0 ? -1e-37f : i%3 == 1 ? 1e-37f : 0.0f);
                 // Non-FP16-exact values exercise source rounding as well as signs.
-                acts[token*k + i] = grouped ? x * 1.0002345f + (token == 1 ? 0.0f : float(i%13)*0.00012345f) : x;
+                acts[token*k + i] = reciprocal_overflow ? finite_tiny : grouped ? x * 1.0002345f + (token == 1 ? 0.0f : float(i%13)*0.00012345f) : x;
             }
         }
 
@@ -10106,6 +10111,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // 2560 is the audited EAGLE drafter head K width.
+    // Fixed A8 finite reciprocal-overflow rows: direct/shared with zero signs.
+    for (int64_t k : {33, 2560, 12800}) for (int64_t n : {1, 7}) for (bool shared : {false, true}) {
+        test_cases.emplace_back(new test_w1a1_mul_mat(k, false, 8, n, false, shared,
+            false, false, 0, 1, false, false, true));
+    }
     // Deployed EAGLE/block reduction widths, scalar oracle at one/full7 rows.
     for (int64_t k : {2560, 4096, 7680, 9728, 12800}) for (int bits : {1, 8}) for (int64_t n : {1, 7}) {
         test_cases.emplace_back(new test_w1a1_mul_mat(k, false, bits, n));

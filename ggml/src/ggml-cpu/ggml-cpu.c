@@ -1521,8 +1521,10 @@ static void ggml_compute_forward_w1ax_pack(const struct ggml_compute_params * pa
             for (int64_t i = 0; i < k; ++i) { GGML_ASSERT(isfinite(row[i])); absmax = fmaxf(absmax, fabsf(row[i])); }
             absmax *= clip;
             scales[token] = absmax/(float) qmax;
+            // fixed_w1a8_finite_reciprocal_v2: F64 division fallback only on
+            // reciprocal overflow; cast to F32 before nearbyintf/RNE.
             const float inv = absmax == 0.0f ? 0.0f : (float) qmax/absmax;
-            for (int64_t i = 0; i < k; ++i) codes[token*k + i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(absmax == 0.0f ? 0.0f : (!learned || isfinite(inv)) ? row[i]*inv : (float) ((double) row[i]/absmax*qmax))));
+            for (int64_t i = 0; i < k; ++i) codes[token*k + i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(absmax == 0.0f ? 0.0f : isfinite(inv) ? row[i]*inv : (float) ((double) row[i]/absmax*qmax))));
             if (bits == 4) {
                 memset(planes + token*words*4, 0, words*4*sizeof(uint32_t));
                 for (int64_t i = 0; i < k; ++i) {
@@ -1609,7 +1611,7 @@ static void ggml_compute_forward_w1a1_mul_mat(
                 act_scale = absmax / (float) qmax;
                 const float inv = absmax == 0.0f ? 0.0f : (float) qmax / absmax;
                 for (int64_t i = 0; i < k; ++i) {
-                    const float normalized = absmax == 0.0f ? 0.0f : (!learned || isfinite(inv)) ? act[i]*inv : (float) ((double) act[i]/absmax*qmax);
+                    const float normalized = absmax == 0.0f ? 0.0f : isfinite(inv) ? act[i]*inv : (float) ((double) act[i]/absmax*qmax);
                     owned_codes[i] = (int8_t) fmaxf(-qmax, fminf(qmax, nearbyintf(normalized)));
                 }
             }

@@ -90,6 +90,9 @@ static __global__ void w1a1_xor_popc(
     }
 }
 
+// fixed_w1a8_finite_reciprocal_v2: finite F32 inputs, RNE codes; preserve
+// divide-then-multiply F64 fallback, cast F32 before integer RNE. Normal
+// finite-reciprocal arithmetic is unchanged. This TU retains --ftz=false.
 // One block per token. Quantization is per complete logical token, with F32
 // absmax/scale and round-to-nearest-even codes. Zero vectors produce zero codes.
 // A4 planes contain two's-complement bits; unused tail bits are always clear.
@@ -102,15 +105,15 @@ static __global__ void w1ax_quantize(
     const float * row = activations + token*k;
     float local_max = 0.0f;
     for (int64_t i = threadIdx.x; i < k; i += blockDim.x) {
-        // ggml-cuda uses -use_fast_math: float min/max may flush subnormals.
-        // Nonnegative finite IEEE bits have the same order as their magnitudes.
-        local_max = learned ? __uint_as_float(max(__float_as_uint(local_max), __float_as_uint(row[i]) & 0x7fffffffu)) : fmaxf(local_max, fabsf(row[i]));
+        // Preserve finite IEEE magnitudes for fixed and learned quantizers.
+        // w1a1.cu is compiled --ftz=false; integer max also makes this explicit.
+        local_max = __uint_as_float(max(__float_as_uint(local_max), __float_as_uint(row[i]) & 0x7fffffffu));
     }
     maxima[threadIdx.x] = local_max;
     __syncthreads();
     for (int stride = blockDim.x/2; stride > 0; stride /= 2) {
         if (threadIdx.x < stride) {
-            maxima[threadIdx.x] = learned ? __uint_as_float(max(__float_as_uint(maxima[threadIdx.x]), __float_as_uint(maxima[threadIdx.x + stride]))) : fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+            maxima[threadIdx.x] = __uint_as_float(max(__float_as_uint(maxima[threadIdx.x]), __float_as_uint(maxima[threadIdx.x + stride])));
         }
         __syncthreads();
     }
@@ -121,11 +124,11 @@ static __global__ void w1ax_quantize(
     }
     __syncthreads();
     const int qmax = bits == 8 ? 127 : 7;
-    const bool zero_limit = learned ? (__float_as_uint(maxima[0]) & 0x7fffffffu) == 0 : maxima[0] == 0.0f;
+    const bool zero_limit = (__float_as_uint(maxima[0]) & 0x7fffffffu) == 0;
     const float inv = zero_limit ? 0.0f : __fdiv_rn((float) qmax, maxima[0]);
     for (int64_t i = threadIdx.x; i < k; i += blockDim.x) {
         const bool finite_inv = (__float_as_uint(inv) & 0x7f800000u) != 0x7f800000u;
-        const float normalized = zero_limit ? 0.0f : (!learned || finite_inv) ? __fmul_rn(row[i], inv) : __double2float_rn((double) row[i]/(double) maxima[0]*qmax);
+        const float normalized = zero_limit ? 0.0f : finite_inv ? __fmul_rn(row[i], inv) : __double2float_rn((double) row[i]/(double) maxima[0]*qmax);
         const int q = __float2int_rn(learned ? fmaxf(-qmax, fminf(qmax, normalized)) : normalized);
         codes[token*k + i] = (int8_t) max(-qmax, min(qmax, q));
     }

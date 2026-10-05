@@ -254,7 +254,7 @@ if (CUDAToolkit_FOUND)
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 
-    # W1Ax packing promises IEEE token scales and learned thresholds, including
+    # W1Ax fixed/learned packing promises IEEE scales and thresholds, including
     # subnormal F32 inputs. -use_fast_math enables FTZ even for the F32-to-F64
     # conversion in the A1 mean: a token of +/- 2^-149 then gets beta=0.
     # Override only FTZ for this translation unit, retaining its other CUDA
