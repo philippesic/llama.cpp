@@ -5,6 +5,7 @@
 #include "llama-model.h"
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
+#include "indexed-logits.h"
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -58,7 +59,7 @@ int main(int argc, char ** argv) {
             if (line.size() > 2*1024*1024) throw std::runtime_error("request exceeds JSON byte cap");
             const auto request=json::parse(line);
             const bool generate=request.contains("prompt");
-            if (!request.is_object() || request.size()!=(request.contains("decode_history")?5:4) || (generate && request.contains("decode_history")) || !request.contains("id") ||
+            if (!request.is_object() || request.size()!=4 + size_t(request.contains("decode_history")) + size_t(request.contains("logits_indices")) + size_t(request.contains("logits_selection")) || (generate && request.contains("decode_history")) || !request.contains("id") ||
                     !request.contains("tap_ids") || !request.contains("logits_mode") ||
                     (generate == request.contains("tokens"))) throw std::runtime_error("invalid teacher request fields");
             const auto id=request.at("id").get<std::string>();
@@ -66,7 +67,18 @@ int main(int argc, char ** argv) {
             const auto ids=request.at("tap_ids").get<std::vector<uint32_t>>();
             const auto mode=request.at("logits_mode").get<std::string>();
             if ((ids.size()!=3 && ids.size()!=5) || std::set<uint32_t>(ids.begin(),ids.end()).size()!=ids.size() ||
-                    (mode!="all" && mode!="last" && mode!="none")) throw std::runtime_error("invalid tap/logit bounds");
+                    (mode!="all" && mode!="last" && mode!="none" && mode!="indexed")) throw std::runtime_error("invalid tap/logit bounds");
+            if (mode=="indexed") {
+                if (generate) {
+                    if (!request.contains("logits_selection") || request.contains("logits_indices") ||
+                            request.at("logits_selection") != block_teacher::block_selection())
+                        throw std::runtime_error("generated indexed logits require exact block anchor selection");
+                } else if (!request.contains("logits_indices") || request.contains("logits_selection")) {
+                    throw std::runtime_error("replay indexed logits require explicit absolute positions");
+                }
+            } else if (request.contains("logits_indices") || request.contains("logits_selection")) {
+                throw std::runtime_error("logit selection requires indexed mode");
+            }
             std::vector<llama_token> tokens;
             int max_new=0;
             std::string rendered, chat_template, template_mode;
@@ -126,6 +138,9 @@ int main(int argc, char ** argv) {
                 llama_set_embeddings_layer_inp(ctx.get(),tap,true);
             }
             const size_t prompt_length=tokens.size();
+            std::vector<size_t> logits_indices;
+            if (mode=="indexed" && !generate)
+                logits_indices=block_teacher::explicit_indices(request.at("logits_indices"),tokens.size());
             const auto directory=root/id;
             if (!fs::create_directory(directory)) throw std::runtime_error("output id exists; refusing overwrite");
             std::ofstream features(directory/"features.f32",std::ios::binary), logits(directory/"logits.f32",std::ios::binary);
@@ -152,7 +167,10 @@ int main(int argc, char ** argv) {
                     const float * row=llama_get_logits_ith(ctx.get(),i);
                     if(!row) throw std::runtime_error("full-vocabulary native logits missing");
                     for(int j=0;j<vocab;++j) if(!std::isfinite(row[j])) throw std::runtime_error("nonfinite native teacher logits");
-                    if(mode=="all") logits.write(reinterpret_cast<const char*>(row),size_t(vocab)*sizeof(float));
+                    // All modes preserve original dense-ALL batch.logits=true and decode partitions.
+                    // Indexed storage selects writes AFTER the unchanged native full-vocabulary head.
+                    if(mode=="all" || (mode=="indexed" && (generate ? off+size_t(i)>=prompt_length-1 :
+                            std::binary_search(logits_indices.begin(),logits_indices.end(),off+size_t(i))))) logits.write(reinterpret_cast<const char*>(row),size_t(vocab)*sizeof(float));
                     if(i+1==n) std::copy(row,row+vocab,last_logits.begin());
                 }
                 decode_history.push_back({{"offset",off},{"count",n},{"phase",phase},{"kv_reused_from_same_chain",off!=0}});
@@ -186,14 +204,23 @@ int main(int argc, char ** argv) {
             if(mode=="last") logits.write(reinterpret_cast<const char*>(last_logits.data()),size_t(vocab)*sizeof(float));
             features.close();logits.close();
             if(!features || !logits) throw std::runtime_error("teacher output write failed");
+            if(mode=="indexed" && generate) {
+                logits_indices=block_teacher::block_indices(prompt_length,tokens.size());
+                // EOG can leave an incomplete final horizon; keep precisely the existing anchors.
+                fs::resize_file(directory/"logits.f32",logits_indices.size()*size_t(vocab)*sizeof(float));
+            }
             for(auto tap:ids) llama_set_embeddings_layer_inp(ctx.get(),tap,false);
             llama_memory_clear(llama_get_memory(ctx.get()),true);
             json receipt={{"schema","block_native_teacher_request_v1"},{"id",id},{"tokens",tokens},{"tap_ids",ids},
-                {"features_shape",{tokens.size(),ids.size(),size_t(hidden)}},{"logits_shape",{mode=="all"?tokens.size():mode=="last"?size_t(1):size_t(0),size_t(vocab)}},
+                {"features_shape",{tokens.size(),ids.size(),size_t(hidden)}},{"logits_shape",{mode=="all"?tokens.size():mode=="last"?size_t(1):mode=="indexed"?logits_indices.size():size_t(0),size_t(vocab)}},
                 {"logits_mode",mode},{"hardware",hardware},{"target_storage_buffers",target_storage},
                 {"executed_result_buffers",execution.result_buffers},{"gpu_layers",gpu_layers},{"kv_type","F16"},
                 {"prefix_contract",generate?"native_tokenized_prompt_then_target_only_greedy":"teacher_forced_exact_caller_token_ids"},
                 {"decode_history",decode_history},{"optimizer_updates",0},{"complete",true}};
+            if(mode=="indexed") {
+                receipt["logits_indices"]=logits_indices;
+                if(generate) receipt["logits_selection"]=request.at("logits_selection");
+            }
             if(generate) {
                 receipt["prompt"]=request.at("prompt");receipt["prompt_length"]=prompt_length;
                 receipt["rendered_prompt"]=rendered;receipt["chat_template"]=chat_template;
