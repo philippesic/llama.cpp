@@ -141,6 +141,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         bool anchor_first = false;
         ml->get_key("dflash.sample_from_anchor", anchor_first);
         if (!anchor_first) throw std::runtime_error("DFlash W1Ax requires author anchor-first layout");
+        const auto mask = vocab.token_mask();
+        if (mask < 0 || mask >= n_vocab || (n_vocab == 151936 && mask != 151669)) {
+            throw std::runtime_error("DFlash W1Ax requires declared author MASK token");
+        }
         dflash_w1ax_bits = bits;
         LLAMA_LOG_INFO("%s: DFlash W1A%u profile=%s (no dense shadows)\n", __func__, bits, profile.c_str());
     }

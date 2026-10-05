@@ -46,6 +46,8 @@ int main(int argc,char **argv) {
     std::unique_ptr<llama_context,decltype(&llama_free)> ctx(llama_init_from_model(model.get(),cp),llama_free);
     if(!ctx)return 1;
     const int h=llama_model_n_embd(model.get()), v=llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const auto mask=llama_vocab_mask(llama_model_get_vocab(model.get()));
+    if(mask<0 || mask>=v) {std::cerr<<"declared model MASK token missing\n";return 1;}
     auto features=llama_batch_init(3,5*h,1);features.n_tokens=3;
     for(int i=0;i<3;++i) {
         for(int k=0;k<5*h;++k)features.embd[i*5*h+k]=0.01f*float((i+k)%11-5);
@@ -53,7 +55,7 @@ int main(int argc,char **argv) {
     }
     int rc=llama_decode(ctx.get(),features);llama_batch_free(features);if(rc)return 1;
     auto noise=llama_batch_init(7,0,1);noise.n_tokens=7;
-    for(int i=0;i<7;++i) {noise.token[i]=i?1:2;noise.pos[i]=3+i;noise.n_seq_id[i]=1;noise.seq_id[i][0]=0;noise.logits[i]=true;}
+    for(int i=0;i<7;++i) {noise.token[i]=i?mask:2;noise.pos[i]=3+i;noise.n_seq_id[i]=1;noise.seq_id[i][0]=0;noise.logits[i]=true;}
     rc=llama_decode(ctx.get(),noise);llama_batch_free(noise);if(rc)return 1;
     for(int i=0;i<7;++i) {
         auto * logits=llama_get_logits_ith(ctx.get(),i);if(!logits)return 1;
@@ -66,7 +68,9 @@ int main(int argc,char **argv) {
         std::ifstream existing(argv[3]);if(existing)return 2;
         std::ofstream proof(argv[3]);proof<<json{{"schema","block_native_graph_smoke_v1"},{"passed",true},
             {"gpu_layers",gpu_layers},{"hardware",hardware},{"nodes",nodes},{"instrumented",true},
-            {"paired_target_geometry_checked",argc==5},
+            {"paired_target_geometry_checked",argc==5},{"mask_token_id",mask},{"anchor_token_id",2},
+            {"noise_input_token_ids",{2,mask,mask,mask,mask,mask,mask}},
+            {"noise_input_positions",{3,4,5,6,7,8,9}},
             {"selected_dense_fallback",false},{"optimizer_updates",0},{"quality_evaluation",false}}.dump(2)<<'\n';
         proof.close();if(!proof)return 1;
     }
