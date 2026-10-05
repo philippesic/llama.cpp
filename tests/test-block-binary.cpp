@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-model.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
@@ -36,11 +37,27 @@ int main(int argc,char **argv) {
     cp.type_k=GGML_TYPE_F16;cp.type_v=GGML_TYPE_F16;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_DISABLED;
     std::unique_ptr<llama_model,decltype(&llama_model_free)> target_model(nullptr,llama_model_free);
     std::unique_ptr<llama_context,decltype(&llama_free)> target_context(nullptr,llama_free);
+    json target_binding=nullptr;
     if(argc==5) {
         target_model.reset(llama_model_load_from_file(argv[4],mp));if(!target_model)return 1;
         auto tp=llama_context_default_params();tp.n_ctx=128;tp.n_batch=7;tp.n_ubatch=7;
         tp.type_k=GGML_TYPE_F16;tp.type_v=GGML_TYPE_F16;
         target_context.reset(llama_init_from_model(target_model.get(),tp));if(!target_context)return 1;
+        auto * target=target_model.get();
+        if(!model->tok_embd || !model->output || !target->tok_embd || !target->output)return 1;
+        for(auto * owned : {model->tok_embd,model->output}) for(auto * teacher : {target->tok_embd,target->output}) {
+            if(owned==teacher || owned->data==teacher->data)return 1;
+        }
+        if(model->tok_embd->ne[0]!=target->tok_embd->ne[0] || model->tok_embd->ne[1]!=target->tok_embd->ne[1] ||
+            model->output->ne[0]!=target->output->ne[0] || model->output->ne[1]!=target->output->ne[1])return 1;
+        if(model->tok_embd->ne[1]==151936 && (model->tok_embd->type!=GGML_TYPE_BF16 || model->output->type!=GGML_TYPE_BF16 ||
+            target->tok_embd->type!=GGML_TYPE_F16 || target->output->type!=GGML_TYPE_F16))return 1;
+        target_binding={{"private_embedding_and_head_distinct_from_target",true},
+            {"draft_embedding_type",ggml_type_name(model->tok_embd->type)},{"draft_head_type",ggml_type_name(model->output->type)},
+            {"target_embedding_type",ggml_type_name(target->tok_embd->type)},{"target_head_type",ggml_type_name(target->output->type)},
+            {"embedding_shape",{model->tok_embd->ne[0],model->tok_embd->ne[1]}},
+            {"head_shape",{model->output->ne[0],model->output->ne[1]}},
+            {"target_layer_count",llama_model_n_layer(target)},{"ordered_native_target_taps",model->target_layer_ids}};
         cp.ctx_other=target_context.get();
     }
     std::unique_ptr<llama_context,decltype(&llama_free)> ctx(llama_init_from_model(model.get(),cp),llama_free);
@@ -68,7 +85,7 @@ int main(int argc,char **argv) {
         std::ifstream existing(argv[3]);if(existing)return 2;
         std::ofstream proof(argv[3]);proof<<json{{"schema","block_native_graph_smoke_v1"},{"passed",true},
             {"gpu_layers",gpu_layers},{"hardware",hardware},{"nodes",nodes},{"instrumented",true},
-            {"paired_target_geometry_checked",argc==5},{"mask_token_id",mask},{"anchor_token_id",2},
+            {"paired_target_geometry_checked",argc==5},{"target_binding",target_binding},{"mask_token_id",mask},{"anchor_token_id",2},
             {"noise_input_token_ids",{2,mask,mask,mask,mask,mask,mask}},
             {"noise_input_positions",{3,4,5,6,7,8,9}},
             {"selected_dense_fallback",false},{"optimizer_updates",0},{"quality_evaluation",false}}.dump(2)<<'\n';
