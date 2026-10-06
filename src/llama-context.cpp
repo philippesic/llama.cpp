@@ -2877,6 +2877,16 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    const auto block_size = model.gguf_kv.find("dflash.block_size");
+    if (std::getenv("DSPARK_REQUIRE_AUTHOR_LAYOUT") && model.arch == LLM_ARCH_DFLASH &&
+            model.dflash_w1ax_bits && model.dspark_markov_w1 &&
+            block_size != model.gguf_kv.end() && block_size->second == "7") {
+        // Reserve a valid synthetic noise block; actual decode batches keep their original size checks.
+        n_tokens = std::min<uint64_t>(n_tokens, 7ull * n_seqs);
+        n_outputs = std::min(n_outputs, n_tokens);
+        LLAMA_LOG_DEBUG("%s: author noise reserve: n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+    }
+
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
