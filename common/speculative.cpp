@@ -2876,12 +2876,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
     if (has_block_draft) {
-        // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        // The admitted DeepSpec reference computes all seven trained noise
-        // positions even when only the first three are proposed. Reserve draft
-        // outputs for computation, independently of target verification length.
+        // DFlash reserves anchor + n_max masks; the author layout computes exactly seven noise positions.
         const bool author_block7 = std::getenv("DSPARK_REQUIRE_AUTHOR_LAYOUT") != nullptr;
-        const int32_t per_seq = std::max(author_block7 ? 7 : 1, params_spec.n_max + 1);
+        const int32_t per_seq = author_block7 ? 7 : std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;

@@ -101,6 +101,47 @@ static void test(void) {
         assert(draft.n_outputs_max_per_seq == 1);
     }
 
+#ifndef _WIN32
+    {
+        const char * author_env = std::getenv("DSPARK_REQUIRE_AUTHOR_LAYOUT");
+        const bool had_author_env = author_env != nullptr;
+        const std::string saved_author_env = author_env ? author_env : "";
+
+        for (bool author_layout : {false, true}) {
+            if (author_layout) {
+                setenv("DSPARK_REQUIRE_AUTHOR_LAYOUT", "1", true);
+            } else {
+                unsetenv("DSPARK_REQUIRE_AUTHOR_LAYOUT");
+            }
+            for (auto type : {COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}) {
+                for (int32_t n_max : {3, 7, 12}) {
+                    for (int32_t n_parallel : {1, 4}) {
+                        for (bool backend_sampling : {false, true}) {
+                            common_params base;
+                            base.n_parallel = n_parallel;
+                            base.speculative.types = {type};
+                            base.speculative.draft.n_max = n_max;
+                            base.speculative.draft.backend_sampling = backend_sampling;
+
+                            const auto draft = common_base_params_to_speculative(base);
+                            const int32_t computed_rows = author_layout ? 7 : n_max + 1;
+                            assert(draft.n_outputs_max == n_parallel * computed_rows);
+                            assert(draft.n_outputs_max_per_seq == (backend_sampling ? computed_rows : 1));
+                            assert(draft.speculative.draft.n_max == n_max);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (had_author_env) {
+            setenv("DSPARK_REQUIRE_AUTHOR_LAYOUT", saved_author_env.c_str(), true);
+        } else {
+            unsetenv("DSPARK_REQUIRE_AUTHOR_LAYOUT");
+        }
+    }
+#endif
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {
