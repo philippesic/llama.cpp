@@ -163,6 +163,88 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     return 0;
 }
 
+// Tests that an accepted EOG ends the accepted draft tokens, unless it is the last draft token.
+static int test_speculative_rejection_eog(common_params params) {
+    const llama_token eog = 0;
+
+    // the test model has no EOG token, make one
+    if (!params.kv_overrides.empty()) {
+        params.kv_overrides.pop_back();
+    }
+    string_parse_kv_override(("tokenizer.ggml.eos_token_id=int:" + std::to_string(eog)).c_str(), params.kv_overrides);
+    params.kv_overrides.emplace_back();
+    params.kv_overrides.back().key[0] = 0;
+
+    params.sampling.backend_sampling = false;
+    auto llama_init = common_init_from_params(params);
+
+    auto * model_tgt = llama_init->model();
+    auto * ctx_tgt   = llama_init->context();
+    if (!model_tgt || !ctx_tgt) {
+        LOG_ERR("failed to initialize target model and context\n");
+        return 1;
+    }
+
+    if (!llama_vocab_is_eog(llama_model_get_vocab(model_tgt), eog)) {
+        LOG_ERR("token %d is not EOG\n", eog);
+        return 1;
+    }
+
+    const llama_tokens prompt = { 1, 2, 3, 1, 2 };
+
+    common_batch batch = common_batch_get_one(ctx_tgt, prompt);
+    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        LOG_ERR("failed to decode the test prompt\n");
+        return 1;
+    }
+
+    // the target and the draft both put all probability on EOG, so every draft token is accepted
+    common_params_sampling sampling;
+    sampling.seed       = 18;
+    sampling.samplers   = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    sampling.temp       = 1.0f;
+    sampling.logit_bias = { { eog, 1000.0f } };
+
+    const std::vector<llama_token_data> q = { { eog, 0.0f, 1.0f } };
+
+    struct test_case {
+        llama_tokens draft;
+        size_t       n_expected;
+    };
+
+    // a trailing EOG is still accepted and followed by the bonus token, same as common_sampler_sample_and_accept_n
+    const std::vector<test_case> cases = {
+        { { eog, eog },      1 },
+        { { eog, eog, eog }, 1 },
+        { { eog },           2 },
+    };
+
+    bool ok = true;
+
+    for (const auto & tc : cases) {
+        common_sampler_ptr smpl(common_sampler_init(model_tgt, sampling));
+        if (!smpl) {
+            LOG_ERR("failed to initialize target sampler\n");
+            return 1;
+        }
+
+        const std::vector<std::vector<llama_token_data>> draft_q(tc.draft.size(), q);
+        const std::vector<int> idxs(tc.draft.size() + 1, -1);
+
+        const std::vector<llama_token> result =
+            common_sampler_sample_and_accept_n_rejection(smpl.get(), ctx_tgt, idxs, tc.draft, draft_q, false);
+
+        LOG("draft of %zu EOG : returned %zu tokens, expected %zu\n", tc.draft.size(), result.size(), tc.n_expected);
+
+        if (result.size() != tc.n_expected || result[0] != eog) {
+            LOG_ERR("draft of %zu EOG: returned %zu tokens, expected %zu\n", tc.draft.size(), result.size(), tc.n_expected);
+            ok = false;
+        }
+    }
+
+    return ok ? 0 : 1;
+}
+
 struct parsed_args {
     int n_trials;
     std::vector<char *> argv;
@@ -217,7 +299,8 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
-    const int result = test_speculative_rejection_sampling(params, parsed->n_trials);
+    int result = test_speculative_rejection_sampling(params, parsed->n_trials);
+    result |= test_speculative_rejection_eog(params);
     if (result == 0) {
         LOG("\nAll tests passed.\n");
     } else {
